@@ -44,14 +44,38 @@ func WriteWAV(path string, waveform []float32, channels, sampleRate int) error {
 		samples = waveform[:numSamples*channels]
 	}
 
-	buf := make([]byte, 0, len(samples)*2)
-	for _, s := range samples {
+	normSamples := normalizeVolume(samples)
+
+	buf := make([]byte, 0, len(normSamples)*2)
+	for _, s := range normSamples {
 		clamped := math.Max(-1.0, math.Min(1.0, float64(s)))
 		pcm16 := int16(math.Round(clamped * 32767.0))
 		buf = append(buf, byte(pcm16), byte(pcm16>>8))
 	}
 	_, err = f.Write(buf)
 	return err
+}
+
+func normalizeVolume(waveform []float32) []float32 {
+	if len(waveform) == 0 {
+		return waveform
+	}
+	var maxAbs float32 = 0
+	for _, s := range waveform {
+		abs := float32(math.Abs(float64(s)))
+		if abs > maxAbs {
+			maxAbs = abs
+		}
+	}
+	if maxAbs < 1e-6 {
+		return waveform
+	}
+	result := make([]float32, len(waveform))
+	normFactor := float32(0.95) / maxAbs
+	for i, s := range waveform {
+		result[i] = s * normFactor
+	}
+	return result
 }
 
 func ReadWAV(path string) ([]float32, int, int, error) {
@@ -96,12 +120,19 @@ func Resample(waveform []float32, origRate, targetRate, channels int) []float32 
 	result := make([]float32, targetFrames*channels)
 	for i := 0; i < targetFrames; i++ {
 		srcFrame := float64(i) / ratio
-		srcFrameFloor := int(srcFrame)
-		if srcFrameFloor >= origFrames-1 {
-			srcFrameFloor = origFrames - 1
+		srcFrame0 := int(srcFrame)
+		if srcFrame0 >= origFrames-1 {
+			srcFrame0 = origFrames - 2
 		}
+		if srcFrame0 < 0 {
+			srcFrame0 = 0
+		}
+		srcFrame1 := srcFrame0 + 1
+		t := srcFrame - float64(srcFrame0)
 		for ch := 0; ch < channels; ch++ {
-			result[i*channels+ch] = waveform[srcFrameFloor*channels+ch]
+			v0 := waveform[srcFrame0*channels+ch]
+			v1 := waveform[srcFrame1*channels+ch]
+			result[i*channels+ch] = float32((1-t)*float64(v0) + t*float64(v1))
 		}
 	}
 	return result

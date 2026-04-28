@@ -534,6 +534,27 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 	inputNames := toStrSlice(onnxInfo["local_cached_input_names"])
 	outputNames := toStrSlice(onnxInfo["local_cached_output_names"])
 
+	doSample := true
+	if ds, ok := gd["do_sample"]; ok {
+		doSample = toBool(ds)
+	}
+	temperature := 1.0
+	if t, ok := gd["temperature"]; ok {
+		temperature = toFloat64(t)
+	}
+	topK := 50
+	if k, ok := gd["top_k"]; ok {
+		topK = int(toFloat64(k))
+	}
+	topP := 1.0
+	if p, ok := gd["top_p"]; ok {
+		topP = toFloat64(p)
+	}
+	repetitionPenalty := float32(1.0)
+	if rp, ok := gd["repetition_penalty"]; ok {
+		repetitionPenalty = float32(toFloat64(rp))
+	}
+
 	ghShape := []int64{1, int64(len(globalHidden))}
 	localPast := make(map[string][]float32)
 	localPVL := 0
@@ -545,7 +566,7 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 		return false, nil
 	}
 
-	nextTextToken := sampler.SampleAssistantTextToken(textLogits, audioAssistSlotID, audioEndTokenID, false, 1.0, 50, 1.0, rt.RNG)
+	nextTextToken := sampler.SampleAssistantTextToken(textLogits, audioAssistSlotID, audioEndTokenID, doSample, temperature, topK, topP, rt.RNG)
 	if nextTextToken != audioAssistSlotID {
 		return false, nil
 	}
@@ -561,7 +582,7 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 	firstChannelLogits := make([]float32, perChannel)
 	copy(firstChannelLogits, audioLogits[:minInt(perChannel, len(audioLogits))])
 
-	sampledToken := sampler.SampleAudioToken(firstChannelLogits, prevTokens[0], prevTokenSets[0], true, 0.8, 25, 0.95, 1.2, rt.RNG)
+	sampledToken := sampler.SampleAudioToken(firstChannelLogits, prevTokens[0], prevTokenSets[0], doSample, temperature, topK, topP, repetitionPenalty, rt.RNG)
 	frame := []int{sampledToken}
 	previousToken := sampledToken
 
@@ -582,7 +603,7 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 			copy(channelLogits, audioLogits2[startOff:endOff])
 		}
 
-		sampledToken2 := sampler.SampleAudioToken(channelLogits, prevTokens[ci], prevTokenSets[ci], true, 0.8, 25, 0.95, 1.2, rt.RNG)
+		sampledToken2 := sampler.SampleAudioToken(channelLogits, prevTokens[ci], prevTokenSets[ci], doSample, temperature, topK, topP, repetitionPenalty, rt.RNG)
 		frame = append(frame, sampledToken2)
 		previousToken = sampledToken2
 	}

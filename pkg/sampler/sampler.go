@@ -57,10 +57,10 @@ func ApplyRepetitionPenalty(values []float32, previousTokenIDs []int, penalty fl
 			continue
 		}
 		seen[id] = true
-		if result[id] < 0 {
-			result[id] *= penalty
-		} else {
+		if result[id] > 0 {
 			result[id] /= penalty
+		} else {
+			result[id] *= penalty
 		}
 	}
 	return result
@@ -125,13 +125,17 @@ func SampleFromScores(values []float32, doSample bool, temperature float64, topK
 		probs := Softmax(sortedScores)
 		removeMask := make([]bool, len(indexed))
 		var cumulative float64
+		removedStart := len(probs)
 		for i, p := range probs {
-			cumulative += p
 			if cumulative > topP {
 				removeMask[i] = true
+				if removedStart == len(probs) {
+					removedStart = i
+				}
+			} else {
+				cumulative += p
 			}
 		}
-		removeMask[0] = false
 		for i, mask := range removeMask {
 			if mask {
 				scores[indexed[i].idx] = math.Inf(-1)

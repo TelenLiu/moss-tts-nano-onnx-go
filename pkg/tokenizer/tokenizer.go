@@ -226,7 +226,7 @@ func (p *Processor) Encode(text string) []int {
 		for end := i + 1; end <= len(runes) && end-i <= 64; end++ {
 			candidate := string(runes[i:end])
 			if id, ok := p.PieceToID[candidate]; ok {
-				if p.Types[id] == PieceNormal || p.Types[id] == PieceUserDefined {
+				if p.Types[id] == PieceNormal || p.Types[id] == PieceUserDefined || p.Types[id] == PieceByte {
 					if p.Scores[id] > bestScore {
 						bestScore = p.Scores[id]
 						bestLen = end - i
@@ -240,9 +240,13 @@ func (p *Processor) Encode(text string) []int {
 			i += bestLen
 		} else {
 			ch := runes[i]
-			hex := fmt.Sprintf("<0x%02X>", ch)
-			if id, ok := p.PieceToID[hex]; ok {
-				tokens = append(tokens, id)
+			if ch < 0x100 {
+				hex := fmt.Sprintf("<0x%02X>", ch)
+				if id, ok := p.PieceToID[hex]; ok {
+					tokens = append(tokens, id)
+				} else {
+					tokens = append(tokens, p.UnkID)
+				}
 			} else {
 				tokens = append(tokens, p.UnkID)
 			}
@@ -278,7 +282,7 @@ func (p *Processor) Decode(tokenIDs []int) string {
 	}
 	result := sb.String()
 	result = strings.ReplaceAll(result, "\xe2\x96\x81", " ")
-	return strings.TrimPrefix(result, " ")
+	return strings.TrimSpace(result)
 }
 
 func (p *Processor) CountTokens(text string) int {

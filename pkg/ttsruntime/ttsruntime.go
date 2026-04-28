@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	DefaultInterChunkPauseShortSec = 0.40
-	DefaultInterChunkPauseLongSec  = 0.24
+	DefaultInterChunkPauseShortSec = 0.15
+	DefaultInterChunkPauseLongSec  = 0.10
 )
 
 var SentenceEndPunctuation = map[rune]bool{'.': true, '!': true, '?': true, '。': true, '！': true, '？': true, '；': true, ';': true}
