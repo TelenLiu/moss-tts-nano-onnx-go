@@ -1,0 +1,8 @@
+.idea
+.trae
+.DS_Store
+*.iml
+moss-tts-nano-onnx-go
+/lib
+/models
+/output
