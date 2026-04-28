@@ -7,10 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/web"
 )
@@ -112,6 +112,10 @@ func runInfer(args []string) {
 	_ = audioTopK
 	_ = audioRepPenalty
 
+	if err := ortruntime.InitializeORT(cfg.LibDir); err != nil {
+		log.Fatalf("初始化 ONNX Runtime 环境失败: %v", err)
+	}
+
 	cwd, _ := os.Getwd()
 	outputDir := filepath.Join(cwd, "output")
 	if *outputPath == "" {
@@ -212,5 +216,3 @@ func resolveTextContent(text, textFile string) string {
 	}
 	return string(data)
 }
-
-var _ = strconv.Itoa

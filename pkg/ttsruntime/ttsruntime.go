@@ -1,6 +1,7 @@
 package ttsruntime
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/tokenizer"
+	ort "github.com/yalue/onnxruntime_go"
 )
 
 const (
@@ -29,6 +31,7 @@ var ClosingPunctuation = map[rune]bool{'"': true, '\'': true, '\u201d': true, '\
 type SynthesisResult struct {
 	AudioPath    string
 	SampleRate   int
+	AudioSamples int
 	Waveform     []float32
 	Channels     int
 	TextChunks   []string
@@ -39,9 +42,9 @@ type SynthesisResult struct {
 }
 
 type OnnxTtsRuntime struct {
-	OrtRuntime  *ortruntime.OrtCpuRuntime
-	SPModel     *tokenizer.Processor
-	OutputDir   string
+	OrtRuntime *ortruntime.OrtCpuRuntime
+	SPModel    *tokenizer.Processor
+	OutputDir  string
 }
 
 func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string, outputDir string) (*OnnxTtsRuntime, error) {
@@ -225,8 +228,18 @@ func (t *OnnxTtsRuntime) splitTextByTokenBudget(text string, maxTokens int) []st
 }
 
 func (t *OnnxTtsRuntime) ResolvePromptAudioCodes(voice string, promptAudioPath string) [][]int {
+	log.Printf("[ResolvePromptAudioCodes] voice=%q promptAudioPath=%q", voice, promptAudioPath)
 	if promptAudioPath != "" {
-		return t.EncodeReferenceAudio(promptAudioPath)
+		log.Printf("[ResolvePromptAudioCodes] 使用上传的参考音频: %s", promptAudioPath)
+		codes := t.EncodeReferenceAudio(promptAudioPath)
+		if codes != nil {
+			log.Printf("[ResolvePromptAudioCodes] 参考音频编码成功: %d 帧", len(codes))
+		} else {
+			log.Printf("[ResolvePromptAudioCodes] 参考音频编码失败，将回退到内置音色")
+		}
+		if codes != nil {
+			return codes
+		}
 	}
 	resolvedVoice := voice
 	if resolvedVoice == "" {
@@ -235,70 +248,202 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodes(voice string, promptAudioPath s
 			resolvedVoice = fmt.Sprintf("%v", voices[0]["voice"])
 		}
 	}
+	log.Printf("[ResolvePromptAudioCodes] 使用内置音色: %s", resolvedVoice)
 	for _, v := range t.OrtRuntime.ListBuiltinVoices() {
 		if fmt.Sprintf("%v", v["voice"]) == resolvedVoice {
 			codes, ok := v["prompt_audio_codes"].([]interface{})
 			if !ok {
+				log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的prompt_audio_codes格式不正确，跳过", resolvedVoice)
 				continue
 			}
 			result := make([][]int, len(codes))
+			allOk := true
 			for i, codeRow := range codes {
 				row, ok := codeRow.([]interface{})
 				if !ok {
-					continue
+					log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的第%d行格式不正确", resolvedVoice, i)
+					allOk = false
+					break
 				}
 				result[i] = make([]int, len(row))
 				for j, val := range row {
 					result[i][j] = int(ortruntime.ToFloat64(val))
 				}
 			}
-			return result
+			if allOk {
+				log.Printf("[ResolvePromptAudioCodes] 内置音色 %s 加载成功: %d 帧", resolvedVoice, len(result))
+				return result
+			}
+			log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 加载失败，继续查找", resolvedVoice)
 		}
 	}
-	log.Printf("警告: 未找到内置音色 %s，使用默认", resolvedVoice)
+	log.Printf("[ResolvePromptAudioCodes] 警告: 未找到内置音色 %s，使用第一个内置音色作为默认", resolvedVoice)
 	voices := t.OrtRuntime.ListBuiltinVoices()
 	if len(voices) > 0 {
-		codes, _ := voices[0]["prompt_audio_codes"].([]interface{})
-		result := make([][]int, len(codes))
-		for i, codeRow := range codes {
-			row, _ := codeRow.([]interface{})
-			result[i] = make([]int, len(row))
-			for j, val := range row {
-				result[i][j] = int(ortruntime.ToFloat64(val))
+		for _, v := range voices {
+			codes, ok := v["prompt_audio_codes"].([]interface{})
+			if !ok {
+				continue
+			}
+			result := make([][]int, len(codes))
+			allOk := true
+			for i, codeRow := range codes {
+				row, ok := codeRow.([]interface{})
+				if !ok {
+					allOk = false
+					break
+				}
+				result[i] = make([]int, len(row))
+				for j, val := range row {
+					result[i][j] = int(ortruntime.ToFloat64(val))
+				}
+			}
+			if allOk {
+				log.Printf("[ResolvePromptAudioCodes] 使用第一个可用音色: %s (%d 帧)", fmt.Sprintf("%v", v["voice"]), len(result))
+				return result
 			}
 		}
-		return result
 	}
+	log.Printf("[ResolvePromptAudioCodes] 错误: 没有可用的内置音色，返回空")
 	return nil
 }
 
 func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
-	log.Printf("编码参考音频: %s (stub - 需要 ONNX codec_encode session)", audioPath)
-	return [][]int{{0, 0, 0, 0}}
+	log.Printf("[EncodeReferenceAudio] 开始编码参考音频: %s", audioPath)
+
+	codecConfig := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
+	targetSampleRate := int(ortruntime.ToFloat64(codecConfig["sample_rate"]))
+	targetChannels := int(ortruntime.ToFloat64(codecConfig["channels"]))
+	numQuantizers := int(ortruntime.ToFloat64(codecConfig["num_quantizers"]))
+	log.Printf("[EncodeReferenceAudio] codec配置: sampleRate=%d channels=%d numQuantizers=%d", targetSampleRate, targetChannels, numQuantizers)
+
+	waveform, channels, sampleRate, err := audio.LoadReferenceAudio(audioPath, targetSampleRate, targetChannels)
+	if err != nil {
+		log.Printf("[EncodeReferenceAudio] 加载参考音频失败: %v, 使用内置音色", err)
+		return nil
+	}
+	log.Printf("[EncodeReferenceAudio] 加载完成: 原始采样率=%d 通道数=%d 总样本数=%d", sampleRate, channels, len(waveform))
+
+	waveformLength := len(waveform) / channels
+	log.Printf("[EncodeReferenceAudio] 波形长度: %d 样本/通道", waveformLength)
+
+	// 将交错格式(interleaved)转换为平面格式(planar)，与 torchaudio.load 保持一致
+	// 交错: [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]
+	// 平面: [ch0_s0, ch0_s1, ..., ch1_s0, ch1_s1, ...]
+	planarWaveform := make([]float32, len(waveform))
+	for ch := 0; ch < channels; ch++ {
+		for i := 0; i < waveformLength; i++ {
+			planarWaveform[ch*waveformLength+i] = waveform[i*channels+ch]
+		}
+	}
+	log.Printf("[EncodeReferenceAudio] 已转换为平面格式: 前5个样本 ch0=%v ch1=%v",
+		planarWaveform[:minInt(5, waveformLength)], planarWaveform[waveformLength:waveformLength+minInt(5, waveformLength)])
+
+	waveform3D := make([][][]float32, 1)
+	waveform3D[0] = make([][]float32, channels)
+	for ch := 0; ch < channels; ch++ {
+		waveform3D[0][ch] = make([]float32, waveformLength)
+		for i := 0; i < waveformLength; i++ {
+			waveform3D[0][ch][i] = planarWaveform[ch*waveformLength+i]
+		}
+	}
+	flatWaveform, wfDims := flatten3dFloat32(waveform3D)
+	log.Printf("[EncodeReferenceAudio] Tensor维度: %v 数据长度=%d", wfDims, len(flatWaveform))
+	waveformTensor, _ := ort.NewTensor(wfDims, flatWaveform)
+	inputLengths := []int32{int32(waveformLength)}
+	inputLengthsTensor, _ := ort.NewTensor([]int64{1}, inputLengths)
+
+	inputs := []ort.Value{waveformTensor, inputLengthsTensor}
+	outputs := make([]ort.Value, 2)
+
+	log.Printf("[EncodeReferenceAudio] 调用 codec_encode...")
+	err = t.OrtRuntime.Onnx.CodecEncode.Run(inputs, outputs)
+	waveformTensor.Destroy()
+	inputLengthsTensor.Destroy()
+
+	if err != nil {
+		log.Printf("[EncodeReferenceAudio] codec_encode 失败: %v, 使用内置音色", err)
+		return nil
+	}
+
+	audioCodesData := getInt32Data(outputs[0])
+	audioCodesShape := outputs[0].GetShape()
+	audioCodeLengthsData := getInt32Data(outputs[1])
+	log.Printf("[EncodeReferenceAudio] codec_encode 成功: audioCodes形状=%v audioCodeLengths=%v 数据长度=%d",
+		audioCodesShape, audioCodeLengthsData, len(audioCodesData))
+
+	for _, v := range outputs {
+		if v != nil {
+			v.Destroy()
+		}
+	}
+
+	codeLength := int(audioCodeLengthsData[0])
+	if len(audioCodesShape) >= 3 {
+		codeLength = minInt(codeLength, int(audioCodesShape[1]))
+	}
+	log.Printf("[EncodeReferenceAudio] 解析codeLength=%d", codeLength)
+
+	promptAudioCodes := make([][]int, codeLength)
+	for frameIndex := 0; frameIndex < codeLength; frameIndex++ {
+		promptAudioCodes[frameIndex] = make([]int, numQuantizers)
+		for q := 0; q < numQuantizers; q++ {
+			offset := frameIndex*numQuantizers + q
+			if offset < len(audioCodesData) {
+				promptAudioCodes[frameIndex][q] = int(audioCodesData[offset])
+			}
+		}
+	}
+
+	if codeLength > 0 {
+		log.Printf("[EncodeReferenceAudio] 参考音频编码完成: %d 帧, 第一帧codes=%v, 最后一帧codes=%v",
+			codeLength, promptAudioCodes[0], promptAudioCodes[codeLength-1])
+	} else {
+		log.Printf("[EncodeReferenceAudio] 参考音频编码完成: 0 帧")
+	}
+	return promptAudioCodes
 }
 
 func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (*SynthesisResult, error) {
 	startTime := time.Now()
+	log.Printf("[Synthesize] 开始合成: text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
 	if seed != nil {
 		t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
+		log.Printf("[Synthesize] 使用随机种子: %d", *seed)
 	}
 	preparedText := t.PrepareSynthesisText(text, enableNormalize)
+	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d", len(text), len(preparedText))
 	promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
+	if promptAudioCodes == nil {
+		log.Printf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
+		promptAudioCodes = [][]int{}
+	} else {
+		log.Printf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
+	}
 	textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
+	log.Printf("[Synthesize] 文本分块: %d 块", len(textChunks))
+	for i, chunk := range textChunks {
+		log.Printf("[Synthesize]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
+	}
 	codecMeta := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
 	sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
+	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
 	var allWaveforms [][]float32
 	for chunkIndex, chunkText := range textChunks {
+		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
 		textTokenIDs := t.EncodeText(chunkText)
+		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
+		log.Printf("[Synthesize]   请求行构建完成: %d 行", len(requestRows["inputIds"]))
 		generatedFrames := t.OrtRuntime.GenerateAudioFrames(requestRows)
+		log.Printf("[Synthesize]   音频帧生成完成: %d 帧", len(generatedFrames))
 		channelArrays, audioLength := t.OrtRuntime.DecodeFullAudio(generatedFrames)
-		log.Printf("  chunk %d/%d: text=%q frames=%d audio_samples=%d", chunkIndex+1, len(textChunks), chunkText, len(generatedFrames), audioLength)
+		log.Printf("[Synthesize]   音频解码完成: channels=%d samples=%d", len(channelArrays), audioLength)
 		if len(channelArrays) > 0 {
-			for _, ch := range channelArrays {
-				allWaveforms = append(allWaveforms, ch)
-			}
+			// 将多通道合并为交错格式，与Python的_merge_audio_channels一致
+			merged := audio.MergeAudioChannels(channelArrays)
+			allWaveforms = append(allWaveforms, merged)
 		}
 		if chunkIndex < len(textChunks)-1 {
 			pauseSeconds := estimateInterChunkPauseSeconds(chunkText)
@@ -317,16 +462,18 @@ func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath s
 		return nil, fmt.Errorf("写入 WAV 文件失败: %w", err)
 	}
 	elapsed := time.Since(startTime).Seconds()
+	audioSamples := len(waveform) / channels
 	return &SynthesisResult{
-		AudioPath:  resolvedOutputPath,
-		SampleRate: sampleRate,
-		Waveform:   waveform,
-		Channels:   channels,
-		TextChunks: textChunks,
-		SampleMode: sampleMode,
-		DoSample:   doSample,
-		Streaming:  streaming,
-		ElapsedSec: elapsed,
+		AudioPath:    resolvedOutputPath,
+		SampleRate:   sampleRate,
+		AudioSamples: audioSamples,
+		Waveform:     waveform,
+		Channels:     channels,
+		TextChunks:   textChunks,
+		SampleMode:   sampleMode,
+		DoSample:     doSample,
+		Streaming:    streaming,
+		ElapsedSec:   elapsed,
 	}, nil
 }
 
@@ -411,6 +558,54 @@ func estimateInterChunkPauseSeconds(textChunk string) float64 {
 
 func ToFloat64(v interface{}) float64 {
 	return ortruntime.ToFloat64(v)
+}
+
+func flatten3dFloat32(nested [][][]float32) ([]float32, []int64) {
+	dim0 := int64(len(nested))
+	dim1 := int64(0)
+	dim2 := int64(0)
+	if dim0 > 0 {
+		dim1 = int64(len(nested[0]))
+		if dim1 > 0 {
+			dim2 = int64(len(nested[0][0]))
+		}
+	}
+	data := make([]float32, dim0*dim1*dim2)
+	offset := 0
+	for i := range nested {
+		for j := range nested[i] {
+			for k := range nested[i][j] {
+				data[offset] = nested[i][j][k]
+				offset++
+			}
+		}
+	}
+	return data, []int64{dim0, dim1, dim2}
+}
+
+func getInt32Data(v ort.Value) []int32 {
+	if v == nil {
+		return nil
+	}
+	if t, ok := v.(*ort.Tensor[int32]); ok {
+		return t.GetData()
+	}
+	if c, ok := v.(*ort.CustomDataTensor); ok {
+		rawData := c.GetData()
+		result := make([]int32, len(rawData)/4)
+		for i := range result {
+			result[i] = int32(binary.LittleEndian.Uint32(rawData[i*4:]))
+		}
+		return result
+	}
+	return nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 var _ = json.Unmarshal

@@ -168,7 +168,7 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 		load("local_fixed_sampled_frame", ttsDir, f, lfInputs, lfOutputs)
 	}
 
-	if err := load("codec_encode", codecDir, codecFiles["encode"], nil, nil); err != nil {
+	if err := load("codec_encode", codecDir, codecFiles["encode"], []string{"waveform", "input_lengths"}, []string{"audio_codes", "audio_code_lengths"}); err != nil {
 		return err
 	}
 	if err := load("codec_decode", codecDir, codecFiles["decode_full"], []string{"audio_codes", "audio_code_lengths"}, []string{"audio", "audio_lengths"}); err != nil {
@@ -605,12 +605,22 @@ func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, 
 	inputs[3] = ciTensor
 	inputs[4] = stTensor
 	inputs[5] = pvlTensor
+	localHeads := int64(8)
+	localHeadDim := int64(64)
+	if mc, ok := rt.TTSMeta["model_config"].(map[string]interface{}); ok {
+		if lh, exists := mc["local_heads"]; exists {
+			localHeads = int64(toFloat64(lh))
+		}
+		if lhd, exists := mc["local_head_dim"]; exists {
+			localHeadDim = int64(toFloat64(lhd))
+		}
+	}
 	for i := 6; i < len(inputNames); i++ {
 		pastData, ok := localPast[inputNames[i]]
 		if !ok {
 			pastData = make([]float32, 0)
 		}
-		pastShape := []int64{1, 0, 8, 64}
+		pastShape := []int64{1, 0, localHeads, localHeadDim}
 		t, _ := ort.NewTensor(pastShape, pastData)
 		inputs[i] = t
 	}
@@ -728,24 +738,36 @@ func (rt *OrtCpuRuntime) DecodeFullAudio(generatedFrames [][]int) ([][]float32, 
 	}
 
 	numChannels := 1
-	if len(audioShape) >= 1 {
-		numChannels = int(audioShape[0])
-		if numChannels <= 0 {
-			numChannels = 1
+	samplesPerChannel := int(audioLength)
+	if len(audioShape) >= 3 {
+		numChannels = int(audioShape[1])
+		samplesPerChannel = int(audioShape[2])
+		if int(audioLength) < samplesPerChannel {
+			samplesPerChannel = int(audioLength)
 		}
+	} else if len(audioShape) >= 1 {
+		numChannels = 1
+	}
+	if numChannels <= 0 {
+		numChannels = 1
+	}
+	if samplesPerChannel*numChannels > len(audioData) {
+		samplesPerChannel = len(audioData) / numChannels
 	}
 
 	channels := make([][]float32, numChannels)
-	samplesPerChannel := int(audioLength)
 	for ch := 0; ch < numChannels; ch++ {
 		startOff := ch * samplesPerChannel
-		endOff := minInt(startOff+samplesPerChannel, len(audioData))
+		endOff := startOff + samplesPerChannel
+		if endOff > len(audioData) {
+			endOff = len(audioData)
+		}
 		channels[ch] = make([]float32, endOff-startOff)
 		copy(channels[ch], audioData[startOff:endOff])
 	}
 
-	log.Printf("  解码音频: frames=%d channels=%d samples=%d", frameCount, numChannels, audioLength)
-	return channels, int(audioLength)
+	log.Printf("  解码音频: frames=%d channels=%d samples=%d audioShape=%v", frameCount, numChannels, samplesPerChannel, audioShape)
+	return channels, samplesPerChannel
 }
 
 func (rt *OrtCpuRuntime) Close() {

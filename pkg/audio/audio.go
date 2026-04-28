@@ -2,6 +2,7 @@ package audio
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"os"
 )
@@ -46,7 +47,7 @@ func WriteWAV(path string, waveform []float32, channels, sampleRate int) error {
 	buf := make([]byte, 0, len(samples)*2)
 	for _, s := range samples {
 		clamped := math.Max(-1.0, math.Min(1.0, float64(s)))
-		pcm16 := int16(clamped * 32767.0)
+		pcm16 := int16(math.Round(clamped * 32767.0))
 		buf = append(buf, byte(pcm16), byte(pcm16>>8))
 	}
 	_, err = f.Write(buf)
@@ -119,6 +120,7 @@ func MergeAudioChannels(channelArrays [][]float32) []float32 {
 			minLen = len(ch)
 		}
 	}
+	// 合并为交错格式(interleaved): [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]
 	result := make([]float32, minLen*len(channelArrays))
 	for chIdx, ch := range channelArrays {
 		for i := 0; i < minLen; i++ {
@@ -145,4 +147,45 @@ func ConcatWaveforms(waveforms [][]float32) []float32 {
 
 func MakeSilence(durationSamples, channels int) []float32 {
 	return make([]float32, durationSamples*channels)
+}
+
+func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {
+	waveform, channels, sampleRate, err := ReadWAV(path)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+
+	if sampleRate != targetSampleRate {
+		waveform = Resample(waveform, sampleRate, targetSampleRate, channels)
+		sampleRate = targetSampleRate
+	}
+
+	if channels == targetChannels {
+		return waveform, channels, sampleRate, nil
+	}
+
+	if channels == 1 && targetChannels > 1 {
+		result := make([]float32, len(waveform)*targetChannels)
+		for i := 0; i < len(waveform); i++ {
+			for ch := 0; ch < targetChannels; ch++ {
+				result[i*targetChannels+ch] = waveform[i]
+			}
+		}
+		return result, targetChannels, sampleRate, nil
+	}
+
+	if channels > 1 && targetChannels == 1 {
+		frames := len(waveform) / channels
+		result := make([]float32, frames)
+		for i := 0; i < frames; i++ {
+			var sum float32
+			for ch := 0; ch < channels; ch++ {
+				sum += waveform[i*channels+ch]
+			}
+			result[i] = sum / float32(channels)
+		}
+		return result, 1, sampleRate, nil
+	}
+
+	return nil, 0, 0, fmt.Errorf("不支持的音频通道转换: %d -> %d", channels, targetChannels)
 }

@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	OnnxRuntimeVersion = "1.21.0"
+	OnnxRuntimeVersion = "1.25.0"
 	DefaultHFBaseURL   = "https://huggingface.co"
 	MirrorHFBaseURL    = "https://hf-mirror.com"
 	OnnxRuntimeBaseURL = "https://github.com/microsoft/onnxruntime/releases/download"

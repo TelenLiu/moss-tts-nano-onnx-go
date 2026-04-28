@@ -62,11 +62,20 @@ func parseModel(data []byte) (*Processor, error) {
 		}
 		switch fieldNum {
 		case 1:
+			// Field 1 could be either trainer_spec or pieces depending on model format
 			val, err := sr.readBytes(wireType)
 			if err != nil {
 				continue
 			}
-			parseTrainerSpec(val, p)
+			// Try to parse as SentencePiece first (newer model format)
+			// If it looks like a piece (has piece text field), treat it as piece
+			piece, isPiece := tryParseSentencePiece(val)
+			if isPiece {
+				p.Pieces = append(p.Pieces, piece)
+			} else {
+				// Otherwise treat as trainer_spec (standard format)
+				parseTrainerSpec(val, p)
+			}
 		case 5, 4:
 			val, err := sr.readBytes(wireType)
 			if err != nil {
@@ -102,6 +111,39 @@ func parseModel(data []byte) (*Processor, error) {
 		}
 	}
 	return p, nil
+}
+
+func tryParseSentencePiece(data []byte) (Piece, bool) {
+	sr := &sliceReader{data: data}
+	p := Piece{Type: PieceNormal}
+	hasPiece := false
+	for !sr.done() {
+		fieldNum, wireType, err := sr.readTag()
+		if err != nil {
+			break
+		}
+		switch fieldNum {
+		case 1:
+			val, err := sr.readString(wireType)
+			if err == nil {
+				p.Text = val
+				hasPiece = true
+			}
+		case 2:
+			val, err := sr.readFloat32(wireType)
+			if err == nil {
+				p.Score = val
+			}
+		case 3:
+			val, err := sr.readVarint(wireType)
+			if err == nil {
+				p.Type = int(val)
+			}
+		default:
+			sr.skipField(wireType)
+		}
+	}
+	return p, hasPiece
 }
 
 func parseTrainerSpec(data []byte, p *Processor) {

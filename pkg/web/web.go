@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -37,24 +38,28 @@ type Server struct {
 	Host         string
 	Port         int
 
-	mu          sync.RWMutex
-	Runtime     *ttsruntime.OnnxTtsRuntime
-	Ready       bool
-	Progress    []ProgressEvent
-	subscribers map[chan ProgressEvent]struct{}
+	mu              sync.RWMutex
+	Runtime         *ttsruntime.OnnxTtsRuntime
+	Ready           bool
+	Progress        []ProgressEvent
+	subscribers     map[chan ProgressEvent]struct{}
+	PromptUploadDir string
 }
 
 func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, outputDir, host string, port int) *Server {
 	absOutputDir, _ := filepath.Abs(outputDir)
 	os.MkdirAll(absOutputDir, 0755)
+	promptUploadDir := filepath.Join(absOutputDir, ".prompt_uploads")
+	os.MkdirAll(promptUploadDir, 0755)
 	return &Server{
-		Cfg:          cfg,
-		CpuThreads:   cpuThreads,
-		MaxNewFrames: maxNewFrames,
-		OutputDir:    absOutputDir,
-		Host:         host,
-		Port:         port,
-		subscribers:  make(map[chan ProgressEvent]struct{}),
+		Cfg:             cfg,
+		CpuThreads:      cpuThreads,
+		MaxNewFrames:    maxNewFrames,
+		OutputDir:       absOutputDir,
+		Host:            host,
+		Port:            port,
+		subscribers:     make(map[chan ProgressEvent]struct{}),
+		PromptUploadDir: promptUploadDir,
 	}
 }
 
@@ -95,6 +100,9 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/synthesize", s.handleSynthesize)
 	mux.HandleFunc("/api/voices", s.handleVoices)
 	mux.HandleFunc("/api/audio/", s.handleAudio)
+	mux.HandleFunc("/api/upload-prompt-audio", s.handleUploadPromptAudio)
+	mux.HandleFunc("/api/config/export", s.handleConfigExport)
+	mux.HandleFunc("/api/config/import", s.handleConfigImport)
 
 	go s.backgroundInit()
 
@@ -262,21 +270,38 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		voiceCloneMaxTokens = 75
 	}
 
+	promptAudioPath := req.PromptAudioPath
+	if req.UploadedPromptAudio != "" {
+		promptAudioPath = req.UploadedPromptAudio
+	}
+
+	seedVal := "nil"
+	if req.Seed != nil {
+		seedVal = fmt.Sprintf("%d", *req.Seed)
+	}
+	log.Printf("[API synthesize] text=%q voice=%q promptAudioPath=%q uploadedPromptAudio=%q sampleMode=%s maxNewFrames=%d voiceCloneMaxTokens=%d seed=%s",
+		req.Text, voice, promptAudioPath, req.UploadedPromptAudio, sampleMode, maxNewFrames, voiceCloneMaxTokens, seedVal)
+
 	result, err := rt.Synthesize(
-		req.Text, voice, req.PromptAudioPath, "",
+		req.Text, voice, promptAudioPath, "",
 		sampleMode, doSample, false,
 		maxNewFrames, voiceCloneMaxTokens,
 		true, req.Seed,
 	)
 	if err != nil {
+		log.Printf("[API synthesize] 合成失败: %v", err)
 		http.Error(w, fmt.Sprintf("Synthesis failed: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("[API synthesize] 合成成功: audio=%s sampleRate=%d audioSamples=%d elapsed=%.2fs chunks=%d",
+		result.AudioPath, result.SampleRate, result.AudioSamples, result.ElapsedSec, len(result.TextChunks))
 
 	audioFilename := filepath.Base(result.AudioPath)
 	resp := SynthesizeResponse{
 		AudioPath:      "/api/audio/" + audioFilename,
 		SampleRate:     result.SampleRate,
+		AudioSamples:   result.AudioSamples,
 		ElapsedSeconds: result.ElapsedSec,
 		Voice:          voice,
 		TextChunks:     result.TextChunks,
@@ -322,18 +347,112 @@ func (s *Server) handleVoices(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 	filename := strings.TrimPrefix(r.URL.Path, "/api/audio/")
 	filePath := filepath.Join(s.OutputDir, filename)
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+	log.Printf("[API audio] 请求音频: %s (完整路径: %s)", filename, filePath)
+
+	info, err := os.Stat(filePath)
+	if os.IsNotExist(err) {
+		log.Printf("[API audio] 音频文件不存在: %s", filePath)
 		http.Error(w, "Audio file not found", http.StatusNotFound)
 		return
 	}
+	if err != nil {
+		log.Printf("[API audio] 访问音频文件出错: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("[API audio] 提供音频: %s (大小: %d bytes)", filePath, info.Size())
 	w.Header().Set("Content-Type", "audio/wav")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	http.ServeFile(w, r, filePath)
+}
+
+func (s *Server) handleUploadPromptAudio(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	r.ParseMultipartForm(32 << 20)
+	file, header, err := r.FormFile("prompt_audio")
+	if err != nil {
+		http.Error(w, fmt.Sprintf("读取上传文件失败: %v", err), http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	ext := filepath.Ext(header.Filename)
+	if ext == "" || len(ext) > 16 {
+		ext = ".wav"
+	}
+
+	tempFile, err := os.CreateTemp(s.PromptUploadDir, "prompt-speech-*"+ext)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("创建临时文件失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer tempFile.Close()
+
+	written, err := io.Copy(tempFile, file)
+	if err != nil {
+		os.Remove(tempFile.Name())
+		http.Error(w, fmt.Sprintf("保存文件失败: %v", err), http.StatusInternalServerError)
+		return
+	}
+	if written <= 0 {
+		os.Remove(tempFile.Name())
+		http.Error(w, "上传文件为空", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[API upload] 参考音频上传成功: name=%s path=%s size=%d", header.Filename, tempFile.Name(), written)
+
+	resp := map[string]string{
+		"path": tempFile.Name(),
+		"name": header.Filename,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleConfigExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ConfigData
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=moss-tts-config.json")
+	json.NewEncoder(w).Encode(req)
+}
+
+func (s *Server) handleConfigImport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ConfigData
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("Invalid config: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(req)
 }
 
 type SynthesizeRequest struct {
 	Text                    string `json:"text"`
 	Voice                   string `json:"voice"`
 	PromptAudioPath         string `json:"prompt_audio_path"`
+	UploadedPromptAudio     string `json:"uploaded_prompt_audio"`
 	SampleMode              string `json:"sample_mode"`
 	MaxNewFrames            int    `json:"max_new_frames"`
 	VoiceCloneMaxTextTokens int    `json:"voice_clone_max_text_tokens"`
@@ -343,11 +462,23 @@ type SynthesizeRequest struct {
 type SynthesizeResponse struct {
 	AudioPath      string   `json:"audio_path"`
 	SampleRate     int      `json:"sample_rate"`
+	AudioSamples   int      `json:"audio_samples"`
 	ElapsedSeconds float64  `json:"elapsed_seconds"`
 	Voice          string   `json:"voice"`
 	TextChunks     []string `json:"text_chunks"`
 	SampleMode     string   `json:"sample_mode"`
 	DoSample       bool     `json:"do_sample"`
+}
+
+type ConfigData struct {
+	Text                    string `json:"text"`
+	Voice                   string `json:"voice"`
+	PromptText              string `json:"prompt_text"`
+	PromptAudioPath         string `json:"prompt_audio_path"`
+	SampleMode              string `json:"sample_mode"`
+	MaxNewFrames            int    `json:"max_new_frames"`
+	VoiceCloneMaxTextTokens int    `json:"voice_clone_max_text_tokens"`
+	Seed                    int    `json:"seed"`
 }
 
 var _ = audio.WriteWAV
@@ -470,24 +601,306 @@ textarea{min-height:80px;resize:vertical}
 button{background:#1a73e8;color:white;border:none;padding:10px 24px;border-radius:4px;cursor:pointer;font-size:16px}
 button:hover{background:#1557b0}
 button:disabled{background:#ccc;cursor:not-allowed}
+button.secondary{background:#fff;color:#1a73e8;border:1px solid #1a73e8;padding:6px 16px;font-size:14px;margin-right:8px}
+button.secondary:hover{background:#e8f0fe}
 .result{margin-top:20px;padding:16px;background:white;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
 audio{width:100%;margin-top:12px}
 .meta{font-size:12px;color:#666;margin-top:4px}
 .error{color:#d93025}
 .badge{display:inline-block;background:#e8f0fe;color:#1a73e8;padding:2px 8px;border-radius:12px;font-size:11px;margin-left:8px}
+.prompt-audio-box{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
+.prompt-audio-box input[type="file"]{border:none;padding:4px 0}
+.prompt-audio-box audio{margin-top:8px}
+.prompt-audio-actions{margin-top:8px}
+.config-actions{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.config-actions button{font-size:14px;padding:8px 16px}
+.row{display:flex;gap:12px}
+.row .field{flex:1}
+.details-summary{cursor:pointer;font-weight:600;color:#1a73e8}
+details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
 </style>
 </head>
 <body>
 <h1>MOSS-TTS-Nano ONNX Demo <span class="badge">Ready</span></h1>
+
+<div class="config-actions">
+  <button class="secondary" onclick="exportConfig()">导出配置</button>
+  <button class="secondary" onclick="document.getElementById('config-import').click()">导入配置</button>
+  <input type="file" id="config-import" accept=".json" style="display:none" onchange="importConfig(this)">
+</div>
+
 <div class="field"><label for="text">输入文本</label><textarea id="text" placeholder="请输入要合成的文本...">你好，欢迎使用MOSS语音合成系统。</textarea></div>
-<div class="field"><label for="voice">音色</label><select id="voice"></select></div>
-<div class="field"><label for="sample-mode">采样模式</label><select id="sample-mode"><option value="fixed">fixed</option><option value="full">full</option><option value="greedy">greedy</option></select><div class="meta">fixed 使用内置ONNX采样常数; full 使用页面参数采样; greedy 禁用采样</div></div>
-<div class="field"><label for="max-new-frames">最大帧数</label><input id="max-new-frames" type="number" value="375" min="1"></div>
+
+<div class="field">
+  <label for="voice">内置音色 / Demo 预设</label>
+  <select id="voice" onchange="onVoiceChange()"></select>
+  <div class="meta">选择内置音色或 Demo 预设，Demo 会自动填充参考文本</div>
+</div>
+
+<div class="field">
+  <label for="prompt-audio-upload">参考音频 (克隆音色)</label>
+  <div class="prompt-audio-box">
+    <input id="prompt-audio-upload" type="file" accept="audio/*,.wav,.mp3,.flac,.m4a,.ogg,.opus,.aac" onchange="onPromptAudioChange()">
+    <audio id="prompt-audio-preview" controls hidden></audio>
+    <div id="prompt-audio-source" class="meta">使用内置音色，未上传参考音频。</div>
+    <div class="prompt-audio-actions">
+      <button id="clear-prompt-btn" class="secondary" type="button" hidden onclick="clearPromptAudio()">清除参考音频</button>
+    </div>
+  </div>
+</div>
+
+<div class="field">
+  <label for="prompt-text">参考文本 (可选)</label>
+  <textarea id="prompt-text" placeholder="请输入参考音频对应的文本内容（用于辅助音色克隆，可选）"></textarea>
+  <div class="meta">参考文本是参考音频对应的文字内容，有助于更准确地克隆音色。使用 Demo 预设时会自动填充。</div>
+</div>
+
+<details>
+  <summary class="details-summary">高级选项</summary>
+  <div class="row" style="margin-top:12px;">
+    <div class="field">
+      <label for="sample-mode">采样模式</label>
+      <select id="sample-mode"><option value="fixed">fixed</option><option value="full">full</option><option value="greedy">greedy</option></select>
+      <div class="meta">fixed 使用内置ONNX采样常数; full 使用页面参数采样; greedy 禁用采样</div>
+    </div>
+    <div class="field">
+      <label for="seed">随机种子</label>
+      <input id="seed" type="number" step="1" value="0">
+      <div class="meta">0 表示随机种子</div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="field">
+      <label for="max-new-frames">最大帧数</label>
+      <input id="max-new-frames" type="number" value="375" min="1">
+    </div>
+    <div class="field">
+      <label for="voice-clone-max-text-tokens">最大文本Token数</label>
+      <input id="voice-clone-max-text-tokens" type="number" value="75" min="1">
+    </div>
+  </div>
+</details>
+
 <button id="btn" onclick="doSynthesize()">开始合成</button>
 <div id="result" class="result" style="display:none"></div>
+
 <script>
-async function loadVoices(){try{const r=await fetch('/api/voices');const v=await r.json();const sel=document.getElementById('voice');if(v.length===0){const o=document.createElement('option');o.value='Junhao';o.textContent='Junhao';sel.appendChild(o)}v.forEach(x=>{const o=document.createElement('option');o.value=x.voice;o.textContent=x.label||x.voice;sel.appendChild(o)})}catch(e){console.error(e)}}
-async function doSynthesize(){const btn=document.getElementById('btn');btn.disabled=true;btn.textContent='合成中...';const result=document.getElementById('result');result.style.display='block';result.innerHTML='<p>正在合成，请稍候...</p>';try{const body={text:document.getElementById('text').value,voice:document.getElementById('voice').value,sample_mode:document.getElementById('sample-mode').value,max_new_frames:parseInt(document.getElementById('max-new-frames').value)||375,voice_clone_max_text_tokens:75};const r=await fetch('/api/synthesize',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const data=await r.json();if(!r.ok){result.innerHTML='<p class="error">错误: '+(data.error||r.statusText)+'</p>';return}result.innerHTML='<p><strong>合成完成!</strong> 耗时: '+data.elapsed_seconds.toFixed(2)+'秒 采样率: '+data.sample_rate+'Hz</p><p>采样模式: '+data.sample_mode+' | 分块数: '+(data.text_chunks?data.text_chunks.length:0)+'</p><audio controls src="'+data.audio_path+'" type="audio/wav"></audio>'}catch(e){result.innerHTML='<p class="error">请求失败: '+e.message+'</p>'}finally{btn.disabled=false;btn.textContent='开始合成'}}
+let uploadedPromptAudioPath = '';
+let uploadedPromptAudioName = '';
+let voiceDataMap = {};
+
+async function loadVoices() {
+  try {
+    const r = await fetch('/api/voices');
+    const v = await r.json();
+    const sel = document.getElementById('voice');
+    sel.innerHTML = '';
+
+    const builtinGroup = document.createElement('optgroup');
+    builtinGroup.label = '内置音色';
+    const demoGroup = document.createElement('optgroup');
+    demoGroup.label = 'Demo 预设';
+
+    let hasBuiltin = false;
+    let hasDemo = false;
+
+    v.forEach(x => {
+      voiceDataMap[x.voice] = x;
+      const o = document.createElement('option');
+      o.value = x.voice;
+      o.textContent = x.label || x.voice;
+      if (x.is_demo) {
+        demoGroup.appendChild(o);
+        hasDemo = true;
+      } else {
+        builtinGroup.appendChild(o);
+        hasBuiltin = true;
+      }
+    });
+
+    if (!hasBuiltin && !hasDemo) {
+      const o = document.createElement('option');
+      o.value = 'Junhao';
+      o.textContent = 'Junhao';
+      sel.appendChild(o);
+    }
+    if (hasBuiltin) sel.appendChild(builtinGroup);
+    if (hasDemo) sel.appendChild(demoGroup);
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function onVoiceChange() {
+  const voice = document.getElementById('voice').value;
+  const data = voiceDataMap[voice];
+  if (data && data.prompt_text) {
+    document.getElementById('prompt-text').value = data.prompt_text;
+  }
+}
+
+function onPromptAudioChange() {
+  const input = document.getElementById('prompt-audio-upload');
+  const preview = document.getElementById('prompt-audio-preview');
+  const source = document.getElementById('prompt-audio-source');
+  const clearBtn = document.getElementById('clear-prompt-btn');
+  const files = input.files;
+
+  if (files && files.length > 0) {
+    const file = files[0];
+    preview.src = URL.createObjectURL(file);
+    preview.hidden = false;
+    input.hidden = true;
+    source.textContent = '已选择: ' + file.name + ' (点击合成时将上传)';
+    clearBtn.hidden = false;
+    uploadedPromptAudioName = file.name;
+  }
+}
+
+function clearPromptAudio() {
+  const input = document.getElementById('prompt-audio-upload');
+  const preview = document.getElementById('prompt-audio-preview');
+  const source = document.getElementById('prompt-audio-source');
+  const clearBtn = document.getElementById('clear-prompt-btn');
+
+  input.value = '';
+  preview.pause();
+  preview.removeAttribute('src');
+  preview.load();
+  preview.hidden = true;
+  input.hidden = false;
+  source.textContent = '使用内置音色，未上传参考音频。';
+  clearBtn.hidden = true;
+  uploadedPromptAudioPath = '';
+  uploadedPromptAudioName = '';
+}
+
+async function uploadPromptAudio(file) {
+  const formData = new FormData();
+  formData.append('prompt_audio', file);
+  const r = await fetch('/api/upload-prompt-audio', { method: 'POST', body: formData });
+  if (!r.ok) throw new Error('上传失败');
+  const data = await r.json();
+  return data.path;
+}
+
+function getConfig() {
+  const seedVal = parseInt(document.getElementById('seed').value) || 0;
+  return {
+    text: document.getElementById('text').value,
+    voice: document.getElementById('voice').value,
+    prompt_text: document.getElementById('prompt-text').value,
+    prompt_audio_path: uploadedPromptAudioPath,
+    prompt_audio_name: uploadedPromptAudioName,
+    sample_mode: document.getElementById('sample-mode').value,
+    max_new_frames: parseInt(document.getElementById('max-new-frames').value) || 375,
+    voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 75,
+    seed: seedVal === 0 ? null : seedVal
+  };
+}
+
+function applyConfig(cfg) {
+  if (cfg.text !== undefined) document.getElementById('text').value = cfg.text;
+  if (cfg.voice !== undefined) document.getElementById('voice').value = cfg.voice;
+  if (cfg.prompt_text !== undefined) document.getElementById('prompt-text').value = cfg.prompt_text;
+  if (cfg.sample_mode !== undefined) document.getElementById('sample-mode').value = cfg.sample_mode;
+  if (cfg.max_new_frames !== undefined) document.getElementById('max-new-frames').value = cfg.max_new_frames;
+  if (cfg.voice_clone_max_text_tokens !== undefined) document.getElementById('voice-clone-max-text-tokens').value = cfg.voice_clone_max_text_tokens;
+  if (cfg.seed !== undefined) document.getElementById('seed').value = cfg.seed || 0;
+  // 恢复参考音频信息（仅显示，需要重新上传文件）
+  if (cfg.prompt_audio_name) {
+    uploadedPromptAudioName = cfg.prompt_audio_name;
+    uploadedPromptAudioPath = cfg.prompt_audio_path || '';
+    document.getElementById('prompt-audio-source').textContent = '配置中的参考音频: ' + cfg.prompt_audio_name + ' (请重新上传文件)';
+  }
+}
+
+function exportConfig() {
+  const cfg = getConfig();
+  const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'moss-tts-config.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function importConfig(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const cfg = JSON.parse(e.target.result);
+      applyConfig(cfg);
+      alert('配置导入成功');
+    } catch (err) {
+      alert('配置导入失败: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+  input.value = '';
+}
+
+async function doSynthesize() {
+  const btn = document.getElementById('btn');
+  btn.disabled = true;
+  btn.textContent = '合成中...';
+  const result = document.getElementById('result');
+  result.style.display = 'block';
+  result.innerHTML = '<p>正在合成，请稍候...</p>';
+
+  try {
+    const input = document.getElementById('prompt-audio-upload');
+    const files = input.files;
+    let uploadedPath = '';
+
+    if (files && files.length > 0) {
+      result.innerHTML = '<p>正在上传参考音频...</p>';
+      uploadedPath = await uploadPromptAudio(files[0]);
+      uploadedPromptAudioPath = uploadedPath;
+    }
+
+    const cfg = getConfig();
+    const body = {
+      text: cfg.text,
+      voice: cfg.voice,
+      prompt_audio_path: '',
+      uploaded_prompt_audio: uploadedPath,
+      sample_mode: cfg.sample_mode,
+      max_new_frames: cfg.max_new_frames,
+      voice_clone_max_text_tokens: cfg.voice_clone_max_text_tokens,
+      seed: cfg.seed
+    };
+
+    result.innerHTML = '<p>正在合成语音...</p>';
+    const r = await fetch('/api/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      result.innerHTML = '<p class="error">错误: ' + (data.error || r.statusText) + '</p>';
+      return;
+    }
+    const durationSec = data.sample_rate > 0 ? (data.audio_samples / data.sample_rate).toFixed(2) : '0.00';
+    result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + data.elapsed_seconds.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 采样率: ' + data.sample_rate + 'Hz</p><p>音色: ' + data.voice + ' | 采样模式: ' + data.sample_mode + ' | 分块数: ' + (data.text_chunks ? data.text_chunks.length : 0) + '</p>';
+    const audioEl = document.createElement('audio');
+    audioEl.controls = true;
+    audioEl.type = 'audio/wav';
+    audioEl.preload = 'none';
+    audioEl.src = data.audio_path;
+    result.appendChild(audioEl);
+  } catch (e) {
+    result.innerHTML = '<p class="error">请求失败: ' + e.message + '</p>';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '开始合成';
+  }
+}
+
 loadVoices();
 </script>
 </body>
