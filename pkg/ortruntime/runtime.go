@@ -1,6 +1,7 @@
 package ortruntime
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -34,6 +35,231 @@ type OnnxSessions struct {
 	CodecEncode            *ort.DynamicAdvancedSession
 	CodecDecode            *ort.DynamicAdvancedSession
 	CodecDecodeStep        *ort.DynamicAdvancedSession
+}
+
+type CodecStreamingDecodeSession struct {
+	CodecMeta        map[string]interface{}
+	Session          *ort.DynamicAdvancedSession
+	TransformerSpecs []map[string]interface{}
+	AttentionSpecs   []map[string]interface{}
+	StateFeeds       map[string]ort.Value
+}
+
+func NewCodecStreamingDecodeSession(codecMeta map[string]interface{}, session *ort.DynamicAdvancedSession) *CodecStreamingDecodeSession {
+	s := &CodecStreamingDecodeSession{
+		CodecMeta:  codecMeta,
+		Session:    session,
+		StateFeeds: make(map[string]ort.Value),
+	}
+	if streamingDecode, ok := codecMeta["streaming_decode"].(map[string]interface{}); ok {
+		if toffsets, ok := streamingDecode["transformer_offsets"].([]interface{}); ok {
+			for _, spec := range toffsets {
+				if m, ok := spec.(map[string]interface{}); ok {
+					s.TransformerSpecs = append(s.TransformerSpecs, m)
+				}
+			}
+		}
+		if acaches, ok := streamingDecode["attention_caches"].([]interface{}); ok {
+			for _, spec := range acaches {
+				if m, ok := spec.(map[string]interface{}); ok {
+					s.AttentionSpecs = append(s.AttentionSpecs, m)
+				}
+			}
+		}
+	}
+	s.Reset()
+	return s
+}
+
+func (s *CodecStreamingDecodeSession) Reset() {
+	for _, v := range s.StateFeeds {
+		if v != nil {
+			v.Destroy()
+		}
+	}
+	s.StateFeeds = make(map[string]ort.Value)
+	for _, spec := range s.TransformerSpecs {
+		shape := toInt64Slice(spec["shape"])
+		data := make([]int32, totalDimFromShape(shape))
+		t, _ := ort.NewTensor(shape, data)
+		s.StateFeeds[fmt.Sprintf("%v", spec["input_name"])] = t
+	}
+	for _, spec := range s.AttentionSpecs {
+		offsetShape := toInt64Slice(spec["offset_shape"])
+		cacheShape := toInt64Slice(spec["cache_shape"])
+		positionsShape := toInt64Slice(spec["positions_shape"])
+		offsetData := make([]int32, totalDimFromShape(offsetShape))
+		cacheData := make([]float32, totalDimFromShape(cacheShape))
+		positionsData := make([]int32, totalDimFromShape(positionsShape))
+		for i := range positionsData {
+			positionsData[i] = -1
+		}
+		offsetT, _ := ort.NewTensor(offsetShape, offsetData)
+		cacheKeysT, _ := ort.NewTensor(cacheShape, cacheData)
+		cacheValuesT, _ := ort.NewTensor(cacheShape, cacheData)
+		positionsT, _ := ort.NewTensor(positionsShape, positionsData)
+		s.StateFeeds[fmt.Sprintf("%v", spec["offset_input_name"])] = offsetT
+		s.StateFeeds[fmt.Sprintf("%v", spec["cached_keys_input_name"])] = cacheKeysT
+		s.StateFeeds[fmt.Sprintf("%v", spec["cached_values_input_name"])] = cacheValuesT
+		s.StateFeeds[fmt.Sprintf("%v", spec["cached_positions_input_name"])] = positionsT
+	}
+}
+
+func (s *CodecStreamingDecodeSession) RunFrames(frameRows [][]int) ([][]float32, int) {
+	if len(frameRows) == 0 || s.Session == nil {
+		return nil, 0
+	}
+	codecConfig := s.CodecMeta["codec_config"].(map[string]interface{})
+	numQuantizers := int(toFloat64(codecConfig["num_quantizers"]))
+	frameCount := len(frameRows)
+
+	audioCodes := make([]int32, frameCount*numQuantizers)
+	for fi, frame := range frameRows {
+		for ci := 0; ci < numQuantizers; ci++ {
+			val := int32(0)
+			if ci < len(frame) {
+				val = int32(frame[ci])
+			}
+			audioCodes[fi*numQuantizers+ci] = val
+		}
+	}
+
+	audioCodesShape := []int64{1, int64(frameCount), int64(numQuantizers)}
+	audioCodesTensor, _ := ort.NewTensor(audioCodesShape, audioCodes)
+	audioCodeLengths := []int32{int32(frameCount)}
+	audioCodeLengthsTensor, _ := ort.NewTensor([]int64{1}, audioCodeLengths)
+
+	inputs := []ort.Value{audioCodesTensor, audioCodeLengthsTensor}
+	inputNames := []string{"audio_codes", "audio_code_lengths"}
+
+	for _, spec := range s.TransformerSpecs {
+		name := fmt.Sprintf("%v", spec["input_name"])
+		if v, ok := s.StateFeeds[name]; ok {
+			inputs = append(inputs, v)
+			inputNames = append(inputNames, name)
+		}
+	}
+	for _, spec := range s.AttentionSpecs {
+		for _, key := range []string{"offset_input_name", "cached_keys_input_name", "cached_values_input_name", "cached_positions_input_name"} {
+			name := fmt.Sprintf("%v", spec[key])
+			if v, ok := s.StateFeeds[name]; ok {
+				inputs = append(inputs, v)
+				inputNames = append(inputNames, name)
+			}
+		}
+	}
+
+	outputs := make([]ort.Value, len(inputNames))
+	err := s.Session.Run(inputs, outputs)
+
+	audioCodesTensor.Destroy()
+	audioCodeLengthsTensor.Destroy()
+
+	if err != nil {
+		log.Printf("  codec_decode_step 失败: %v", err)
+		for _, v := range outputs {
+			if v != nil {
+				v.Destroy()
+			}
+		}
+		return nil, 0
+	}
+
+	outputNames := []string{"audio", "audio_lengths"}
+	for _, spec := range s.TransformerSpecs {
+		outputNames = append(outputNames, fmt.Sprintf("%v", spec["output_name"]))
+	}
+	for _, spec := range s.AttentionSpecs {
+		for _, key := range []string{"offset_output_name", "cached_keys_output_name", "cached_values_output_name", "cached_positions_output_name"} {
+			outputNames = append(outputNames, fmt.Sprintf("%v", spec[key]))
+		}
+	}
+
+	namedOutputs := make(map[string]ort.Value)
+	for i, name := range outputNames {
+		if i < len(outputs) {
+			namedOutputs[name] = outputs[i]
+		}
+	}
+
+	for _, spec := range s.TransformerSpecs {
+		inName := fmt.Sprintf("%v", spec["input_name"])
+		outName := fmt.Sprintf("%v", spec["output_name"])
+		if oldV, ok := s.StateFeeds[inName]; ok && oldV != nil {
+			oldV.Destroy()
+		}
+		if newV, ok := namedOutputs[outName]; ok && newV != nil {
+			s.StateFeeds[inName] = newV
+		}
+	}
+	for _, spec := range s.AttentionSpecs {
+		pairs := []struct{ inKey, outKey string }{
+			{"offset_input_name", "offset_output_name"},
+			{"cached_keys_input_name", "cached_keys_output_name"},
+			{"cached_values_input_name", "cached_values_output_name"},
+			{"cached_positions_input_name", "cached_positions_output_name"},
+		}
+		for _, pair := range pairs {
+			inName := fmt.Sprintf("%v", spec[pair.inKey])
+			outName := fmt.Sprintf("%v", spec[pair.outKey])
+			if oldV, ok := s.StateFeeds[inName]; ok && oldV != nil {
+				oldV.Destroy()
+			}
+			if newV, ok := namedOutputs[outName]; ok && newV != nil {
+				s.StateFeeds[inName] = newV
+			}
+		}
+	}
+
+	audioLengthData := getInt32Data(namedOutputs["audio_lengths"])
+	audioLength := int32(0)
+	if len(audioLengthData) > 0 {
+		audioLength = audioLengthData[0]
+	}
+
+	audioData := getFloat32Data(namedOutputs["audio"])
+	audioShape := namedOutputs["audio"].GetShape()
+
+	numChannels := 1
+	maxSamplesPerChannel := int(audioLength)
+	if len(audioShape) >= 3 {
+		numChannels = int(audioShape[1])
+		maxSamplesPerChannel = int(audioShape[2])
+	} else if len(audioShape) >= 2 {
+		numChannels = int(audioShape[1])
+	}
+	if numChannels <= 0 {
+		numChannels = 1
+	}
+
+	actualSamplesPerChannel := int(audioLength)
+	if actualSamplesPerChannel > maxSamplesPerChannel {
+		actualSamplesPerChannel = maxSamplesPerChannel
+	}
+
+	channels := make([][]float32, numChannels)
+	for ch := 0; ch < numChannels; ch++ {
+		startOff := ch * maxSamplesPerChannel
+		endOff := startOff + actualSamplesPerChannel
+		if endOff > len(audioData) {
+			endOff = len(audioData)
+		}
+		if startOff >= len(audioData) {
+			channels[ch] = make([]float32, 0)
+			continue
+		}
+		channels[ch] = make([]float32, endOff-startOff)
+		copy(channels[ch], audioData[startOff:endOff])
+	}
+
+	if audioV, ok := namedOutputs["audio"]; ok && audioV != nil {
+		audioV.Destroy()
+	}
+	if alV, ok := namedOutputs["audio_lengths"]; ok && alV != nil {
+		alV.Destroy()
+	}
+
+	return channels, actualSamplesPerChannel
 }
 
 type OrtCpuRuntime struct {
@@ -116,10 +342,29 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 	codecFiles := rt.CodecMeta["files"].(map[string]interface{})
 	onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
 	sessions := &OnnxSessions{}
+
+	sessionOptions, err := ort.NewSessionOptions()
+	if err != nil {
+		return fmt.Errorf("创建 SessionOptions 失败: %w", err)
+	}
+	defer sessionOptions.Destroy()
+	if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevel(99)); err != nil {
+		log.Printf("  警告: 设置图优化级别失败: %v", err)
+	}
+	if err := sessionOptions.SetIntraOpNumThreads(rt.ThreadCount); err != nil {
+		log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+	}
+	if err := sessionOptions.SetInterOpNumThreads(1); err != nil {
+		log.Printf("  警告: 设置 InterOp 线程数失败: %v", err)
+	}
+
 	load := func(name, dir string, filename interface{}, inputNames, outputNames []string) error {
+		if filename == nil {
+			return nil
+		}
 		onnxPath := filepath.Join(dir, fmt.Sprintf("%v", filename))
-		log.Printf("  加载 ONNX session: %s (inputs=%d outputs=%d)", name, len(inputNames), len(outputNames))
-		sess, err := ort.NewDynamicAdvancedSession(onnxPath, inputNames, outputNames, nil)
+		log.Printf("  加载 ONNX session: %s (inputs=%d outputs=%d threads=%d)", name, len(inputNames), len(outputNames), rt.ThreadCount)
+		sess, err := ort.NewDynamicAdvancedSession(onnxPath, inputNames, outputNames, sessionOptions)
 		if err != nil {
 			return fmt.Errorf("创建 ONNX session 失败 (%s): %w", name, err)
 		}
@@ -174,7 +419,12 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 	if err := load("codec_decode", codecDir, codecFiles["decode_full"], []string{"audio_codes", "audio_code_lengths"}, []string{"audio", "audio_lengths"}); err != nil {
 		return err
 	}
-	load("codec_decode_step", codecDir, codecFiles["decode_step"], nil, nil)
+	if f, ok := codecFiles["decode_step"]; ok && f != nil {
+		codecOnnxInfo := rt.CodecMeta["onnx"].(map[string]interface{})
+		dsInputs := toStrSlice(codecOnnxInfo["decode_step_input_names"])
+		dsOutputs := toStrSlice(codecOnnxInfo["decode_step_output_names"])
+		load("codec_decode_step", codecDir, f, dsInputs, dsOutputs)
+	}
 	rt.Onnx = sessions
 	return nil
 }
@@ -276,6 +526,16 @@ func (rt *OrtCpuRuntime) BuildVoiceCloneRequestRows(promptAudioCodes [][]int, te
 }
 
 func (rt *OrtCpuRuntime) GenerateAudioFrames(requestRows map[string][][]int32) [][]int {
+	return rt.GenerateAudioFramesWithContext(context.Background(), requestRows)
+}
+
+func (rt *OrtCpuRuntime) GenerateAudioFramesWithContext(ctx context.Context, requestRows map[string][][]int32) [][]int {
+	return rt.GenerateAudioFramesWithCallback(ctx, requestRows, nil)
+}
+
+type FrameCallback func(generatedFrames [][]int, stepIndex int, frame []int)
+
+func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, requestRows map[string][][]int32, onFrame FrameCallback) [][]int {
 	gd := rt.Manifest["generation_defaults"].(map[string]interface{})
 	ttsConfig := rt.Manifest["tts_config"].(map[string]interface{})
 	onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
@@ -288,6 +548,12 @@ func (rt *OrtCpuRuntime) GenerateAudioFrames(requestRows map[string][][]int32) [
 		audioCodebookSize = audioCodebookSizes[0]
 	}
 	sampleMode := fmt.Sprintf("%v", gd["sample_mode"])
+
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
 
 	inputIDs3D := [][][]int32{requestRows["inputIds"]}
 	flatIDs, idDims := flatten3dInt32(inputIDs3D)
@@ -338,6 +604,19 @@ func (rt *OrtCpuRuntime) GenerateAudioFrames(requestRows map[string][][]int32) [
 	decodeOutputNames := toStrSlice(onnxInfo["decode_output_names"])
 
 	for stepIndex := 0; stepIndex < maxNewFrames; stepIndex++ {
+		select {
+		case <-ctx.Done():
+			log.Printf("  生成被取消")
+			for _, v := range pastByName {
+				v.Destroy()
+			}
+			for _, v := range prefillOutputs {
+				v.Destroy()
+			}
+			return nil
+		default:
+		}
+
 		var frame []int
 		shouldContinue := true
 
@@ -362,6 +641,10 @@ func (rt *OrtCpuRuntime) GenerateAudioFrames(requestRows map[string][][]int32) [
 			prevTokenSetsByChannel[ci][token] = true
 		}
 		generatedFrames = append(generatedFrames, frame)
+
+		if onFrame != nil {
+			onFrame(generatedFrames, stepIndex, frame)
+		}
 
 		audioPad := int32(toFloat64(ttsConfig["audio_pad_token_id"]))
 		assistSlot := int32(toFloat64(ttsConfig["audio_assistant_slot_token_id"]))
@@ -704,9 +987,20 @@ func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, 
 }
 
 func (rt *OrtCpuRuntime) DecodeFullAudio(generatedFrames [][]int) ([][]float32, int) {
+	return rt.DecodeFullAudioWithContext(context.Background(), generatedFrames)
+}
+
+func (rt *OrtCpuRuntime) DecodeFullAudioWithContext(ctx context.Context, generatedFrames [][]int) ([][]float32, int) {
 	if len(generatedFrames) == 0 || rt.Onnx.CodecDecode == nil {
 		return nil, 0
 	}
+
+	select {
+	case <-ctx.Done():
+		return nil, 0
+	default:
+	}
+
 	codecConfig := rt.CodecMeta["codec_config"].(map[string]interface{})
 	numQuantizers := int(toFloat64(codecConfig["num_quantizers"]))
 	frameCount := len(generatedFrames)
@@ -759,36 +1053,34 @@ func (rt *OrtCpuRuntime) DecodeFullAudio(generatedFrames [][]int) ([][]float32, 
 	}
 
 	numChannels := 1
-	samplesPerChannel := int(audioLength)
+	maxSamplesPerChannel := int(audioLength)
 	if len(audioShape) >= 3 {
 		numChannels = int(audioShape[1])
-		samplesPerChannel = int(audioShape[2])
-		if int(audioLength) < samplesPerChannel {
-			samplesPerChannel = int(audioLength)
-		}
+		maxSamplesPerChannel = int(audioShape[2])
 	} else if len(audioShape) >= 1 {
 		numChannels = 1
 	}
 	if numChannels <= 0 {
 		numChannels = 1
 	}
-	if samplesPerChannel*numChannels > len(audioData) {
-		samplesPerChannel = len(audioData) / numChannels
-	}
 
 	channels := make([][]float32, numChannels)
 	for ch := 0; ch < numChannels; ch++ {
-		startOff := ch * samplesPerChannel
-		endOff := startOff + samplesPerChannel
+		startOff := ch * maxSamplesPerChannel
+		endOff := startOff + int(audioLength)
 		if endOff > len(audioData) {
 			endOff = len(audioData)
+		}
+		if startOff >= len(audioData) {
+			channels[ch] = make([]float32, 0)
+			continue
 		}
 		channels[ch] = make([]float32, endOff-startOff)
 		copy(channels[ch], audioData[startOff:endOff])
 	}
 
-	log.Printf("  解码音频: frames=%d channels=%d samples=%d audioShape=%v", frameCount, numChannels, samplesPerChannel, audioShape)
-	return channels, samplesPerChannel
+	log.Printf("  解码音频: frames=%d channels=%d samples=%d audioShape=%v", frameCount, numChannels, audioLength, audioShape)
+	return channels, int(audioLength)
 }
 
 func (rt *OrtCpuRuntime) Close() {
@@ -1056,6 +1348,33 @@ func toStrSlice(v interface{}) []string {
 		return result
 	case []string:
 		return val
+	default:
+		return nil
+	}
+}
+
+func toInt64Slice(v interface{}) []int64 {
+	switch val := v.(type) {
+	case []interface{}:
+		result := make([]int64, len(val))
+		for i, item := range val {
+			result[i] = int64(toFloat64(item))
+		}
+		return result
+	case []int64:
+		return val
+	case []int:
+		result := make([]int64, len(val))
+		for i, item := range val {
+			result[i] = int64(item)
+		}
+		return result
+	case []float64:
+		result := make([]int64, len(val))
+		for i, item := range val {
+			result[i] = int64(item)
+		}
+		return result
 	default:
 		return nil
 	}

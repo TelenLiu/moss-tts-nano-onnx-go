@@ -1,10 +1,14 @@
 package web
 
 import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -30,37 +34,57 @@ type ProgressEvent struct {
 	SpeedMBps  float64 `json:"speed_mbps,omitempty"`
 }
 
+type DemoEntry struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Role string `json:"role"`
+	Text string `json:"text"`
+	Path string `json:"-"`
+}
+
 type Server struct {
 	Cfg          *deps.Config
 	CpuThreads   int
 	MaxNewFrames int
-	OutputDir    string
 	Host         string
 	Port         int
+	AppRoot      string
 
 	mu              sync.RWMutex
 	Runtime         *ttsruntime.OnnxTtsRuntime
 	Ready           bool
 	Progress        []ProgressEvent
 	subscribers     map[chan ProgressEvent]struct{}
-	PromptUploadDir string
+	DemoEntries     []DemoEntry
+	DemoEntriesByID map[string]*DemoEntry
+	AssetsDir       string
 }
 
-func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, outputDir, host string, port int) *Server {
-	absOutputDir, _ := filepath.Abs(outputDir)
-	os.MkdirAll(absOutputDir, 0755)
-	promptUploadDir := filepath.Join(absOutputDir, ".prompt_uploads")
-	os.MkdirAll(promptUploadDir, 0755)
-	return &Server{
+func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, host string, port int, appRoot string) *Server {
+	cwd, _ := os.Getwd()
+	assetsDir := filepath.Join(cwd, "assets")
+	demoPath := filepath.Join(assetsDir, "demo.jsonl")
+
+	s := &Server{
 		Cfg:             cfg,
 		CpuThreads:      cpuThreads,
 		MaxNewFrames:    maxNewFrames,
-		OutputDir:       absOutputDir,
 		Host:            host,
 		Port:            port,
+		AppRoot:         appRoot,
 		subscribers:     make(map[chan ProgressEvent]struct{}),
-		PromptUploadDir: promptUploadDir,
+		DemoEntriesByID: make(map[string]*DemoEntry),
+		AssetsDir:       assetsDir,
 	}
+
+	if _, err := os.Stat(demoPath); err == nil {
+		s.loadDemoEntries(demoPath, assetsDir)
+		log.Printf("[Demo] 已加载 %d 个默认样例", len(s.DemoEntries))
+	} else {
+		log.Printf("[Demo] 未找到demo.jsonl，跳过加载: %v", err)
+	}
+
+	return s
 }
 
 func (s *Server) emit(evt ProgressEvent) {
@@ -78,6 +102,62 @@ func (s *Server) emit(evt ProgressEvent) {
 		}
 	}
 	log.Printf("[%s] %s (%.0f%%)", evt.Phase, evt.Message, evt.Percent)
+}
+
+func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
+	file, err := os.Open(demoPath)
+	if err != nil {
+		log.Printf("[Demo] 打开demo.jsonl失败: %v", err)
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	demoIndex := 1
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var entry struct {
+			Name string `json:"name"`
+			Role string `json:"role"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			log.Printf("[Demo] 解析demo行失败: %v", err)
+			continue
+		}
+
+		if entry.Role == "" || entry.Text == "" {
+			continue
+		}
+
+		rolePath := entry.Role
+		rolePath = strings.TrimPrefix(rolePath, "assets/")
+		fullPath := filepath.Join(assetsDir, filepath.FromSlash(rolePath))
+		if _, err := os.Stat(fullPath); err != nil {
+			log.Printf("[Demo] 跳过demo，音频文件不存在: %s", fullPath)
+			continue
+		}
+
+		demoID := fmt.Sprintf("demo-%d", demoIndex)
+		demoEntry := DemoEntry{
+			ID:   demoID,
+			Name: entry.Name,
+			Role: entry.Role,
+			Text: entry.Text,
+			Path: fullPath,
+		}
+		s.DemoEntries = append(s.DemoEntries, demoEntry)
+		s.DemoEntriesByID[demoID] = &s.DemoEntries[len(s.DemoEntries)-1]
+		demoIndex++
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("[Demo] 读取demo.jsonl错误: %v", err)
+	}
 }
 
 func (s *Server) Start() error {
@@ -103,6 +183,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/upload-prompt-audio", s.handleUploadPromptAudio)
 	mux.HandleFunc("/api/config/export", s.handleConfigExport)
 	mux.HandleFunc("/api/config/import", s.handleConfigImport)
+	mux.HandleFunc("/api/demos", s.handleDemos)
+	mux.HandleFunc("/api/demo-prompt-audio/", s.handleDemoPromptAudio)
 
 	go s.backgroundInit()
 
@@ -140,7 +222,6 @@ func (s *Server) backgroundInit() {
 	rt, err := ttsruntime.NewOnnxTtsRuntime(
 		s.Cfg.ModelDir, s.CpuThreads,
 		&s.MaxNewFrames, nil, nil,
-		s.OutputDir,
 	)
 	if err != nil {
 		s.emit(ProgressEvent{Phase: "error", Message: fmt.Sprintf("TTS 运行时初始化失败: %v", err), Error: fmt.Sprintf("TTS 运行时初始化失败: %v", err)})
@@ -273,16 +354,35 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	promptAudioPath := req.PromptAudioPath
 	if req.UploadedPromptAudio != "" {
 		promptAudioPath = req.UploadedPromptAudio
+	} else if req.DemoID != "" {
+		s.mu.RLock()
+		if demo, ok := s.DemoEntriesByID[req.DemoID]; ok {
+			promptAudioPath = demo.Path
+		}
+		s.mu.RUnlock()
 	}
 
 	seedVal := "nil"
 	if req.Seed != nil {
 		seedVal = fmt.Sprintf("%d", *req.Seed)
 	}
-	log.Printf("[API synthesize] text=%q voice=%q promptAudioPath=%q uploadedPromptAudio=%q sampleMode=%s maxNewFrames=%d voiceCloneMaxTokens=%d seed=%s",
-		req.Text, voice, promptAudioPath, req.UploadedPromptAudio, sampleMode, maxNewFrames, voiceCloneMaxTokens, seedVal)
+	log.Printf("[API synthesize] text=%q voice=%q promptAudioPath=%q uploadedPromptAudio=%q sampleMode=%s maxNewFrames=%d voiceCloneMaxTokens=%d seed=%s stream=%v",
+		req.Text, voice, promptAudioPath, req.UploadedPromptAudio, sampleMode, maxNewFrames, voiceCloneMaxTokens, seedVal, req.Stream)
 
-	result, err := rt.Synthesize(
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	go func() {
+		<-ctx.Done()
+		log.Printf("[API synthesize] 请求断开，取消合成")
+	}()
+
+	if req.Stream {
+		s.handleStreamSynthesize(w, ctx, rt, req, voice, promptAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens)
+		return
+	}
+
+	result, err := rt.SynthesizeWithContext(ctx,
 		req.Text, voice, promptAudioPath, "",
 		sampleMode, doSample, false,
 		maxNewFrames, voiceCloneMaxTokens,
@@ -294,12 +394,12 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API synthesize] 合成成功: audio=%s sampleRate=%d audioSamples=%d elapsed=%.2fs chunks=%d",
-		result.AudioPath, result.SampleRate, result.AudioSamples, result.ElapsedSec, len(result.TextChunks))
+	log.Printf("[API synthesize] 合成成功: sampleRate=%d audioSamples=%d elapsed=%.2fs chunks=%d",
+		result.SampleRate, result.AudioSamples, result.ElapsedSec, len(result.TextChunks))
 
-	audioFilename := filepath.Base(result.AudioPath)
 	resp := SynthesizeResponse{
-		AudioPath:      "/api/audio/" + audioFilename,
+		AudioPath:      "",
+		AudioDataB64:   base64.StdEncoding.EncodeToString(result.AudioData),
 		SampleRate:     result.SampleRate,
 		AudioSamples:   result.AudioSamples,
 		ElapsedSeconds: result.ElapsedSec,
@@ -310,6 +410,74 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	chunkChan, err := rt.SynthesizeStream(ctx,
+		req.Text, voice, promptAudioPath,
+		sampleMode, doSample,
+		maxNewFrames, voiceCloneMaxTokens,
+		true, req.Seed,
+	)
+	if err != nil {
+		log.Printf("[API synthesize stream] 流式合成启动失败: %v", err)
+		return
+	}
+
+	totalSamples := 0
+	chunkCount := 0
+	startTime := time.Now()
+	headersSent := false
+
+	for chunk := range chunkChan {
+		select {
+		case <-ctx.Done():
+			log.Printf("[API synthesize stream] 请求断开，停止流式输出")
+			return
+		default:
+		}
+
+		if len(chunk.Waveform) == 0 {
+			continue
+		}
+
+		if !headersSent {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("Transfer-Encoding", "chunked")
+			w.Header().Set("X-Audio-Codec", "pcm_f32le")
+			w.Header().Set("X-Audio-Sample-Rate", fmt.Sprintf("%d", chunk.SampleRate))
+			w.Header().Set("X-Audio-Channels", fmt.Sprintf("%d", chunk.Channels))
+			w.WriteHeader(http.StatusOK)
+			headersSent = true
+		}
+
+		pcmData := make([]byte, len(chunk.Waveform)*4)
+		for i, sample := range chunk.Waveform {
+			bits := math.Float32bits(sample)
+			binary.LittleEndian.PutUint32(pcmData[i*4:], bits)
+		}
+
+		if _, err := w.Write(pcmData); err != nil {
+			log.Printf("[API synthesize stream] 写入流失败: %v", err)
+			return
+		}
+		flusher.Flush()
+
+		totalSamples += len(chunk.Waveform) / chunk.Channels
+		chunkCount++
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	log.Printf("[API synthesize stream] 流式合成完成: chunks=%d totalSamples=%d elapsed=%.2fs",
+		chunkCount, totalSamples, elapsed)
 }
 
 func (s *Server) handleVoices(w http.ResponseWriter, r *http.Request) {
@@ -346,7 +514,7 @@ func (s *Server) handleVoices(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 	filename := strings.TrimPrefix(r.URL.Path, "/api/audio/")
-	filePath := filepath.Join(s.OutputDir, filename)
+	filePath := filepath.Join(os.TempDir(), filename)
 	log.Printf("[API audio] 请求音频: %s (完整路径: %s)", filename, filePath)
 
 	info, err := os.Stat(filePath)
@@ -373,43 +541,56 @@ func (s *Server) handleUploadPromptAudio(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	r.ParseMultipartForm(32 << 20)
-	file, header, err := r.FormFile("prompt_audio")
-	if err != nil {
-		http.Error(w, fmt.Sprintf("读取上传文件失败: %v", err), http.StatusBadRequest)
+	var req struct {
+		AudioDataB64 string `json:"audio_data_b64"`
+		FileName     string `json:"file_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("解析请求失败: %v", err), http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
-
-	ext := filepath.Ext(header.Filename)
-	if ext == "" || len(ext) > 16 {
-		ext = ".wav"
+	if req.AudioDataB64 == "" {
+		http.Error(w, "audio_data_b64 不能为空", http.StatusBadRequest)
+		return
 	}
 
-	tempFile, err := os.CreateTemp(s.PromptUploadDir, "prompt-speech-*"+ext)
+	audioData, err := base64.StdEncoding.DecodeString(req.AudioDataB64)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("base64解码失败: %v", err), http.StatusBadRequest)
+		return
+	}
+	if len(audioData) == 0 {
+		http.Error(w, "音频数据为空", http.StatusBadRequest)
+		return
+	}
+
+	ext := ".wav"
+	if req.FileName != "" {
+		e := filepath.Ext(req.FileName)
+		if e != "" && len(e) <= 16 {
+			ext = e
+		}
+	}
+
+	tempFile, err := os.CreateTemp("", "prompt-speech-*"+ext)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("创建临时文件失败: %v", err), http.StatusInternalServerError)
 		return
 	}
 	defer tempFile.Close()
 
-	written, err := io.Copy(tempFile, file)
-	if err != nil {
+	if _, err := tempFile.Write(audioData); err != nil {
 		os.Remove(tempFile.Name())
-		http.Error(w, fmt.Sprintf("保存文件失败: %v", err), http.StatusInternalServerError)
-		return
-	}
-	if written <= 0 {
-		os.Remove(tempFile.Name())
-		http.Error(w, "上传文件为空", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("写入文件失败: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[API upload] 参考音频上传成功: name=%s path=%s size=%d", header.Filename, tempFile.Name(), written)
+	log.Printf("[API upload] 参考音频上传成功: name=%s size=%d path=%s", req.FileName, len(audioData), tempFile.Name())
 
 	resp := map[string]string{
-		"path": tempFile.Name(),
-		"name": header.Filename,
+		"path":      tempFile.Name(),
+		"name":      req.FileName,
+		"file_size": fmt.Sprintf("%d", len(audioData)),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -448,19 +629,74 @@ func (s *Server) handleConfigImport(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(req)
 }
 
+func (s *Server) handleDemos(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	demos := s.DemoEntries
+	s.mu.RUnlock()
+
+	type demoInfo struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+		Text string `json:"text"`
+	}
+	var infos []demoInfo
+	for _, d := range demos {
+		infos = append(infos, demoInfo{
+			ID:   d.ID,
+			Name: d.Name,
+			Text: d.Text,
+		})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(infos)
+}
+
+func (s *Server) handleDemoPromptAudio(w http.ResponseWriter, r *http.Request) {
+	demoID := strings.TrimPrefix(r.URL.Path, "/api/demo-prompt-audio/")
+	if demoID == "" {
+		http.Error(w, "demo_id is required", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	demo, ok := s.DemoEntriesByID[demoID]
+	s.mu.RUnlock()
+
+	if !ok {
+		http.Error(w, "demo not found", http.StatusNotFound)
+		return
+	}
+
+	ext := filepath.Ext(demo.Path)
+	if strings.ToLower(ext) == ".wav" {
+		w.Header().Set("Content-Type", "audio/wav")
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	http.ServeFile(w, r, demo.Path)
+	log.Printf("[Demo] 提供演示音频: %s -> %s", demoID, demo.Path)
+}
+
 type SynthesizeRequest struct {
 	Text                    string `json:"text"`
 	Voice                   string `json:"voice"`
+	DemoID                  string `json:"demo_id"`
 	PromptAudioPath         string `json:"prompt_audio_path"`
 	UploadedPromptAudio     string `json:"uploaded_prompt_audio"`
 	SampleMode              string `json:"sample_mode"`
 	MaxNewFrames            int    `json:"max_new_frames"`
 	VoiceCloneMaxTextTokens int    `json:"voice_clone_max_text_tokens"`
 	Seed                    *int   `json:"seed"`
+	Stream                  bool   `json:"stream"`
 }
 
 type SynthesizeResponse struct {
 	AudioPath      string   `json:"audio_path"`
+	AudioDataB64   string   `json:"audio_data_b64,omitempty"`
 	SampleRate     int      `json:"sample_rate"`
 	AudioSamples   int      `json:"audio_samples"`
 	ElapsedSeconds float64  `json:"elapsed_seconds"`
@@ -473,6 +709,7 @@ type SynthesizeResponse struct {
 type ConfigData struct {
 	Text                    string `json:"text"`
 	Voice                   string `json:"voice"`
+	DemoID                  string `json:"demo_id"`
 	PromptText              string `json:"prompt_text"`
 	PromptAudioPath         string `json:"prompt_audio_path"`
 	SampleMode              string `json:"sample_mode"`
@@ -629,12 +866,18 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   <input type="file" id="config-import" accept=".json" style="display:none" onchange="importConfig(this)">
 </div>
 
+<div class="field">
+  <label for="demo">演示样例</label>
+  <select id="demo" onchange="onDemoChange()"></select>
+  <div class="meta">选择预置的演示样例，会自动填入文本并加载参考音频</div>
+</div>
+
 <div class="field"><label for="text">输入文本</label><textarea id="text" placeholder="请输入要合成的文本...">你好，欢迎使用MOSS语音合成系统。</textarea></div>
 
 <div class="field">
-  <label for="voice">内置音色 / Demo 预设</label>
+  <label for="voice">内置音色</label>
   <select id="voice" onchange="onVoiceChange()"></select>
-  <div class="meta">选择内置音色或 Demo 预设，Demo 会自动填充参考文本</div>
+  <div class="meta">选择内置音色</div>
 </div>
 
 <div class="field">
@@ -644,7 +887,8 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
     <audio id="prompt-audio-preview" controls hidden></audio>
     <div id="prompt-audio-source" class="meta">使用内置音色，未上传参考音频。</div>
     <div class="prompt-audio-actions">
-      <button id="clear-prompt-btn" class="secondary" type="button" hidden onclick="clearPromptAudio()">清除参考音频</button>
+      <button id="choose-prompt-btn" class="secondary" type="button" hidden onclick="choosePromptAudio()">选择文件</button>
+      <button id="clear-prompt-btn" class="secondary" type="button" hidden onclick="clearPromptAudio()">使用默认</button>
     </div>
   </div>
 </div>
@@ -681,13 +925,48 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   </div>
 </details>
 
+<div class="field">
+  <label>播放模式</label>
+  <select id="play-mode">
+    <option value="stream">流式播放 (实时合成)</option>
+    <option value="buffer">生成后播放 (完整音频)</option>
+  </select>
+  <div class="meta">生成后播放：等待全部合成完成后播放；流式播放：边合成边播放（低延迟）</div>
+</div>
+
 <button id="btn" onclick="doSynthesize()">开始合成</button>
 <div id="result" class="result" style="display:none"></div>
 
 <script>
 let uploadedPromptAudioPath = '';
 let uploadedPromptAudioName = '';
+let currentDemoPromptAudioUrl = null;
 let voiceDataMap = {};
+let demosById = {};
+
+async function loadDemos() {
+  try {
+    const r = await fetch('/api/demos');
+    const demos = await r.json();
+    const sel = document.getElementById('demo');
+    sel.innerHTML = '';
+
+    const emptyOption = document.createElement('option');
+    emptyOption.value = '';
+    emptyOption.textContent = '(无) - 使用内置音色或上传';
+    sel.appendChild(emptyOption);
+
+    demos.forEach(d => {
+      demosById[d.id] = d;
+      const o = document.createElement('option');
+      o.value = d.id;
+      o.textContent = d.name;
+      sel.appendChild(o);
+    });
+  } catch (e) {
+    console.error('Failed to load demos:', e);
+  }
+}
 
 async function loadVoices() {
   try {
@@ -698,34 +977,24 @@ async function loadVoices() {
 
     const builtinGroup = document.createElement('optgroup');
     builtinGroup.label = '内置音色';
-    const demoGroup = document.createElement('optgroup');
-    demoGroup.label = 'Demo 预设';
-
     let hasBuiltin = false;
-    let hasDemo = false;
 
     v.forEach(x => {
       voiceDataMap[x.voice] = x;
       const o = document.createElement('option');
       o.value = x.voice;
       o.textContent = x.label || x.voice;
-      if (x.is_demo) {
-        demoGroup.appendChild(o);
-        hasDemo = true;
-      } else {
-        builtinGroup.appendChild(o);
-        hasBuiltin = true;
-      }
+      builtinGroup.appendChild(o);
+      hasBuiltin = true;
     });
 
-    if (!hasBuiltin && !hasDemo) {
+    if (!hasBuiltin) {
       const o = document.createElement('option');
       o.value = 'Junhao';
       o.textContent = 'Junhao';
       sel.appendChild(o);
     }
     if (hasBuiltin) sel.appendChild(builtinGroup);
-    if (hasDemo) sel.appendChild(demoGroup);
   } catch (e) {
     console.error(e);
   }
@@ -739,28 +1008,78 @@ function onVoiceChange() {
   }
 }
 
+function clearCurrentDemoPromptAudio() {
+  if (currentDemoPromptAudioUrl) {
+    URL.revokeObjectURL(currentDemoPromptAudioUrl);
+    currentDemoPromptAudioUrl = null;
+  }
+}
+
+function onDemoChange() {
+  const demoId = document.getElementById('demo').value;
+  const demo = demosById[demoId];
+  clearCurrentDemoPromptAudio();
+  clearUploadedPromptAudio();
+
+  if (!demoId || !demo) {
+    document.getElementById('prompt-audio-source').textContent = '使用内置音色，未上传参考音频。';
+    document.getElementById('prompt-audio-preview').hidden = true;
+    document.getElementById('choose-prompt-btn').hidden = true;
+    document.getElementById('clear-prompt-btn').hidden = true;
+    document.getElementById('prompt-audio-upload').hidden = false;
+    return;
+  }
+
+  document.getElementById('text').value = demo.text;
+  const preview = document.getElementById('prompt-audio-preview');
+  const source = document.getElementById('prompt-audio-source');
+  const chooseBtn = document.getElementById('choose-prompt-btn');
+  const clearBtn = document.getElementById('clear-prompt-btn');
+  const input = document.getElementById('prompt-audio-upload');
+
+  currentDemoPromptAudioUrl = '/api/demo-prompt-audio/' + encodeURIComponent(demo.id);
+  preview.src = currentDemoPromptAudioUrl;
+  preview.hidden = false;
+  input.hidden = true;
+  source.textContent = '使用演示样例音频: ' + demo.name;
+  chooseBtn.hidden = false;
+  clearBtn.hidden = false;
+  uploadedPromptAudioPath = '';
+  uploadedPromptAudioName = '';
+}
+
+function choosePromptAudio() {
+  document.getElementById('prompt-audio-upload').click();
+}
+
 function onPromptAudioChange() {
   const input = document.getElementById('prompt-audio-upload');
   const preview = document.getElementById('prompt-audio-preview');
   const source = document.getElementById('prompt-audio-source');
+  const chooseBtn = document.getElementById('choose-prompt-btn');
   const clearBtn = document.getElementById('clear-prompt-btn');
   const files = input.files;
 
+  clearCurrentDemoPromptAudio();
+
   if (files && files.length > 0) {
     const file = files[0];
-    preview.src = URL.createObjectURL(file);
+    currentDemoPromptAudioUrl = URL.createObjectURL(file);
+    preview.src = currentDemoPromptAudioUrl;
     preview.hidden = false;
     input.hidden = true;
     source.textContent = '已选择: ' + file.name + ' (点击合成时将上传)';
+    chooseBtn.hidden = true;
     clearBtn.hidden = false;
     uploadedPromptAudioName = file.name;
   }
 }
 
-function clearPromptAudio() {
+function clearUploadedPromptAudio() {
   const input = document.getElementById('prompt-audio-upload');
   const preview = document.getElementById('prompt-audio-preview');
   const source = document.getElementById('prompt-audio-source');
+  const chooseBtn = document.getElementById('choose-prompt-btn');
   const clearBtn = document.getElementById('clear-prompt-btn');
 
   input.value = '';
@@ -770,25 +1089,25 @@ function clearPromptAudio() {
   preview.hidden = true;
   input.hidden = false;
   source.textContent = '使用内置音色，未上传参考音频。';
+  chooseBtn.hidden = true;
   clearBtn.hidden = true;
   uploadedPromptAudioPath = '';
   uploadedPromptAudioName = '';
 }
 
-async function uploadPromptAudio(file) {
-  const formData = new FormData();
-  formData.append('prompt_audio', file);
-  const r = await fetch('/api/upload-prompt-audio', { method: 'POST', body: formData });
-  if (!r.ok) throw new Error('上传失败');
-  const data = await r.json();
-  return data.path;
+function clearPromptAudio() {
+  clearCurrentDemoPromptAudio();
+  clearUploadedPromptAudio();
+  onDemoChange();
 }
 
 function getConfig() {
   const seedVal = parseInt(document.getElementById('seed').value) || 0;
+  const demoId = document.getElementById('demo').value;
   return {
     text: document.getElementById('text').value,
     voice: document.getElementById('voice').value,
+    demo_id: demoId,
     prompt_text: document.getElementById('prompt-text').value,
     prompt_audio_path: uploadedPromptAudioPath,
     prompt_audio_name: uploadedPromptAudioName,
@@ -802,13 +1121,17 @@ function getConfig() {
 function applyConfig(cfg) {
   if (cfg.text !== undefined) document.getElementById('text').value = cfg.text;
   if (cfg.voice !== undefined) document.getElementById('voice').value = cfg.voice;
+  if (cfg.demo_id !== undefined) document.getElementById('demo').value = cfg.demo_id;
   if (cfg.prompt_text !== undefined) document.getElementById('prompt-text').value = cfg.prompt_text;
   if (cfg.sample_mode !== undefined) document.getElementById('sample-mode').value = cfg.sample_mode;
   if (cfg.max_new_frames !== undefined) document.getElementById('max-new-frames').value = cfg.max_new_frames;
   if (cfg.voice_clone_max_text_tokens !== undefined) document.getElementById('voice-clone-max-text-tokens').value = cfg.voice_clone_max_text_tokens;
   if (cfg.seed !== undefined) document.getElementById('seed').value = cfg.seed || 0;
+  if (cfg.demo_id !== undefined && cfg.demo_id) {
+    onDemoChange();
+  }
   // 恢复参考音频信息（仅显示，需要重新上传文件）
-  if (cfg.prompt_audio_name) {
+  if (cfg.prompt_audio_name && !cfg.demo_id) {
     uploadedPromptAudioName = cfg.prompt_audio_name;
     uploadedPromptAudioPath = cfg.prompt_audio_path || '';
     document.getElementById('prompt-audio-source').textContent = '配置中的参考音频: ' + cfg.prompt_audio_name + ' (请重新上传文件)';
@@ -845,8 +1168,9 @@ function importConfig(input) {
 
 async function doSynthesize() {
   const btn = document.getElementById('btn');
+  const playMode = document.getElementById('play-mode').value;
   btn.disabled = true;
-  btn.textContent = '合成中...';
+  btn.textContent = playMode === 'stream' ? '流式合成中...' : '合成中...';
   const result = document.getElementById('result');
   result.style.display = 'block';
   result.innerHTML = '<p>正在合成，请稍候...</p>';
@@ -858,7 +1182,26 @@ async function doSynthesize() {
 
     if (files && files.length > 0) {
       result.innerHTML = '<p>正在上传参考音频...</p>';
-      uploadedPath = await uploadPromptAudio(files[0]);
+      const file = files[0];
+      const fileBuffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(fileBuffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const base64Data = btoa(binary);
+
+      const uploadResp = await fetch('/api/upload-prompt-audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          audio_data_b64: base64Data,
+          file_name: file.name
+        })
+      });
+      if (!uploadResp.ok) throw new Error('上传失败');
+      const uploadData = await uploadResp.json();
+      uploadedPath = uploadData.path;
       uploadedPromptAudioPath = uploadedPath;
     }
 
@@ -866,41 +1209,158 @@ async function doSynthesize() {
     const body = {
       text: cfg.text,
       voice: cfg.voice,
+      demo_id: cfg.demo_id,
       prompt_audio_path: '',
       uploaded_prompt_audio: uploadedPath,
       sample_mode: cfg.sample_mode,
       max_new_frames: cfg.max_new_frames,
       voice_clone_max_text_tokens: cfg.voice_clone_max_text_tokens,
-      seed: cfg.seed
+      seed: cfg.seed,
+      stream: playMode === 'stream'
     };
 
-    result.innerHTML = '<p>正在合成语音...</p>';
-    const r = await fetch('/api/synthesize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const data = await r.json();
-    if (!r.ok) {
-      result.innerHTML = '<p class="error">错误: ' + (data.error || r.statusText) + '</p>';
-      return;
+    if (playMode === 'stream') {
+      await doStreamSynthesize(body, result, btn);
+    } else {
+      await doBufferSynthesize(body, result, btn);
     }
-    const durationSec = data.sample_rate > 0 ? (data.audio_samples / data.sample_rate).toFixed(2) : '0.00';
-    result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + data.elapsed_seconds.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 采样率: ' + data.sample_rate + 'Hz</p><p>音色: ' + data.voice + ' | 采样模式: ' + data.sample_mode + ' | 分块数: ' + (data.text_chunks ? data.text_chunks.length : 0) + '</p>';
-    const audioEl = document.createElement('audio');
-    audioEl.controls = true;
-    audioEl.type = 'audio/wav';
-    audioEl.preload = 'none';
-    audioEl.src = data.audio_path;
-    result.appendChild(audioEl);
   } catch (e) {
     result.innerHTML = '<p class="error">请求失败: ' + e.message + '</p>';
-  } finally {
     btn.disabled = false;
     btn.textContent = '开始合成';
   }
 }
 
+async function doBufferSynthesize(body, result, btn) {
+  result.innerHTML = '<p>正在合成语音...</p>';
+  const r = await fetch('/api/synthesize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const data = await r.json();
+  if (!r.ok) {
+    result.innerHTML = '<p class="error">错误: ' + (data.error || r.statusText) + '</p>';
+    btn.disabled = false;
+    btn.textContent = '开始合成';
+    return;
+  }
+  const durationSec = data.sample_rate > 0 ? (data.audio_samples / data.sample_rate).toFixed(2) : '0.00';
+  result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + data.elapsed_seconds.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 采样率: ' + data.sample_rate + 'Hz</p><p>音色: ' + data.voice + ' | 采样模式: ' + data.sample_mode + ' | 分块数: ' + (data.text_chunks ? data.text_chunks.length : 0) + '</p>';
+
+  if (data.audio_data_b64) {
+    const byteCharacters = atob(data.audio_data_b64);
+    const byteNumbers = new Array(byteCharacters.length);
+    for (let i = 0; i < byteCharacters.length; i++) {
+      byteNumbers[i] = byteCharacters.charCodeAt(i);
+    }
+    const byteArray = new Uint8Array(byteNumbers);
+    const blob = new Blob([byteArray], { type: 'audio/wav' });
+    const audioUrl = URL.createObjectURL(blob);
+    const audioEl = document.createElement('audio');
+    audioEl.controls = true;
+    audioEl.type = 'audio/wav';
+    audioEl.src = audioUrl;
+    result.appendChild(audioEl);
+  }
+  btn.disabled = false;
+  btn.textContent = '开始合成';
+}
+
+async function doStreamSynthesize(body, result, btn) {
+  result.innerHTML = '<p>正在流式合成语音...</p>';
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 300000);
+
+  try {
+    const r = await fetch('/api/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (!r.ok) {
+      const data = await r.json().catch(() => ({}));
+      result.innerHTML = '<p class="error">错误: ' + (data.error || r.statusText) + '</p>';
+      btn.disabled = false;
+      btn.textContent = '开始合成';
+      return;
+    }
+
+    const sampleRate = parseInt(r.headers.get('X-Audio-Sample-Rate') || '24000');
+    const channels = parseInt(r.headers.get('X-Audio-Channels') || '2');
+
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioContextCtor({ sampleRate: sampleRate });
+    await audioCtx.resume();
+
+    let nextPlaybackTime = audioCtx.currentTime + 0.1;
+    let totalSamplesReceived = 0;
+    let chunkCount = 0;
+
+    const reader = r.body.getReader();
+    let remainder = new Uint8Array(0);
+    const bytesPerFrame = channels * 4;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.length === 0) continue;
+
+      const merged = new Uint8Array(remainder.length + value.length);
+      merged.set(remainder);
+      merged.set(value, remainder.length);
+
+      const alignedLength = Math.floor(merged.length / bytesPerFrame) * bytesPerFrame;
+      if (alignedLength <= 0) {
+        remainder = merged;
+        continue;
+      }
+
+      const pcmChunk = merged.subarray(0, alignedLength);
+      remainder = merged.subarray(alignedLength);
+
+      const totalFrames = pcmChunk.length / bytesPerFrame;
+      const audioBuffer = audioCtx.createBuffer(channels, totalFrames, sampleRate);
+      const view = new DataView(pcmChunk.buffer, pcmChunk.byteOffset, pcmChunk.length);
+
+      for (let ch = 0; ch < channels; ch++) {
+        const channelData = audioBuffer.getChannelData(ch);
+        for (let i = 0; i < totalFrames; i++) {
+          const byteOffset = (i * channels + ch) * 4;
+          channelData[i] = view.getFloat32(byteOffset, true);
+        }
+      }
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(audioCtx.destination);
+      const startAt = Math.max(nextPlaybackTime, audioCtx.currentTime + 0.02);
+      source.start(startAt);
+      nextPlaybackTime = startAt + audioBuffer.duration;
+
+      totalSamplesReceived += totalFrames;
+      chunkCount++;
+    }
+
+    result.querySelector('p').textContent = '流式合成完成! (共 ' + chunkCount + ' 个音频块)';
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      result.innerHTML = '<p class="error">请求超时</p>';
+    } else {
+      result.innerHTML = '<p class="error">请求失败: ' + e.message + '</p>';
+    }
+  } finally {
+    clearTimeout(timeoutId);
+    btn.disabled = false;
+    btn.textContent = '开始合成';
+  }
+}
+
+loadDemos();
 loadVoices();
 </script>
 </body>

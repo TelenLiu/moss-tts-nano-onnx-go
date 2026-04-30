@@ -1,13 +1,26 @@
 package audio
 
 import (
+	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"math"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"time"
 )
 
 func WriteWAV(path string, waveform []float32, channels, sampleRate int) error {
+	data, err := EncodeWAV(waveform, channels, sampleRate)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func EncodeWAV(waveform []float32, channels, sampleRate int) ([]byte, error) {
 	numSamples := len(waveform) / channels
 	if numSamples == 0 {
 		numSamples = len(waveform)
@@ -15,14 +28,9 @@ func WriteWAV(path string, waveform []float32, channels, sampleRate int) error {
 	}
 	dataSize := numSamples * channels * 2
 
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
+	var buf bytes.Buffer
 	writeLE := func(data interface{}) {
-		binary.Write(f, binary.LittleEndian, data)
+		binary.Write(&buf, binary.LittleEndian, data)
 	}
 
 	writeLE([]byte("RIFF"))
@@ -46,14 +54,15 @@ func WriteWAV(path string, waveform []float32, channels, sampleRate int) error {
 
 	normSamples := normalizeVolume(samples)
 
-	buf := make([]byte, 0, len(normSamples)*2)
-	for _, s := range normSamples {
+	pcmBuf := make([]byte, len(normSamples)*2)
+	for i, s := range normSamples {
 		clamped := math.Max(-1.0, math.Min(1.0, float64(s)))
 		pcm16 := int16(math.Round(clamped * 32767.0))
-		buf = append(buf, byte(pcm16), byte(pcm16>>8))
+		pcmBuf[i*2] = byte(pcm16)
+		pcmBuf[i*2+1] = byte(pcm16 >> 8)
 	}
-	_, err = f.Write(buf)
-	return err
+	buf.Write(pcmBuf)
+	return buf.Bytes(), nil
 }
 
 func normalizeVolume(waveform []float32) []float32 {
@@ -79,20 +88,96 @@ func normalizeVolume(waveform []float32) []float32 {
 }
 
 func ReadWAV(path string) ([]float32, int, int, error) {
+	return ReadWAVMaxDuration(path, 30)
+}
+
+func ReadWAVMaxDuration(path string, maxDurationSecs int) ([]float32, int, int, error) {
+	if _, err := exec.LookPath("ffmpeg"); err == nil {
+		return readWithFFmpeg(path)
+	}
+	return readRIFFWAV(path)
+}
+
+func readWithFFmpeg(path string) ([]float32, int, int, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("无法获取绝对路径: %w", err)
+	}
+
+	resolvedPath := absPath
+	if info, err := os.Stat(absPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if rl, err := filepath.EvalSymlinks(absPath); err == nil {
+			resolvedPath = rl
+		}
+	}
+
+	tmpDir := filepath.Dir(resolvedPath)
+	tmpFile := filepath.Join(tmpDir, fmt.Sprintf(".tmp_convert_%d.wav", time.Now().UnixNano()))
+	defer os.Remove(tmpFile)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
+		"-v", "fatal",
+		"-i", resolvedPath,
+		"-t", "30",
+		"-f", "wav",
+		"-acodec", "pcm_s16le",
+		tmpFile,
+	)
+
+	if err := cmd.Run(); err != nil {
+		return nil, 0, 0, fmt.Errorf("ffmpeg转码失败: %w", err)
+	}
+
+	return readRIFFWAV(tmpFile)
+}
+
+func readRIFFWAV(path string) ([]float32, int, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	defer f.Close()
 
-	header := make([]byte, 44)
+	header := make([]byte, 12)
 	if _, err := f.Read(header); err != nil {
 		return nil, 0, 0, err
 	}
+	if string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
+		return nil, 0, 0, fmt.Errorf("ffmpeg输出不是有效的WAV")
+	}
 
-	channels := int(binary.LittleEndian.Uint16(header[22:24]))
-	sampleRate := int(binary.LittleEndian.Uint32(header[24:28]))
-	dataSize := int(binary.LittleEndian.Uint32(header[40:44]))
+	var channels, sampleRate, dataSize int
+	for {
+		chunkHeader := make([]byte, 8)
+		_, err := f.Read(chunkHeader)
+		if err != nil {
+			return nil, 0, 0, fmt.Errorf("读取chunk头失败: %w", err)
+		}
+		chunkID := string(chunkHeader[0:4])
+		chunkSize := int(binary.LittleEndian.Uint32(chunkHeader[4:8]))
+
+		if chunkID == "fmt " {
+			fmtData := make([]byte, 16)
+			if _, err := f.Read(fmtData); err != nil {
+				return nil, 0, 0, err
+			}
+			channels = int(binary.LittleEndian.Uint16(fmtData[2:4]))
+			sampleRate = int(binary.LittleEndian.Uint32(fmtData[4:8]))
+			remaining := chunkSize - 16
+			if remaining > 0 {
+				f.Seek(int64(remaining), 1)
+			}
+		} else if chunkID == "data" {
+			dataSize = chunkSize
+			break
+		} else {
+			pad := chunkSize % 2
+			f.Seek(int64(chunkSize+pad), 1)
+		}
+	}
 
 	data := make([]byte, dataSize)
 	if _, err := f.Read(data); err != nil {

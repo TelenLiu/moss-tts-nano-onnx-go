@@ -62,7 +62,7 @@ func runInfer(args []string) {
 	promptAudioPath := fs.String("prompt-audio-path", "", "参考音频路径 (覆盖 --voice)")
 	sampleMode := fs.String("sample-mode", "fixed", "采样模式: greedy, fixed, full")
 	doSample := fs.Int("do-sample", 1, "是否采样 (0/1)")
-	cpuThreads := fs.Int("cpu-threads", 4, "ONNX Runtime 线程数")
+	cpuThreads := fs.Int("cpu-threads", defaultCpuThreads(), "ONNX Runtime 线程数 (默认: CPU核心数-1, 至少为1)")
 	maxNewFrames := fs.Int("max-new-frames", 375, "最大生成音频帧数")
 	voiceCloneMaxTokens := fs.Int("voice-clone-max-text-tokens", 75, "文本分块token预算")
 	textTemp := fs.Float64("text-temperature", 1.0, "文本层采样温度")
@@ -117,13 +117,12 @@ func runInfer(args []string) {
 	}
 
 	cwd, _ := os.Getwd()
-	outputDir := filepath.Join(cwd, "output")
 	if *outputPath == "" {
-		*outputPath = filepath.Join(outputDir, "infer_onnx_output.wav")
+		*outputPath = filepath.Join(cwd, "infer_onnx_output.wav")
 	}
 
 	log.Printf("初始化 TTS 运行时 (model_dir=%s threads=%d)...", cfg.ModelDir, *cpuThreads)
-	rt, err := ttsruntime.NewOnnxTtsRuntime(cfg.ModelDir, *cpuThreads, &maxFrames, &doSampleBool, sampleMode, outputDir)
+	rt, err := ttsruntime.NewOnnxTtsRuntime(cfg.ModelDir, *cpuThreads, &maxFrames, &doSampleBool, sampleMode)
 	if err != nil {
 		log.Fatalf("初始化 TTS 运行时失败: %v", err)
 	}
@@ -143,13 +142,20 @@ func runInfer(args []string) {
 		result.AudioPath, result.SampleRate, result.ElapsedSec, len(result.TextChunks))
 }
 
+func defaultCpuThreads() int {
+	n := runtime.NumCPU()
+	if n > 1 {
+		return n - 1
+	}
+	return 1
+}
+
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	modelDir := fs.String("model-dir", "", "模型目录 (默认自动下载)")
-	outputDir := fs.String("output-dir", "", "生成音频输出目录")
 	host := fs.String("host", "localhost", "监听地址")
 	port := fs.Int("port", 18083, "监听端口")
-	cpuThreads := fs.Int("cpu-threads", runtime.NumCPU(), "ONNX Runtime 线程数")
+	cpuThreads := fs.Int("cpu-threads", defaultCpuThreads(), "ONNX Runtime 线程数 (默认: CPU核心数-1, 至少为1)")
 	maxNewFrames := fs.Int("max-new-frames", 375, "最大生成音频帧数")
 	useMirror := fs.Bool("mirror", false, "使用国内加速镜像源下载依赖和模型")
 	fs.Parse(args)
@@ -160,13 +166,8 @@ func runServe(args []string) {
 		cfg.ModelDir = *modelDir
 	}
 
-	resolvedOutputDir := *outputDir
-	if resolvedOutputDir == "" {
-		cwd2, _ := os.Getwd()
-		resolvedOutputDir = filepath.Join(cwd2, "output", "generated_audio")
-	}
-
-	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, resolvedOutputDir, *host, *port)
+	appRoot := fmt.Sprintf("http://%s:%d", *host, *port)
+	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, *host, *port, appRoot)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Web 服务启动失败: %v", err)
 	}

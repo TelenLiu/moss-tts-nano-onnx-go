@@ -1,14 +1,13 @@
 package ttsruntime
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
 	"math/rand"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,6 +29,7 @@ var ClosingPunctuation = map[rune]bool{'"': true, '\'': true, '\u201d': true, '\
 
 type SynthesisResult struct {
 	AudioPath    string
+	AudioData    []byte
 	SampleRate   int
 	AudioSamples int
 	Waveform     []float32
@@ -41,13 +41,20 @@ type SynthesisResult struct {
 	ElapsedSec   float64
 }
 
+type StreamChunk struct {
+	Waveform   []float32
+	SampleRate int
+	Channels   int
+	ChunkIndex int
+	IsPause    bool
+}
+
 type OnnxTtsRuntime struct {
 	OrtRuntime *ortruntime.OrtCpuRuntime
 	SPModel    *tokenizer.Processor
-	OutputDir  string
 }
 
-func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string, outputDir string) (*OnnxTtsRuntime, error) {
+func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string) (*OnnxTtsRuntime, error) {
 	rt, err := ortruntime.NewOrtCpuRuntime(modelDir, threadCount, maxNewFrames, doSample, sampleMode)
 	if err != nil {
 		return nil, fmt.Errorf("创建 OrtCpuRuntime 失败: %w", err)
@@ -66,12 +73,9 @@ func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSa
 	if err != nil {
 		return nil, fmt.Errorf("加载 SentencePiece 分词器失败: %w", err)
 	}
-	absOutputDir, _ := filepath.Abs(outputDir)
-	os.MkdirAll(absOutputDir, 0755)
 	return &OnnxTtsRuntime{
 		OrtRuntime: rt,
 		SPModel:    sp,
-		OutputDir:  absOutputDir,
 	}, nil
 }
 
@@ -325,30 +329,17 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	log.Printf("[EncodeReferenceAudio] 加载完成: 原始采样率=%d 通道数=%d 总样本数=%d", sampleRate, channels, len(waveform))
 
 	waveformLength := len(waveform) / channels
-	log.Printf("[EncodeReferenceAudio] 波形长度: %d 样本/通道", waveformLength)
 
-	// 将交错格式(interleaved)转换为平面格式(planar)，与 torchaudio.load 保持一致
-	// 交错: [ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]
-	// 平面: [ch0_s0, ch0_s1, ..., ch1_s0, ch1_s1, ...]
+	// 直接构建平面格式数据: [ch0_s0, ch0_s1, ..., ch1_s0, ch1_s1, ...]
 	planarWaveform := make([]float32, len(waveform))
 	for ch := 0; ch < channels; ch++ {
 		for i := 0; i < waveformLength; i++ {
 			planarWaveform[ch*waveformLength+i] = waveform[i*channels+ch]
 		}
 	}
-	log.Printf("[EncodeReferenceAudio] 已转换为平面格式: 前5个样本 ch0=%v ch1=%v",
-		planarWaveform[:minInt(5, waveformLength)], planarWaveform[waveformLength:waveformLength+minInt(5, waveformLength)])
 
-	waveform3D := make([][][]float32, 1)
-	waveform3D[0] = make([][]float32, channels)
-	for ch := 0; ch < channels; ch++ {
-		waveform3D[0][ch] = make([]float32, waveformLength)
-		for i := 0; i < waveformLength; i++ {
-			waveform3D[0][ch][i] = planarWaveform[ch*waveformLength+i]
-		}
-	}
-	flatWaveform, wfDims := flatten3dFloat32(waveform3D)
-	log.Printf("[EncodeReferenceAudio] Tensor维度: %v 数据长度=%d", wfDims, len(flatWaveform))
+	flatWaveform := planarWaveform
+	wfDims := []int64{1, int64(channels), int64(waveformLength)}
 	waveformTensor, _ := ort.NewTensor(wfDims, flatWaveform)
 	inputLengths := []int32{int32(waveformLength)}
 	inputLengthsTensor, _ := ort.NewTensor([]int64{1}, inputLengths)
@@ -405,6 +396,10 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 }
 
 func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (*SynthesisResult, error) {
+	return t.SynthesizeWithContext(context.Background(), text, voice, promptAudioPath, outputAudioPath, sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, enableNormalize, seed)
+}
+
+func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (*SynthesisResult, error) {
 	startTime := time.Now()
 	log.Printf("[Synthesize] 开始合成: text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
 	if seed != nil {
@@ -431,17 +426,30 @@ func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath s
 	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
 	var allWaveforms [][]float32
 	for chunkIndex, chunkText := range textChunks {
+		select {
+		case <-ctx.Done():
+			log.Printf("[Synthesize] 合成被取消")
+			return nil, ctx.Err()
+		default:
+		}
 		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
 		textTokenIDs := t.EncodeText(chunkText)
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成: %d 行", len(requestRows["inputIds"]))
-		generatedFrames := t.OrtRuntime.GenerateAudioFrames(requestRows)
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows)
+		if ctx.Err() != nil {
+			log.Printf("[Synthesize] 合成被取消")
+			return nil, ctx.Err()
+		}
 		log.Printf("[Synthesize]   音频帧生成完成: %d 帧", len(generatedFrames))
-		channelArrays, audioLength := t.OrtRuntime.DecodeFullAudio(generatedFrames)
+		channelArrays, audioLength := t.OrtRuntime.DecodeFullAudioWithContext(ctx, generatedFrames)
+		if ctx.Err() != nil {
+			log.Printf("[Synthesize] 合成被取消")
+			return nil, ctx.Err()
+		}
 		log.Printf("[Synthesize]   音频解码完成: channels=%d samples=%d", len(channelArrays), audioLength)
 		if len(channelArrays) > 0 {
-			// 将多通道合并为交错格式，与Python的_merge_audio_channels一致
 			merged := audio.MergeAudioChannels(channelArrays)
 			allWaveforms = append(allWaveforms, merged)
 		}
@@ -454,17 +462,25 @@ func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath s
 		}
 	}
 	waveform := audio.ConcatWaveforms(allWaveforms)
-	resolvedOutputPath := outputAudioPath
-	if resolvedOutputPath == "" {
-		resolvedOutputPath = filepath.Join(t.OutputDir, "infer_onnx_output.wav")
+
+	var audioData []byte
+	var resolvedOutputPath string
+	if outputAudioPath != "" {
+		resolvedOutputPath = outputAudioPath
+		if err := audio.WriteWAV(resolvedOutputPath, waveform, channels, sampleRate); err != nil {
+			return nil, fmt.Errorf("写入 WAV 文件失败: %w", err)
+		}
 	}
-	if err := audio.WriteWAV(resolvedOutputPath, waveform, channels, sampleRate); err != nil {
-		return nil, fmt.Errorf("写入 WAV 文件失败: %w", err)
+	audioData, err := audio.EncodeWAV(waveform, channels, sampleRate)
+	if err != nil {
+		return nil, fmt.Errorf("编码 WAV 失败: %w", err)
 	}
+
 	elapsed := time.Since(startTime).Seconds()
 	audioSamples := len(waveform) / channels
 	return &SynthesisResult{
 		AudioPath:    resolvedOutputPath,
+		AudioData:    audioData,
 		SampleRate:   sampleRate,
 		AudioSamples: audioSamples,
 		Waveform:     waveform,
@@ -475,6 +491,143 @@ func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath s
 		Streaming:    streaming,
 		ElapsedSec:   elapsed,
 	}, nil
+}
+
+func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voice string, promptAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (<-chan StreamChunk, error) {
+	chunkChan := make(chan StreamChunk, 16)
+
+	go func() {
+		defer close(chunkChan)
+
+		if seed != nil {
+			t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
+		}
+
+		preparedText := t.PrepareSynthesisText(text, enableNormalize)
+		promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
+		if promptAudioCodes == nil {
+			promptAudioCodes = [][]int{}
+		}
+		textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
+
+		codecMeta := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
+		sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
+		channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
+
+		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep)
+		if streamingSession == nil {
+			log.Printf("[SynthesizeStream] 错误: 无法创建流式解码会话")
+			return
+		}
+		defer streamingSession.Reset()
+
+		for chunkIndex, chunkText := range textChunks {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			textTokenIDs := t.EncodeText(chunkText)
+			requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
+
+			pendingDecodeFrames := make([][]int, 0)
+			emittedSamplesTotal := 0
+			firstAudioEmittedAt := float64(0)
+			hasEmittedAudio := false
+
+			streamingSession.Reset()
+
+			decodePending := func(force bool) {
+				pendingCount := len(pendingDecodeFrames)
+				if pendingCount <= 0 {
+					return
+				}
+				decodeBudget := resolveStreamDecodeFrameBudget(emittedSamplesTotal, sampleRate, firstAudioEmittedAt, hasEmittedAudio)
+				if !force && pendingCount < max(1, decodeBudget) {
+					return
+				}
+				frameBudget := pendingCount
+				if !force {
+					frameBudget = minInt(pendingCount, max(1, decodeBudget))
+				}
+				frameChunk := pendingDecodeFrames[:frameBudget]
+				pendingDecodeFrames = pendingDecodeFrames[frameBudget:]
+
+				channelArrays, audioLength := streamingSession.RunFrames(frameChunk)
+				if audioLength <= 0 {
+					return
+				}
+				if !hasEmittedAudio {
+					hasEmittedAudio = true
+					firstAudioEmittedAt = float64(time.Now().UnixNano()) / 1e9
+				}
+				emittedSamplesTotal += audioLength
+
+				merged := audio.MergeAudioChannels(channelArrays)
+				select {
+				case <-ctx.Done():
+					return
+				case chunkChan <- StreamChunk{
+					Waveform:   merged,
+					SampleRate: sampleRate,
+					Channels:   channels,
+					ChunkIndex: chunkIndex,
+					IsPause:    false,
+				}:
+				}
+			}
+
+			onFrame := func(_ [][]int, _ int, frame []int) {
+				pendingDecodeFrames = append(pendingDecodeFrames, frame)
+				decodePending(false)
+			}
+
+			_ = t.OrtRuntime.GenerateAudioFramesWithCallback(ctx, requestRows, onFrame)
+			decodePending(true)
+			streamingSession.Reset()
+
+			if chunkIndex < len(textChunks)-1 {
+				pauseSeconds := estimateInterChunkPauseSeconds(chunkText)
+				pauseSamples := int(math.Round(float64(sampleRate) * pauseSeconds))
+				if pauseSamples > 0 {
+					pauseWaveform := audio.MakeSilence(pauseSamples, channels)
+					select {
+					case <-ctx.Done():
+						return
+					case chunkChan <- StreamChunk{
+						Waveform:   pauseWaveform,
+						SampleRate: sampleRate,
+						Channels:   channels,
+						ChunkIndex: chunkIndex,
+						IsPause:    true,
+					}:
+					}
+				}
+			}
+		}
+	}()
+
+	return chunkChan, nil
+}
+
+func resolveStreamDecodeFrameBudget(emittedSamplesTotal, sampleRate int, firstAudioEmittedAt float64, hasEmittedAudio bool) int {
+	if !hasEmittedAudio || sampleRate <= 0 {
+		return 1
+	}
+	elapsedSeconds := math.Max(0.0, float64(time.Now().UnixNano())/1e9-firstAudioEmittedAt)
+	emittedSeconds := float64(emittedSamplesTotal) / float64(sampleRate)
+	leadSeconds := emittedSeconds - elapsedSeconds
+	if leadSeconds < 0.20 {
+		return 1
+	}
+	if leadSeconds < 0.55 {
+		return 2
+	}
+	if leadSeconds < 1.10 {
+		return 4
+	}
+	return 8
 }
 
 func (t *OnnxTtsRuntime) Close() {
@@ -558,29 +711,6 @@ func estimateInterChunkPauseSeconds(textChunk string) float64 {
 
 func ToFloat64(v interface{}) float64 {
 	return ortruntime.ToFloat64(v)
-}
-
-func flatten3dFloat32(nested [][][]float32) ([]float32, []int64) {
-	dim0 := int64(len(nested))
-	dim1 := int64(0)
-	dim2 := int64(0)
-	if dim0 > 0 {
-		dim1 = int64(len(nested[0]))
-		if dim1 > 0 {
-			dim2 = int64(len(nested[0][0]))
-		}
-	}
-	data := make([]float32, dim0*dim1*dim2)
-	offset := 0
-	for i := range nested {
-		for j := range nested[i] {
-			for k := range nested[i][j] {
-				data[offset] = nested[i][j][k]
-				offset++
-			}
-		}
-	}
-	return data, []int64{dim0, dim1, dim2}
 }
 
 func getInt32Data(v ort.Value) []int32 {
