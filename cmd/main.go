@@ -153,7 +153,7 @@ func defaultCpuThreads() int {
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	modelDir := fs.String("model-dir", "", "模型目录 (默认自动下载)")
-	host := fs.String("host", "localhost", "监听地址")
+	host := fs.String("host", "", "监听地址 (留空监听所有网络接口)")
 	port := fs.Int("port", 18083, "监听端口")
 	cpuThreads := fs.Int("cpu-threads", defaultCpuThreads(), "ONNX Runtime 线程数 (默认: CPU核心数-1, 至少为1)")
 	maxNewFrames := fs.Int("max-new-frames", 375, "最大生成音频帧数")
@@ -166,7 +166,11 @@ func runServe(args []string) {
 		cfg.ModelDir = *modelDir
 	}
 
-	appRoot := fmt.Sprintf("http://%s:%d", *host, *port)
+	displayHost := *host
+	if displayHost == "" {
+		displayHost = "0.0.0.0"
+	}
+	appRoot := fmt.Sprintf("http://%s:%d", displayHost, *port)
 	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, *host, *port, appRoot)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Web 服务启动失败: %v", err)

@@ -189,7 +189,11 @@ func (s *Server) Start() error {
 	go s.backgroundInit()
 
 	addr := fmt.Sprintf("%s:%d", s.Host, s.Port)
-	log.Printf("Web 服务启动于 http://%s/", addr)
+	displayAddr := addr
+	if s.Host == "" {
+		displayAddr = fmt.Sprintf("0.0.0.0:%d", s.Port)
+	}
+	log.Printf("Web 服务启动于 http://%s/ (监听所有网络接口)", displayAddr)
 	return http.ListenAndServe(addr, mux)
 }
 
