@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"runtime"
+
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
@@ -348,7 +350,7 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	outputs := make([]ort.Value, 2)
 
 	log.Printf("[EncodeReferenceAudio] 调用 codec_encode...")
-	err = t.OrtRuntime.Onnx.CodecEncode.Run(inputs, outputs)
+	err = t.OrtRuntime.Onnx.CodecEncode.Session.Run(inputs, outputs)
 	waveformTensor.Destroy()
 	inputLengthsTensor.Destroy()
 
@@ -401,7 +403,11 @@ func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath s
 
 func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (*SynthesisResult, error) {
 	startTime := time.Now()
-	log.Printf("[Synthesize] 开始合成: text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
+
+	// 检查并释放空闲超时的 Session
+	t.OrtRuntime.CheckAndReleaseIdleSessions()
+
+	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
 	if seed != nil {
 		t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
 		log.Printf("[Synthesize] 使用随机种子: %d", *seed)
@@ -476,6 +482,14 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		return nil, fmt.Errorf("编码 WAV 失败: %w", err)
 	}
 
+	// 强制 GC，释放内存
+	runtime.GC()
+
+	// 销毁所有 Session，强制 ONNX Runtime 释放内存池
+	// 这是防止内存持续增长的关键步骤
+	t.OrtRuntime.ResetSessions()
+	log.Printf("[Synthesize] Session 已重置，内存已释放")
+
 	elapsed := time.Since(startTime).Seconds()
 	audioSamples := len(waveform) / channels
 	return &SynthesisResult{
@@ -514,7 +528,7 @@ func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voic
 		sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 		channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
 
-		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep)
+		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session)
 		if streamingSession == nil {
 			log.Printf("[SynthesizeStream] 错误: 无法创建流式解码会话")
 			return

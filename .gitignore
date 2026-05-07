@@ -6,3 +6,4 @@ moss-tts-nano-onnx-go
 /lib
 /models
 /output
+/debug

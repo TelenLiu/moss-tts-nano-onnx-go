@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/sampler"
 	ort "github.com/yalue/onnxruntime_go"
@@ -26,15 +27,21 @@ var ModelDirAliasMap = map[string]string{
 	"MOSS-Audio-Tokenizer-Nano-ONNX-CPU": "MOSS-Audio-Tokenizer-Nano-ONNX",
 }
 
+// TimedSession 带时间戳的 Session 包装
+type TimedSession struct {
+	Session  *ort.DynamicAdvancedSession
+	LastUsed time.Time
+}
+
 type OnnxSessions struct {
-	Prefill                *ort.DynamicAdvancedSession
-	Decode                 *ort.DynamicAdvancedSession
-	LocalDecoder           *ort.DynamicAdvancedSession
-	LocalCachedStep        *ort.DynamicAdvancedSession
-	LocalFixedSampledFrame *ort.DynamicAdvancedSession
-	CodecEncode            *ort.DynamicAdvancedSession
-	CodecDecode            *ort.DynamicAdvancedSession
-	CodecDecodeStep        *ort.DynamicAdvancedSession
+	Prefill                *TimedSession
+	Decode                 *TimedSession
+	LocalDecoder           *TimedSession
+	LocalCachedStep        *TimedSession
+	LocalFixedSampledFrame *TimedSession
+	CodecEncode            *TimedSession
+	CodecDecode            *TimedSession
+	CodecDecodeStep        *TimedSession
 }
 
 type CodecStreamingDecodeSession struct {
@@ -263,24 +270,26 @@ func (s *CodecStreamingDecodeSession) RunFrames(frameRows [][]int) ([][]float32,
 }
 
 type OrtCpuRuntime struct {
-	ModelDir      string
-	ThreadCount   int
-	ManifestPath  string
-	ManifestDir   string
-	Manifest      map[string]interface{}
-	TTSMetaPath   string
-	CodecMetaPath string
-	TTSMeta       map[string]interface{}
-	CodecMeta     map[string]interface{}
-	RNG           *rand.Rand
-	Onnx          *OnnxSessions
+	ModelDir           string
+	ThreadCount        int
+	ManifestPath       string
+	ManifestDir        string
+	Manifest           map[string]interface{}
+	TTSMetaPath        string
+	CodecMetaPath      string
+	TTSMeta            map[string]interface{}
+	CodecMeta          map[string]interface{}
+	RNG                *rand.Rand
+	Onnx               *OnnxSessions
+	SessionIdleTimeout time.Duration // Session 空闲超时（默认 10 秒）
 }
 
 func NewOrtCpuRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string) (*OrtCpuRuntime, error) {
 	rt := &OrtCpuRuntime{
-		ModelDir:    modelDir,
-		ThreadCount: max(1, threadCount),
-		RNG:         rand.New(rand.NewSource(1234)),
+		ModelDir:           modelDir,
+		ThreadCount:        max(1, threadCount),
+		RNG:                rand.New(rand.NewSource(1234)),
+		SessionIdleTimeout: 10 * time.Second, // 默认 10 秒超时
 	}
 	manifestPath, err := rt.resolveManifestPath(modelDir)
 	if err != nil {
@@ -370,21 +379,21 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 		}
 		switch name {
 		case "prefill":
-			sessions.Prefill = sess
+			sessions.Prefill = &TimedSession{Session: sess, LastUsed: time.Now()}
 		case "decode":
-			sessions.Decode = sess
+			sessions.Decode = &TimedSession{Session: sess, LastUsed: time.Now()}
 		case "local_decoder":
-			sessions.LocalDecoder = sess
+			sessions.LocalDecoder = &TimedSession{Session: sess, LastUsed: time.Now()}
 		case "local_cached_step":
-			sessions.LocalCachedStep = sess
+			sessions.LocalCachedStep = &TimedSession{Session: sess, LastUsed: time.Now()}
 		case "local_fixed_sampled_frame":
-			sessions.LocalFixedSampledFrame = sess
+			sessions.LocalFixedSampledFrame = &TimedSession{Session: sess, LastUsed: time.Now()}
 		case "codec_encode":
-			sessions.CodecEncode = sess
+			sessions.CodecEncode = &TimedSession{Session: sess, LastUsed: time.Now()}
 		case "codec_decode":
-			sessions.CodecDecode = sess
+			sessions.CodecDecode = &TimedSession{Session: sess, LastUsed: time.Now()}
 		case "codec_decode_step":
-			sessions.CodecDecodeStep = sess
+			sessions.CodecDecodeStep = &TimedSession{Session: sess, LastUsed: time.Now()}
 		}
 		return nil
 	}
@@ -566,14 +575,16 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 	prefillOutputs := make([]ort.Value, len(prefillOutputNames))
 
 	log.Printf("  运行 prefill (输入长度=%d)...", len(requestRows["inputIds"]))
-	if err := rt.Onnx.Prefill.Run(prefillInputs, prefillOutputs); err != nil {
-		log.Printf("  prefill 失败: %v", err)
+	if err := rt.Onnx.Prefill.Session.Run(prefillInputs, prefillOutputs); err != nil {
+		log.Printf("  prefill 失败：%v", err)
 		inputIDsTensor.Destroy()
 		attentionMaskTensor.Destroy()
 		return nil
 	}
 	inputIDsTensor.Destroy()
 	attentionMaskTensor.Destroy()
+	// 更新 Session 使用时间
+	rt.UpdateSessionTime(rt.Onnx.Prefill)
 
 	namedPrefillOutputs := make(map[string]ort.Value)
 	for i, name := range prefillOutputNames {
@@ -674,14 +685,16 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		}
 
 		decodeOutputs := make([]ort.Value, len(decodeOutputNames))
-		if err := rt.Onnx.Decode.Run(decodeInputs, decodeOutputs); err != nil {
-			log.Printf("  decode_step 失败: %v", err)
+		if err := rt.Onnx.Decode.Session.Run(decodeInputs, decodeOutputs); err != nil {
+			log.Printf("  decode_step 失败：%v", err)
 			nextRowTensor.Destroy()
 			pvlTensor.Destroy()
 			break
 		}
 		nextRowTensor.Destroy()
 		pvlTensor.Destroy()
+		// 更新 Session 使用时间
+		rt.UpdateSessionTime(rt.Onnx.Decode)
 
 		namedDecodeOutputs := make(map[string]ort.Value)
 		for i, name := range decodeOutputNames {
@@ -691,14 +704,20 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		globalHidden = extractLastHidden(namedDecodeOutputs["global_hidden"])
 		pastValidLength++
 
+		// 销毁旧的 past 值
 		for _, oldPast := range pastByName {
 			oldPast.Destroy()
 		}
-		pastByName = make(map[string]ort.Value)
+
+		// 创建新的 pastByName，只保存需要传递到下一轮的 past 值
+		newPastByName := make(map[string]ort.Value)
 		for _, name := range decodeOutputNames[1:] {
 			pastName := strings.Replace(name, "present_", "past_", 1)
-			pastByName[pastName] = namedDecodeOutputs[name]
+			if v, ok := namedDecodeOutputs[name]; ok && v != nil {
+				newPastByName[pastName] = v
+			}
 		}
+		pastByName = newPastByName
 
 		if (stepIndex+1)%10 == 0 {
 			log.Printf("  已生成 %d/%d 帧", stepIndex+1, maxNewFrames)
@@ -781,7 +800,7 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 	inputs := []ort.Value{ghTensor, repMaskTensor, assRUTensor, audioRUTensor}
 	outputs := make([]ort.Value, 2)
 
-	err := rt.Onnx.LocalFixedSampledFrame.Run(inputs, outputs)
+	err := rt.Onnx.LocalFixedSampledFrame.Session.Run(inputs, outputs)
 	ghTensor.Destroy()
 	repMaskTensor.Destroy()
 	assRUTensor.Destroy()
@@ -791,6 +810,8 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 		log.Printf("  local_fixed_sampled_frame 失败: %v", err)
 		return false, nil
 	}
+	// 更新 Session 使用时间
+	rt.UpdateSessionTime(rt.Onnx.LocalFixedSampledFrame)
 
 	shouldContinueData := getInt32Data(outputs[0])
 	shouldContinue := int32(0)
@@ -930,7 +951,7 @@ func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, 
 	}
 
 	outputs := make([]ort.Value, len(outputNames))
-	err := rt.Onnx.LocalCachedStep.Run(inputs, outputs)
+	err := rt.Onnx.LocalCachedStep.Session.Run(inputs, outputs)
 
 	ghTensor.Destroy()
 	ttTensor.Destroy()
@@ -945,9 +966,11 @@ func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, 
 	}
 
 	if err != nil {
-		log.Printf("  local_cached_step 失败: %v", err)
+		log.Printf("  local_cached_step 失败：%v", err)
 		return nil, nil, nil, nil
 	}
+	// 更新 Session 使用时间
+	rt.UpdateSessionTime(rt.Onnx.LocalCachedStep)
 
 	namedOut := make(map[string]ort.Value)
 	for i, name := range outputNames {
@@ -1024,14 +1047,16 @@ func (rt *OrtCpuRuntime) DecodeFullAudioWithContext(ctx context.Context, generat
 	inputs := []ort.Value{audioCodesTensor, audioCodeLengthsTensor}
 	outputs := make([]ort.Value, 2)
 
-	err := rt.Onnx.CodecDecode.Run(inputs, outputs)
+	err := rt.Onnx.CodecDecode.Session.Run(inputs, outputs)
 	audioCodesTensor.Destroy()
 	audioCodeLengthsTensor.Destroy()
 
 	if err != nil {
-		log.Printf("  codec_decode_full 失败: %v", err)
+		log.Printf("  codec_decode_full 失败：%v", err)
 		return nil, 0
 	}
+	// 更新 Session 使用时间
+	rt.UpdateSessionTime(rt.Onnx.CodecDecode)
 
 	audioLengthData := getInt32Data(outputs[1])
 	audioLength := int32(0)
@@ -1087,30 +1112,139 @@ func (rt *OrtCpuRuntime) Close() {
 	if rt.Onnx != nil {
 		s := rt.Onnx
 		if s.Prefill != nil {
-			s.Prefill.Destroy()
+			s.Prefill.Session.Destroy()
+			s.Prefill = nil
 		}
 		if s.Decode != nil {
-			s.Decode.Destroy()
+			s.Decode.Session.Destroy()
+			s.Decode = nil
 		}
 		if s.LocalDecoder != nil {
-			s.LocalDecoder.Destroy()
+			s.LocalDecoder.Session.Destroy()
+			s.LocalDecoder = nil
 		}
 		if s.LocalCachedStep != nil {
-			s.LocalCachedStep.Destroy()
+			s.LocalCachedStep.Session.Destroy()
+			s.LocalCachedStep = nil
 		}
 		if s.LocalFixedSampledFrame != nil {
-			s.LocalFixedSampledFrame.Destroy()
+			s.LocalFixedSampledFrame.Session.Destroy()
+			s.LocalFixedSampledFrame = nil
 		}
 		if s.CodecEncode != nil {
-			s.CodecEncode.Destroy()
+			s.CodecEncode.Session.Destroy()
+			s.CodecEncode = nil
 		}
 		if s.CodecDecode != nil {
-			s.CodecDecode.Destroy()
+			s.CodecDecode.Session.Destroy()
+			s.CodecDecode = nil
 		}
 		if s.CodecDecodeStep != nil {
-			s.CodecDecodeStep.Destroy()
+			s.CodecDecodeStep.Session.Destroy()
+			s.CodecDecodeStep = nil
 		}
 	}
+}
+
+// CheckAndReleaseIdleSessions 检查并释放所有空闲超时的 Session（导出方法）
+func (rt *OrtCpuRuntime) CheckAndReleaseIdleSessions() {
+	if rt.SessionIdleTimeout <= 0 {
+		return // 禁用超时释放
+	}
+
+	now := time.Now()
+	count := 0
+	log.Printf("[ORT] 开始检查空闲 Session (超时阈值：%v)...", rt.SessionIdleTimeout)
+
+	// 检查每个 Session
+	count += rt.checkAndReleaseOne("prefill", rt.Onnx.Prefill, now)
+	count += rt.checkAndReleaseOne("decode", rt.Onnx.Decode, now)
+	count += rt.checkAndReleaseOne("local_decoder", rt.Onnx.LocalDecoder, now)
+	count += rt.checkAndReleaseOne("local_cached_step", rt.Onnx.LocalCachedStep, now)
+	count += rt.checkAndReleaseOne("local_fixed_sampled_frame", rt.Onnx.LocalFixedSampledFrame, now)
+	count += rt.checkAndReleaseOne("codec_encode", rt.Onnx.CodecEncode, now)
+	count += rt.checkAndReleaseOne("codec_decode", rt.Onnx.CodecDecode, now)
+	count += rt.checkAndReleaseOne("codec_decode_step", rt.Onnx.CodecDecodeStep, now)
+
+	if count > 0 {
+		log.Printf("[ORT] 发现 %d 个空闲 Session (超时：%v)，执行重置...", count, rt.SessionIdleTimeout)
+		// 调用 ResetSessions 来销毁并重新创建所有 Session
+		if err := rt.ResetSessions(); err != nil {
+			log.Printf("[ORT] 重置 Session 失败：%v", err)
+		} else {
+			log.Printf("[ORT] 重置完成，已释放 %d 个空闲 Session", count)
+		}
+	}
+}
+
+// checkAndReleaseOne 检查并释放单个 Session（内部方法）
+func (rt *OrtCpuRuntime) checkAndReleaseOne(name string, timed *TimedSession, now time.Time) int {
+	if timed != nil && timed.Session != nil {
+		idleTime := now.Sub(timed.LastUsed)
+		log.Printf("[ORT]   Session '%s': 空闲 %v (阈值：%v)", name, idleTime, rt.SessionIdleTimeout)
+		if idleTime > rt.SessionIdleTimeout {
+			log.Printf("[ORT] Session '%s' 空闲超时 (%v > %v)，标记需要重置", name, idleTime, rt.SessionIdleTimeout)
+			return 1
+		}
+	} else {
+		log.Printf("[ORT]   Session '%s': 未加载", name)
+	}
+	return 0
+}
+
+// UpdateSessionTime 更新 Session 使用时间（在成功使用后调用）
+func (rt *OrtCpuRuntime) UpdateSessionTime(timed *TimedSession) {
+	if timed != nil {
+		timed.LastUsed = time.Now()
+	}
+}
+
+// ResetSessions 销毁并重新创建所有 ONNX Session
+func (rt *OrtCpuRuntime) ResetSessions() error {
+	log.Printf("[ORT] 销毁旧 sessions...")
+
+	// 销毁所有 Session
+	s := rt.Onnx
+	if s == nil {
+		return nil
+	}
+
+	if s.Prefill != nil {
+		s.Prefill.Session.Destroy()
+		s.Prefill = nil
+	}
+	if s.Decode != nil {
+		s.Decode.Session.Destroy()
+		s.Decode = nil
+	}
+	if s.LocalDecoder != nil {
+		s.LocalDecoder.Session.Destroy()
+		s.LocalDecoder = nil
+	}
+	if s.LocalCachedStep != nil {
+		s.LocalCachedStep.Session.Destroy()
+		s.LocalCachedStep = nil
+	}
+	if s.LocalFixedSampledFrame != nil {
+		s.LocalFixedSampledFrame.Session.Destroy()
+		s.LocalFixedSampledFrame = nil
+	}
+	if s.CodecEncode != nil {
+		s.CodecEncode.Session.Destroy()
+		s.CodecEncode = nil
+	}
+	if s.CodecDecode != nil {
+		s.CodecDecode.Session.Destroy()
+		s.CodecDecode = nil
+	}
+	if s.CodecDecodeStep != nil {
+		s.CodecDecodeStep.Session.Destroy()
+		s.CodecDecodeStep = nil
+	}
+
+	// 重新创建
+	log.Printf("[ORT] 重新创建 sessions...")
+	return rt.CreateSessions()
 }
 
 func (rt *OrtCpuRuntime) resolveManifestPath(modelDir string) (string, error) {

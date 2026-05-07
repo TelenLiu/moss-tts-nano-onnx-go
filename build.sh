@@ -1,0 +1,1 @@
+go build -o tts-onnx-go ./cmd/main.go

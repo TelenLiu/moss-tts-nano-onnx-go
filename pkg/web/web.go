@@ -19,8 +19,17 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/runtime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 )
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+
 
 type ProgressEvent struct {
 	Phase      string  `json:"phase"`
@@ -51,6 +60,7 @@ type Server struct {
 	AppRoot      string
 
 	mu              sync.RWMutex
+	RuntimeManager  *runtime.RuntimeManager
 	Runtime         *ttsruntime.OnnxTtsRuntime
 	Ready           bool
 	Progress        []ProgressEvent
@@ -348,9 +358,15 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	doSample := sampleMode != "greedy"
 	maxNewFrames := req.MaxNewFrames
 	if maxNewFrames <= 0 {
-		maxNewFrames = 375
+		// 根据文本长度动态调整 max_new_frames
+		// 假设：每 10 个字约 1 秒音频，每秒约 50 帧
+		estimatedFrames := len(req.Text) / 10 * 50
+		maxNewFrames = min(estimatedFrames+50, 500)  // 上限 500 帧
 	}
 	voiceCloneMaxTokens := req.VoiceCloneMaxTextTokens
+	if voiceCloneMaxTokens <= 0 {
+		voiceCloneMaxTokens = 300  // 从 75 增加到 300，减少 chunk 数量
+	}
 	if voiceCloneMaxTokens <= 0 {
 		voiceCloneMaxTokens = 75
 	}
@@ -578,9 +594,10 @@ func (s *Server) handleUploadPromptAudio(w http.ResponseWriter, r *http.Request)
 
 	tempFile, err := os.CreateTemp("", "prompt-speech-*"+ext)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("创建临时文件失败: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("创建临时文件失败：%v", err), http.StatusInternalServerError)
 		return
 	}
+	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
 	if _, err := tempFile.Write(audioData); err != nil {
