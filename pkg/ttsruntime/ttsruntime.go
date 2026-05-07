@@ -651,6 +651,21 @@ func prepareTextForSentenceChunking(text string) string {
 		}
 		return normalizedText
 	}
+	runes := []rune(normalizedText)
+	if len(runes) > 0 && runes[0] >= 'a' && runes[0] <= 'z' {
+		runes[0] = runes[0] - 'a' + 'A'
+		normalizedText = string(runes)
+	}
+	if len(runes) > 0 {
+		lastCh := runes[len(runes)-1]
+		if (lastCh >= 'a' && lastCh <= 'z') || (lastCh >= 'A' && lastCh <= 'Z') || (lastCh >= '0' && lastCh <= '9') {
+			normalizedText += "."
+		}
+	}
+	words := strings.Fields(normalizedText)
+	if len(words) < 5 {
+		normalizedText = "        " + normalizedText
+	}
 	return normalizedText
 }
 
