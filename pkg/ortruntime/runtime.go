@@ -290,7 +290,7 @@ func NewOrtCpuRuntime(modelDir string, threadCount int, maxNewFrames *int, doSam
 	rt := &OrtCpuRuntime{
 		ModelDir:           modelDir,
 		ThreadCount:        max(1, threadCount),
-		RNG:                rand.New(rand.NewSource(1234)),
+		RNG:                rand.New(rand.NewSource(time.Now().UnixNano())),
 		SessionIdleTimeout: 10 * time.Second, // 默认 10 秒超时
 	}
 	manifestPath, err := rt.resolveManifestPath(modelDir)
@@ -525,9 +525,14 @@ func (rt *OrtCpuRuntime) BuildVoiceCloneRequestRows(promptAudioCodes [][]int, te
 	suffixIDs = append(suffixIDs, toIntSlice(promptTemplates["assistant_prompt_prefix_token_ids"])...)
 	suffixIDs = append(suffixIDs, int(toFloat64(ttsConfig["audio_start_token_id"])))
 	var allRows [][]int32
-	allRows = append(allRows, rt.BuildTextRows(prefixIDs)...)
-	allRows = append(allRows, rt.BuildAudioPrefixRows(promptAudioCodes, nil)...)
-	allRows = append(allRows, rt.BuildTextRows(suffixIDs)...)
+	prefixRows := rt.BuildTextRows(prefixIDs)
+	audioRows := rt.BuildAudioPrefixRows(promptAudioCodes, nil)
+	suffixRows := rt.BuildTextRows(suffixIDs)
+	allRows = append(allRows, prefixRows...)
+	allRows = append(allRows, audioRows...)
+	allRows = append(allRows, suffixRows...)
+	log.Printf("[BuildVoiceCloneRequestRows] prefixRows=%d audioRows=%d suffixRows=%d total=%d textTokens=%d audioFrames=%d",
+		len(prefixRows), len(audioRows), len(suffixRows), len(allRows), len(textTokenIDs), len(promptAudioCodes))
 	mask := make([][]int32, 1)
 	mask[0] = make([]int32, len(allRows))
 	for i := range mask[0] {
@@ -541,12 +546,12 @@ func (rt *OrtCpuRuntime) GenerateAudioFrames(requestRows map[string][][]int32) [
 }
 
 func (rt *OrtCpuRuntime) GenerateAudioFramesWithContext(ctx context.Context, requestRows map[string][][]int32) [][]int {
-	return rt.GenerateAudioFramesWithCallback(ctx, requestRows, nil)
+	return rt.GenerateAudioFramesWithCallback(ctx, requestRows, 0, nil)
 }
 
 type FrameCallback func(generatedFrames [][]int, stepIndex int, frame []int)
 
-func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, requestRows map[string][][]int32, onFrame FrameCallback) [][]int {
+func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, requestRows map[string][][]int32, maxNewFrames int, onFrame FrameCallback) [][]int {
 	rt.SessionMutex.Lock()
 	defer rt.SessionMutex.Unlock()
 
@@ -554,7 +559,10 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 	ttsConfig := rt.Manifest["tts_config"].(map[string]interface{})
 	onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
 	nvq := int(toFloat64(ttsConfig["n_vq"]))
-	maxNewFrames := int(toFloat64(gd["max_new_frames"]))
+	// 使用传入的 maxNewFrames，如果为 0 则使用默认值
+	if maxNewFrames <= 0 {
+		maxNewFrames = int(toFloat64(gd["max_new_frames"]))
+	}
 	rowWidth := nvq + 1
 	audioCodebookSizes := toIntSlice(ttsConfig["audio_codebook_sizes"])
 	audioCodebookSize := 1024
@@ -646,20 +654,21 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 			shouldContinue, frame, localPast, localPVL = rt.runLocalCachedStepFull(
 				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd, localPast, localPVL)
 		} else {
-			log.Printf("  step %d: 无可用的local模型", stepIndex)
+			log.Printf("  step %d: 无可用的 local 模型", stepIndex)
 			break
 		}
 
-		if !shouldContinue {
-			log.Printf("  step %d: 停止信号", stepIndex)
-			break
-		}
-
+		// 按照 Python 源码的顺序：先添加帧，再检查停止信号
 		for ci, token := range frame {
 			prevTokensByChannel[ci] = append(prevTokensByChannel[ci], token)
 			prevTokenSetsByChannel[ci][token] = true
 		}
 		generatedFrames = append(generatedFrames, frame)
+
+		if !shouldContinue {
+			log.Printf("  step %d: 停止信号", stepIndex)
+			break
+		}
 
 		if onFrame != nil {
 			onFrame(generatedFrames, stepIndex, frame)
@@ -712,10 +721,11 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		globalHidden = extractLastHidden(namedDecodeOutputs["global_hidden"])
 		pastValidLength++
 
-		// 销毁旧的 past 值
+		// 销毁旧的 past 值和 decodeOutputs
 		for _, oldPast := range pastByName {
 			oldPast.Destroy()
 		}
+		// 注意：namedDecodeOutputs 中的值会被转移到 newPastByName，所以这里不需要销毁
 
 		// 创建新的 pastByName，只保存需要传递到下一轮的 past 值
 		newPastByName := make(map[string]ort.Value)

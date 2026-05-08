@@ -107,6 +107,10 @@ func (t *OnnxTtsRuntime) SplitVoiceCloneText(text string, maxTokens int) []strin
 	if len(sentenceCandidates) == 0 {
 		sentenceCandidates = []string{strings.TrimSpace(preparedText)}
 	}
+	log.Printf("[SplitVoiceCloneText] 原始句子数: %d, maxTokens=%d", len(sentenceCandidates), safeMaxTokens)
+	for i, s := range sentenceCandidates {
+		log.Printf("[SplitVoiceCloneText]   句子 %d: %q (tokens=%d)", i+1, s, t.CountTextTokens(s))
+	}
 	type slice struct {
 		tokenCount int
 		text       string
@@ -164,6 +168,10 @@ func (t *OnnxTtsRuntime) SplitVoiceCloneText(text string, maxTokens int) []strin
 	}
 	if currentChunk != "" {
 		chunks = append(chunks, strings.TrimSpace(currentChunk))
+	}
+	log.Printf("[SplitVoiceCloneText] 分块结果: %d 块", len(chunks))
+	for i, chunk := range chunks {
+		log.Printf("[SplitVoiceCloneText]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
 	}
 	if len(chunks) > 1 {
 		return chunks
@@ -414,6 +422,10 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	if seed != nil {
 		rngSeed = int64(*seed)
 		log.Printf("[Synthesize] 使用随机种子: %d", *seed)
+	} else {
+		// 如果没有指定种子，使用当前时间作为种子，确保每次合成都是独立的
+		rngSeed = time.Now().UnixNano()
+		log.Printf("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
 	}
 	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
 
@@ -448,7 +460,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		textTokenIDs := t.EncodeText(chunkText)
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
-		log.Printf("[Synthesize]   请求行构建完成: %d 行", len(requestRows["inputIds"]))
+		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
 		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows)
 		if ctx.Err() != nil {
 			log.Printf("[Synthesize] 合成被取消")
@@ -550,6 +562,7 @@ func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voic
 
 			textTokenIDs := t.EncodeText(chunkText)
 			requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
+			log.Printf("[SynthesizeStream] 处理 chunk %d/%d: maxNewFrames=%d", chunkIndex+1, len(textChunks), maxNewFrames)
 
 			pendingDecodeFrames := make([][]int, 0)
 			emittedSamplesTotal := 0
@@ -603,7 +616,7 @@ func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voic
 				decodePending(false)
 			}
 
-			_ = t.OrtRuntime.GenerateAudioFramesWithCallback(ctx, requestRows, onFrame)
+			_ = t.OrtRuntime.GenerateAudioFramesWithCallback(ctx, requestRows, maxNewFrames, onFrame)
 			decodePending(true)
 			streamingSession.Reset()
 

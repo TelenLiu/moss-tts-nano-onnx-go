@@ -250,6 +250,9 @@ func (s *Server) backgroundInit() {
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
 	s.mu.RLock()
 	ready := s.Ready
 	s.mu.RUnlock()
@@ -356,9 +359,10 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	maxNewFrames := req.MaxNewFrames
 	if maxNewFrames <= 0 {
 		// 根据文本长度动态调整 max_new_frames
-		// 假设：每 10 个字约 1 秒音频，每秒约 50 帧
-		estimatedFrames := len(req.Text) / 10 * 50
-		maxNewFrames = min(estimatedFrames+50, 500) // 上限 500 帧
+		// 经验值：中文文本每字约需 3-4 帧
+		estimatedFrames := len(req.Text) * 4
+		maxNewFrames = min(estimatedFrames+100, 2000) // 上限 2000 帧
+		log.Printf("[API] 动态计算 maxNewFrames: textLen=%d estimated=%d final=%d", len(req.Text), estimatedFrames, maxNewFrames)
 	}
 	voiceCloneMaxTokens := req.VoiceCloneMaxTextTokens
 	if voiceCloneMaxTokens <= 0 {
@@ -800,6 +804,9 @@ const ttsHTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>MOSS-TTS-Nano Demo</title>
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:800px;margin:40px auto;padding:0 20px;background:#f8f9fa;color:#333}
@@ -876,7 +883,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   <div class="row">
     <div class="field">
       <label for="max-new-frames">最大帧数</label>
-      <input id="max-new-frames" type="number" value="375" min="1">
+      <input id="max-new-frames" type="number" value="2000" min="1">
     </div>
     <div class="field">
       <label for="voice-clone-max-text-tokens">最大文本Token数</label>
