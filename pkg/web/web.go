@@ -22,14 +22,13 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/runtime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 )
+
 func min(a, b int) int {
 	if a < b {
 		return a
 	}
 	return b
 }
-
-
 
 type ProgressEvent struct {
 	Phase      string  `json:"phase"`
@@ -191,8 +190,6 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/voices", s.handleVoices)
 	mux.HandleFunc("/api/audio/", s.handleAudio)
 	mux.HandleFunc("/api/upload-prompt-audio", s.handleUploadPromptAudio)
-	mux.HandleFunc("/api/config/export", s.handleConfigExport)
-	mux.HandleFunc("/api/config/import", s.handleConfigImport)
 	mux.HandleFunc("/api/demos", s.handleDemos)
 	mux.HandleFunc("/api/demo-prompt-audio/", s.handleDemoPromptAudio)
 
@@ -361,11 +358,11 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		// 根据文本长度动态调整 max_new_frames
 		// 假设：每 10 个字约 1 秒音频，每秒约 50 帧
 		estimatedFrames := len(req.Text) / 10 * 50
-		maxNewFrames = min(estimatedFrames+50, 500)  // 上限 500 帧
+		maxNewFrames = min(estimatedFrames+50, 500) // 上限 500 帧
 	}
 	voiceCloneMaxTokens := req.VoiceCloneMaxTextTokens
 	if voiceCloneMaxTokens <= 0 {
-		voiceCloneMaxTokens = 300  // 从 75 增加到 300，减少 chunk 数量
+		voiceCloneMaxTokens = 300 // 从 75 增加到 300，减少 chunk 数量
 	}
 	if voiceCloneMaxTokens <= 0 {
 		voiceCloneMaxTokens = 75
@@ -617,39 +614,6 @@ func (s *Server) handleUploadPromptAudio(w http.ResponseWriter, r *http.Request)
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleConfigExport(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req ConfigData
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("Invalid request: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Disposition", "attachment; filename=moss-tts-config.json")
-	json.NewEncoder(w).Encode(req)
-}
-
-func (s *Server) handleConfigImport(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req ConfigData
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("Invalid config: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(req)
-}
-
 func (s *Server) handleDemos(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	demos := s.DemoEntries
@@ -725,18 +689,6 @@ type SynthesizeResponse struct {
 	TextChunks     []string `json:"text_chunks"`
 	SampleMode     string   `json:"sample_mode"`
 	DoSample       bool     `json:"do_sample"`
-}
-
-type ConfigData struct {
-	Text                    string `json:"text"`
-	Voice                   string `json:"voice"`
-	DemoID                  string `json:"demo_id"`
-	PromptText              string `json:"prompt_text"`
-	PromptAudioPath         string `json:"prompt_audio_path"`
-	SampleMode              string `json:"sample_mode"`
-	MaxNewFrames            int    `json:"max_new_frames"`
-	VoiceCloneMaxTextTokens int    `json:"voice_clone_max_text_tokens"`
-	Seed                    int    `json:"seed"`
 }
 
 var _ = audio.WriteWAV
@@ -870,8 +822,7 @@ audio{width:100%;margin-top:12px}
 .prompt-audio-box input[type="file"]{border:none;padding:4px 0}
 .prompt-audio-box audio{margin-top:8px}
 .prompt-audio-actions{margin-top:8px}
-.config-actions{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
-.config-actions button{font-size:14px;padding:8px 16px}
+
 .row{display:flex;gap:12px}
 .row .field{flex:1}
 .details-summary{cursor:pointer;font-weight:600;color:#1a73e8}
@@ -880,12 +831,6 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
 </head>
 <body>
 <h1>MOSS-TTS-Nano ONNX Demo <span class="badge">Ready</span></h1>
-
-<div class="config-actions">
-  <button class="secondary" onclick="exportConfig()">导出配置</button>
-  <button class="secondary" onclick="document.getElementById('config-import').click()">导入配置</button>
-  <input type="file" id="config-import" accept=".json" style="display:none" onchange="importConfig(this)">
-</div>
 
 <div class="field">
   <label for="demo">演示样例</label>
@@ -914,12 +859,6 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   </div>
 </div>
 
-<div class="field">
-  <label for="prompt-text">参考文本 (可选)</label>
-  <textarea id="prompt-text" placeholder="请输入参考音频对应的文本内容（用于辅助音色克隆，可选）"></textarea>
-  <div class="meta">参考文本是参考音频对应的文字内容，有助于更准确地克隆音色。使用 Demo 预设时会自动填充。</div>
-</div>
-
 <details>
   <summary class="details-summary">高级选项</summary>
   <div class="row" style="margin-top:12px;">
@@ -930,7 +869,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
     </div>
     <div class="field">
       <label for="seed">随机种子</label>
-      <input id="seed" type="number" step="1" value="0">
+      <input id="seed" type="number" step="1" value="1">
       <div class="meta">0 表示随机种子</div>
     </div>
   </div>
@@ -1022,11 +961,6 @@ async function loadVoices() {
 }
 
 function onVoiceChange() {
-  const voice = document.getElementById('voice').value;
-  const data = voiceDataMap[voice];
-  if (data && data.prompt_text) {
-    document.getElementById('prompt-text').value = data.prompt_text;
-  }
 }
 
 function clearCurrentDemoPromptAudio() {
@@ -1129,62 +1063,11 @@ function getConfig() {
     text: document.getElementById('text').value,
     voice: document.getElementById('voice').value,
     demo_id: demoId,
-    prompt_text: document.getElementById('prompt-text').value,
-    prompt_audio_path: uploadedPromptAudioPath,
-    prompt_audio_name: uploadedPromptAudioName,
     sample_mode: document.getElementById('sample-mode').value,
     max_new_frames: parseInt(document.getElementById('max-new-frames').value) || 375,
     voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 75,
     seed: seedVal === 0 ? null : seedVal
   };
-}
-
-function applyConfig(cfg) {
-  if (cfg.text !== undefined) document.getElementById('text').value = cfg.text;
-  if (cfg.voice !== undefined) document.getElementById('voice').value = cfg.voice;
-  if (cfg.demo_id !== undefined) document.getElementById('demo').value = cfg.demo_id;
-  if (cfg.prompt_text !== undefined) document.getElementById('prompt-text').value = cfg.prompt_text;
-  if (cfg.sample_mode !== undefined) document.getElementById('sample-mode').value = cfg.sample_mode;
-  if (cfg.max_new_frames !== undefined) document.getElementById('max-new-frames').value = cfg.max_new_frames;
-  if (cfg.voice_clone_max_text_tokens !== undefined) document.getElementById('voice-clone-max-text-tokens').value = cfg.voice_clone_max_text_tokens;
-  if (cfg.seed !== undefined) document.getElementById('seed').value = cfg.seed || 0;
-  if (cfg.demo_id !== undefined && cfg.demo_id) {
-    onDemoChange();
-  }
-  // 恢复参考音频信息（仅显示，需要重新上传文件）
-  if (cfg.prompt_audio_name && !cfg.demo_id) {
-    uploadedPromptAudioName = cfg.prompt_audio_name;
-    uploadedPromptAudioPath = cfg.prompt_audio_path || '';
-    document.getElementById('prompt-audio-source').textContent = '配置中的参考音频: ' + cfg.prompt_audio_name + ' (请重新上传文件)';
-  }
-}
-
-function exportConfig() {
-  const cfg = getConfig();
-  const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'moss-tts-config.json';
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function importConfig(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = function(e) {
-    try {
-      const cfg = JSON.parse(e.target.result);
-      applyConfig(cfg);
-      alert('配置导入成功');
-    } catch (err) {
-      alert('配置导入失败: ' + err.message);
-    }
-  };
-  reader.readAsText(file);
-  input.value = '';
 }
 
 async function doSynthesize() {

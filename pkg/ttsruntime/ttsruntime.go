@@ -408,10 +408,15 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	t.OrtRuntime.CheckAndReleaseIdleSessions()
 
 	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
+
+	// 保存初始随机种子，只在开始时设置一次，确保RNG状态在分块之间连续
+	var rngSeed int64 = 1234 // 默认种子
 	if seed != nil {
-		t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
+		rngSeed = int64(*seed)
 		log.Printf("[Synthesize] 使用随机种子: %d", *seed)
 	}
+	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+
 	preparedText := t.PrepareSynthesisText(text, enableNormalize)
 	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d", len(text), len(preparedText))
 	promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
@@ -439,6 +444,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		default:
 		}
 		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
+
 		textTokenIDs := t.EncodeText(chunkText)
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)

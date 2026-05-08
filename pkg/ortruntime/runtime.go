@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/sampler"
@@ -282,6 +283,7 @@ type OrtCpuRuntime struct {
 	RNG                *rand.Rand
 	Onnx               *OnnxSessions
 	SessionIdleTimeout time.Duration // Session 空闲超时（默认 10 秒）
+	SessionMutex       sync.Mutex    // 保护 sessions 的并发访问
 }
 
 func NewOrtCpuRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string) (*OrtCpuRuntime, error) {
@@ -545,6 +547,9 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithContext(ctx context.Context, req
 type FrameCallback func(generatedFrames [][]int, stepIndex int, frame []int)
 
 func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, requestRows map[string][][]int32, onFrame FrameCallback) [][]int {
+	rt.SessionMutex.Lock()
+	defer rt.SessionMutex.Unlock()
+
 	gd := rt.Manifest["generation_defaults"].(map[string]interface{})
 	ttsConfig := rt.Manifest["tts_config"].(map[string]interface{})
 	onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
@@ -614,6 +619,9 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 	decodeInputNames := toStrSlice(onnxInfo["decode_input_names"])
 	decodeOutputNames := toStrSlice(onnxInfo["decode_output_names"])
 
+	localPast := make(map[string][]float32)
+	localPVL := 0
+
 	for stepIndex := 0; stepIndex < maxNewFrames; stepIndex++ {
 		select {
 		case <-ctx.Done():
@@ -635,8 +643,8 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 			shouldContinue, frame = rt.runLocalFixedSampledFrame(
 				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize)
 		} else if rt.Onnx.LocalCachedStep != nil {
-			shouldContinue, frame = rt.runLocalCachedStepFull(
-				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd)
+			shouldContinue, frame, localPast, localPVL = rt.runLocalCachedStepFull(
+				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd, localPast, localPVL)
 		} else {
 			log.Printf("  step %d: 无可用的local模型", stepIndex)
 			break
@@ -830,7 +838,7 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 	return shouldContinue != 0, frame
 }
 
-func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevTokens [][]int, prevTokenSets []map[int]bool, nvq, audioCodebookSize int, gd map[string]interface{}) (bool, []int) {
+func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevTokens [][]int, prevTokenSets []map[int]bool, nvq, audioCodebookSize int, gd map[string]interface{}, localPast map[string][]float32, localPVL int) (bool, []int, map[string][]float32, int) {
 	ttsConfig := rt.Manifest["tts_config"].(map[string]interface{})
 	onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
 	audioAssistSlotID := int(toFloat64(ttsConfig["audio_assistant_slot_token_id"]))
@@ -860,26 +868,24 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 	}
 
 	ghShape := []int64{1, int64(len(globalHidden))}
-	localPast := make(map[string][]float32)
-	localPVL := 0
 
-	textLogits, _, _, _ := rt.runCachedStep(globalHidden, ghShape, 0, 0, 0, 0, localPVL, localPast, inputNames, outputNames)
+	textLogits, _, _, localPastData := rt.runCachedStep(globalHidden, ghShape, 0, 0, 0, 0, localPVL, localPast, inputNames, outputNames)
 	localPVL++
 
 	if textLogits == nil {
-		return false, nil
+		return false, nil, localPastData, localPVL
 	}
 
 	nextTextToken := sampler.SampleAssistantTextToken(textLogits, audioAssistSlotID, audioEndTokenID, doSample, temperature, topK, topP, rt.RNG)
 	if nextTextToken != audioAssistSlotID {
-		return false, nil
+		return false, nil, localPastData, localPVL
 	}
 
-	_, audioLogits, audioLogitsShape, localPastData := rt.runCachedStep(globalHidden, ghShape, nextTextToken, 0, 0, 1, localPVL, localPast, inputNames, outputNames)
+	_, audioLogits, audioLogitsShape, localPastData := rt.runCachedStep(globalHidden, ghShape, nextTextToken, 0, 0, 1, localPVL, localPastData, inputNames, outputNames)
 	localPVL++
 
 	if audioLogits == nil {
-		return false, nil
+		return false, nil, localPastData, localPVL
 	}
 
 	perChannel := int(audioLogitsShape[len(audioLogitsShape)-1])
@@ -912,7 +918,7 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 		previousToken = sampledToken2
 	}
 
-	return true, frame
+	return true, frame, localPastData, localPVL
 }
 
 func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, textTokenID, audioTokenID, channelIndex, stepType, pastValidLength int, localPast map[string][]float32, inputNames, outputNames []string) ([]float32, []float32, []int64, map[string][]float32) {
@@ -1202,6 +1208,10 @@ func (rt *OrtCpuRuntime) UpdateSessionTime(timed *TimedSession) {
 // ResetSessions 销毁并重新创建所有 ONNX Session
 func (rt *OrtCpuRuntime) ResetSessions() error {
 	log.Printf("[ORT] 销毁旧 sessions...")
+
+	// 获取互斥锁以防止与正在运行的请求发生竞态条件
+	rt.SessionMutex.Lock()
+	defer rt.SessionMutex.Unlock()
 
 	// 销毁所有 Session
 	s := rt.Onnx
