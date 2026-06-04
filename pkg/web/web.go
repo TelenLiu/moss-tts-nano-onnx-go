@@ -381,10 +381,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 	voiceCloneMaxTokens := req.VoiceCloneMaxTextTokens
 	if voiceCloneMaxTokens <= 0 {
-		voiceCloneMaxTokens = 300 // 从 75 增加到 300，减少 chunk 数量
-	}
-	if voiceCloneMaxTokens <= 0 {
-		voiceCloneMaxTokens = 75
+		voiceCloneMaxTokens = 300 // 默认值300，减少chunk数量，提高音频质量
 	}
 
 	promptAudioPath := req.PromptAudioPath
@@ -902,7 +899,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
     </div>
     <div class="field">
       <label for="seed">随机种子</label>
-      <input id="seed" type="number" step="1" value="1">
+      <input id="seed" type="number" step="1" value="0">
       <div class="meta">0 表示随机种子</div>
     </div>
   </div>
@@ -913,7 +910,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
     </div>
     <div class="field">
       <label for="voice-clone-max-text-tokens">最大文本Token数</label>
-      <input id="voice-clone-max-text-tokens" type="number" value="75" min="1">
+      <input id="voice-clone-max-text-tokens" type="number" value="300" min="1">
     </div>
   </div>
   <div class="row" style="margin-top:8px;">
@@ -1108,7 +1105,7 @@ function getConfig() {
     demo_id: demoId,
     sample_mode: document.getElementById('sample-mode').value,
     max_new_frames: parseInt(document.getElementById('max-new-frames').value) || 375,
-    voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 75,
+    voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 300,
     seed: seedVal === 0 ? null : seedVal,
     enable_robust: document.getElementById('enable-robust').checked,
     enable_wetext: document.getElementById('enable-wetext').checked

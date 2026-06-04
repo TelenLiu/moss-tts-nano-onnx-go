@@ -466,7 +466,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows)
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, maxNewFrames)
 		if ctx.Err() != nil {
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
@@ -579,7 +579,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows)
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, maxNewFrames)
 		if ctx.Err() != nil {
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()

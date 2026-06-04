@@ -542,11 +542,11 @@ func (rt *OrtCpuRuntime) BuildVoiceCloneRequestRows(promptAudioCodes [][]int, te
 }
 
 func (rt *OrtCpuRuntime) GenerateAudioFrames(requestRows map[string][][]int32) [][]int {
-	return rt.GenerateAudioFramesWithContext(context.Background(), requestRows)
+	return rt.GenerateAudioFramesWithContext(context.Background(), requestRows, 0)
 }
 
-func (rt *OrtCpuRuntime) GenerateAudioFramesWithContext(ctx context.Context, requestRows map[string][][]int32) [][]int {
-	return rt.GenerateAudioFramesWithCallback(ctx, requestRows, 0, nil)
+func (rt *OrtCpuRuntime) GenerateAudioFramesWithContext(ctx context.Context, requestRows map[string][][]int32, maxNewFrames int) [][]int {
+	return rt.GenerateAudioFramesWithCallback(ctx, requestRows, maxNewFrames, nil)
 }
 
 type FrameCallback func(generatedFrames [][]int, stepIndex int, frame []int)
@@ -658,17 +658,18 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 			break
 		}
 
-		// 按照 Python 源码的顺序：先添加帧，再检查停止信号
+		// 按照 Python 源码的顺序：先检查停止信号，如果停止则不添加帧
+		if !shouldContinue {
+			log.Printf("  step %d: 停止信号", stepIndex)
+			break
+		}
+
+		// 添加帧到结果中
 		for ci, token := range frame {
 			prevTokensByChannel[ci] = append(prevTokensByChannel[ci], token)
 			prevTokenSetsByChannel[ci][token] = true
 		}
 		generatedFrames = append(generatedFrames, frame)
-
-		if !shouldContinue {
-			log.Printf("  step %d: 停止信号", stepIndex)
-			break
-		}
 
 		if onFrame != nil {
 			onFrame(generatedFrames, stepIndex, frame)
