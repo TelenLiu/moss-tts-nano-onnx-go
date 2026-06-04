@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -52,8 +53,9 @@ type StreamChunk struct {
 }
 
 type OnnxTtsRuntime struct {
-	OrtRuntime *ortruntime.OrtCpuRuntime
-	SPModel    *tokenizer.Processor
+	OrtRuntime    *ortruntime.OrtCpuRuntime
+	SPModel       *tokenizer.Processor
+	PreloadCache  *PreloadCache
 }
 
 func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string) (*OnnxTtsRuntime, error) {
@@ -75,10 +77,17 @@ func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSa
 	if err != nil {
 		return nil, fmt.Errorf("加载 SentencePiece 分词器失败: %w", err)
 	}
-	return &OnnxTtsRuntime{
+
+	// 创建preload缓存
+	ttsRuntime := &OnnxTtsRuntime{
 		OrtRuntime: rt,
 		SPModel:    sp,
-	}, nil
+	}
+	// 使用 lib/cache/assets_preload 作为缓存目录
+	cacheDir := filepath.Join(filepath.Dir(modelDir), "lib", "cache", "assets_preload")
+	ttsRuntime.PreloadCache = NewPreloadCache(cacheDir, 2, ttsRuntime)
+
+	return ttsRuntime, nil
 }
 
 func (t *OnnxTtsRuntime) EncodeText(text string) []int {
@@ -246,7 +255,39 @@ func (t *OnnxTtsRuntime) splitTextByTokenBudget(text string, maxTokens int) []st
 }
 
 func (t *OnnxTtsRuntime) ResolvePromptAudioCodes(voice string, promptAudioPath string) [][]int {
-	log.Printf("[ResolvePromptAudioCodes] voice=%q promptAudioPath=%q", voice, promptAudioPath)
+	return t.ResolvePromptAudioCodesWithPreload(voice, promptAudioPath, "", "")
+}
+
+func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, promptAudioPath string, preloadId string, preloadAudioPath string) [][]int {
+	log.Printf("[ResolvePromptAudioCodes] voice=%q promptAudioPath=%q preloadId=%q preloadAudioPath=%q", voice, promptAudioPath, preloadId, preloadAudioPath)
+
+	// 优先使用preloadId
+	if preloadId != "" && t.PreloadCache != nil {
+		log.Printf("[ResolvePromptAudioCodes] 尝试使用preload缓存: %s", preloadId)
+		data, err := t.PreloadCache.Get(preloadId)
+		if err != nil {
+			log.Printf("[ResolvePromptAudioCodes] preload缓存获取失败: %v，尝试预加载", err)
+			// 尝试预加载
+			if preloadAudioPath != "" {
+				if err := t.PreloadCache.Preload(preloadId, preloadAudioPath, ""); err != nil {
+					log.Printf("[ResolvePromptAudioCodes] 预加载失败: %v", err)
+				} else {
+					// 再次尝试获取
+					data, err = t.PreloadCache.Get(preloadId)
+					if err == nil {
+						log.Printf("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
+						return data.AudioCodes
+					}
+				}
+			}
+		} else {
+			log.Printf("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
+			return data.AudioCodes
+		}
+	} else if preloadId != "" && t.PreloadCache == nil {
+		log.Printf("[ResolvePromptAudioCodes] 警告: PreloadCache未初始化，无法使用preloadId")
+	}
+
 	if promptAudioPath != "" {
 		log.Printf("[ResolvePromptAudioCodes] 使用上传的参考音频: %s", promptAudioPath)
 		codes := t.EncodeReferenceAudio(promptAudioPath)
@@ -414,15 +455,15 @@ func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath s
 }
 
 func (t *OnnxTtsRuntime) SynthesizeEx(text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
-	return t.SynthesizeWithContextEx(context.Background(), text, voice, promptAudioPath, outputAudioPath, sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, enableRobust, enableWeText, seed)
+	return t.SynthesizeWithContextEx(context.Background(), text, voice, promptAudioPath, outputAudioPath, "", "", sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, enableRobust, enableWeText, seed)
 }
 
-func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
+func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
 	startTime := time.Now()
 
 	t.OrtRuntime.CheckAndReleaseIdleSessions()
 
-	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
+	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q preloadId=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, preloadId, sampleMode, doSample, maxNewFrames)
 
 	var rngSeed int64 = 1234
 	if seed != nil {
@@ -436,7 +477,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 
 	preparedText := t.PrepareSynthesisTextEx(text, enableRobust, enableWeText)
 	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
-	promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
+	promptAudioCodes := t.ResolvePromptAudioCodesWithPreload(voice, promptAudioPath, preloadId, preloadAudioPath)
 	if promptAudioCodes == nil {
 		log.Printf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
 		promptAudioCodes = [][]int{}
@@ -643,7 +684,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	}, nil
 }
 
-func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (<-chan StreamChunk, error) {
+func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (<-chan StreamChunk, error) {
 	chunkChan := make(chan StreamChunk, 16)
 
 	go func() {
@@ -654,7 +695,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 		}
 
 		preparedText := t.PrepareSynthesisTextEx(text, enableRobust, enableWeText)
-		promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
+		promptAudioCodes := t.ResolvePromptAudioCodesWithPreload(voice, promptAudioPath, preloadId, preloadAudioPath)
 		if promptAudioCodes == nil {
 			promptAudioCodes = [][]int{}
 		}
@@ -763,7 +804,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 }
 
 func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voice string, promptAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (<-chan StreamChunk, error) {
-	return t.SynthesizeStreamEx(ctx, text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTextTokens, true, true, seed)
+	return t.SynthesizeStreamEx(ctx, text, voice, promptAudioPath, "", "", sampleMode, doSample, maxNewFrames, voiceCloneMaxTextTokens, true, true, seed)
 }
 
 func resolveStreamDecodeFrameBudget(emittedSamplesTotal, sampleRate int, firstAudioEmittedAt float64, hasEmittedAudio bool) int {

@@ -45,11 +45,12 @@ type ProgressEvent struct {
 }
 
 type DemoEntry struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Role string `json:"role"`
-	Text string `json:"text"`
-	Path string `json:"-"`
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	Text      string `json:"text"`
+	Path      string `json:"-"`
+	PreloadID string `json:"preloadId,omitempty"`
 }
 
 type Server struct {
@@ -132,9 +133,10 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 		}
 
 		var entry struct {
-			Name string `json:"name"`
-			Role string `json:"role"`
-			Text string `json:"text"`
+			Name      string `json:"name"`
+			Role      string `json:"role"`
+			Text      string `json:"text"`
+			PreloadID string `json:"preloadId"`
 		}
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			log.Printf("[Demo] 解析demo行失败: %v", err)
@@ -155,11 +157,12 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 
 		demoID := fmt.Sprintf("demo-%d", demoIndex)
 		demoEntry := DemoEntry{
-			ID:   demoID,
-			Name: entry.Name,
-			Role: entry.Role,
-			Text: entry.Text,
-			Path: fullPath,
+			ID:        demoID,
+			Name:      entry.Name,
+			Role:      entry.Role,
+			Text:      entry.Text,
+			Path:      fullPath,
+			PreloadID: entry.PreloadID,
 		}
 		s.DemoEntries = append(s.DemoEntries, demoEntry)
 		s.DemoEntriesByID[demoID] = &s.DemoEntries[len(s.DemoEntries)-1]
@@ -385,12 +388,32 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	promptAudioPath := req.PromptAudioPath
+	preloadId := req.PreloadID
+	preloadAudioPath := ""
+
 	if req.UploadedPromptAudio != "" {
 		promptAudioPath = req.UploadedPromptAudio
 	} else if req.DemoID != "" {
 		s.mu.RLock()
 		if demo, ok := s.DemoEntriesByID[req.DemoID]; ok {
 			promptAudioPath = demo.Path
+			// 如果demo有preloadId，使用preloadId
+			if demo.PreloadID != "" {
+				preloadId = demo.PreloadID
+				preloadAudioPath = demo.Path
+			}
+		}
+		s.mu.RUnlock()
+	}
+
+	// 如果直接指定了preloadId，但没有preloadAudioPath，从demo中查找
+	if preloadId != "" && preloadAudioPath == "" {
+		s.mu.RLock()
+		for _, demo := range s.DemoEntries {
+			if demo.PreloadID == preloadId {
+				preloadAudioPath = demo.Path
+				break
+			}
 		}
 		s.mu.RUnlock()
 	}
@@ -399,8 +422,8 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	if req.Seed != nil {
 		seedVal = fmt.Sprintf("%d", *req.Seed)
 	}
-	log.Printf("[API synthesize] text=%q voice=%q promptAudioPath=%q uploadedPromptAudio=%q sampleMode=%s maxNewFrames=%d voiceCloneMaxTokens=%d seed=%s stream=%v",
-		req.Text, voice, promptAudioPath, req.UploadedPromptAudio, sampleMode, maxNewFrames, voiceCloneMaxTokens, seedVal, req.Stream)
+	log.Printf("[API synthesize] text=%q voice=%q promptAudioPath=%q preloadId=%q sampleMode=%s maxNewFrames=%d voiceCloneMaxTokens=%d seed=%s stream=%v",
+		req.Text, voice, promptAudioPath, preloadId, sampleMode, maxNewFrames, voiceCloneMaxTokens, seedVal, req.Stream)
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
@@ -411,7 +434,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	enableRobust := true
-	enableWeText := true
+	enableWeText := false // 默认禁用WeTextProcessing，避免性能问题（首次调用耗时17秒）
 	if req.EnableRobust != nil {
 		enableRobust = *req.EnableRobust
 	}
@@ -420,12 +443,13 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		s.handleStreamSynthesize(w, ctx, rt, req, voice, promptAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
+		s.handleStreamSynthesize(w, ctx, rt, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
 		return
 	}
 
 	result, err := rt.SynthesizeWithContextEx(ctx,
 		req.Text, voice, promptAudioPath, "",
+		preloadId, preloadAudioPath,
 		sampleMode, doSample, false,
 		maxNewFrames, voiceCloneMaxTokens,
 		enableRobust, enableWeText, req.Seed,
@@ -454,7 +478,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
+func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
@@ -463,6 +487,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 
 	chunkChan, err := rt.SynthesizeStreamEx(ctx,
 		req.Text, voice, promptAudioPath,
+		preloadId, preloadAudioPath,
 		sampleMode, doSample,
 		maxNewFrames, voiceCloneMaxTokens,
 		enableRobust, enableWeText, req.Seed,
@@ -645,16 +670,18 @@ func (s *Server) handleDemos(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	type demoInfo struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-		Text string `json:"text"`
+		ID        string `json:"id"`
+		Name      string `json:"name"`
+		Text      string `json:"text"`
+		PreloadID string `json:"preloadId,omitempty"`
 	}
 	var infos []demoInfo
 	for _, d := range demos {
 		infos = append(infos, demoInfo{
-			ID:   d.ID,
-			Name: d.Name,
-			Text: d.Text,
+			ID:        d.ID,
+			Name:      d.Name,
+			Text:      d.Text,
+			PreloadID: d.PreloadID,
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -695,6 +722,7 @@ type SynthesizeRequest struct {
 	Text                    string `json:"text"`
 	Voice                   string `json:"voice"`
 	DemoID                  string `json:"demo_id"`
+	PreloadID               string `json:"preload_id"`
 	PromptAudioPath         string `json:"prompt_audio_path"`
 	UploadedPromptAudio     string `json:"uploaded_prompt_audio"`
 	SampleMode              string `json:"sample_mode"`
@@ -919,8 +947,8 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
       <div class="meta">处理标点、空格、括号、重复符号等</div>
     </div>
     <div class="field">
-      <label><input id="enable-wetext" type="checkbox" checked> 开启 WeTextProcessing</label>
-      <div class="meta">数字/日期/金额等语义级展开</div>
+      <label><input id="enable-wetext" type="checkbox"> 开启 WeTextProcessing</label>
+      <div class="meta">数字/日期/金额等语义级展开（首次调用耗时17秒，建议仅在需要时启用）</div>
     </div>
   </div>
 </details>
@@ -960,7 +988,12 @@ async function loadDemos() {
       demosById[d.id] = d;
       const o = document.createElement('option');
       o.value = d.id;
-      o.textContent = d.name;
+      // 如果有preloadId，在名称后面添加标识
+      if (d.preloadId) {
+        o.textContent = d.name + ' [预加载]';
+      } else {
+        o.textContent = d.name;
+      }
       sel.appendChild(o);
     });
   } catch (e) {
@@ -1036,7 +1069,12 @@ function onDemoChange() {
   preview.src = currentDemoPromptAudioUrl;
   preview.hidden = false;
   input.hidden = true;
-  source.textContent = '使用演示样例音频: ' + demo.name;
+  // 显示demo信息和preloadId
+  let sourceText = '使用演示样例音频: ' + demo.name;
+  if (demo.preloadId) {
+    sourceText += ' (预加载缓存: ' + demo.preloadId + ')';
+  }
+  source.textContent = sourceText;
   chooseBtn.hidden = false;
   clearBtn.hidden = false;
   uploadedPromptAudioPath = '';
