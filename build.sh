@@ -1,1 +1,1 @@
-go build -o moss-tts-nano-onnx-go ./cmd/main.go
+go build -o moss-tts-nano-onnx-go ./cmd/

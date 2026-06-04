@@ -215,6 +215,7 @@ func (p *Processor) Encode(text string) []int {
 	if text == "" {
 		return nil
 	}
+	text = normalizeNFKC(text)
 	normalized := strings.ReplaceAll(text, " ", "\xe2\x96\x81")
 	runes := []rune(normalized)
 	var tokens []int
@@ -298,6 +299,23 @@ func (p *Processor) GetPieceID(piece string) int {
 
 func (p *Processor) VocabSize_() int {
 	return p.VocabSize
+}
+
+// normalizeNFKC normalizes fullwidth characters to their ASCII equivalents,
+// matching SentencePiece's internal NFKC normalization behavior.
+// SentencePiece normalizes the fullwidth block (U+FF01-U+FF5E) to ASCII,
+// but keeps smart quotes (U+201C/U+201D) and dashes (U+2013/U+2014) as-is.
+func normalizeNFKC(text string) string {
+	runes := []rune(text)
+	result := make([]rune, 0, len(runes))
+	for _, r := range runes {
+		if r >= 0xFF01 && r <= 0xFF5E {
+			result = append(result, rune(r-0xFEE0))
+		} else {
+			result = append(result, r)
+		}
+	}
+	return string(result)
 }
 
 type sliceReader struct {

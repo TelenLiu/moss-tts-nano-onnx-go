@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/web"
@@ -72,8 +73,10 @@ func runInfer(args []string) {
 	audioTopP := fs.Float64("audio-top-p", 0.95, "音频层top-p")
 	audioTopK := fs.Int("audio-top-k", 25, "音频层top-k")
 	audioRepPenalty := fs.Float64("audio-repetition-penalty", 1.2, "音频层重复惩罚")
-	enableNormalize := fs.Bool("enable-normalize-tts-text", true, "启用TTS文本正则化")
-	disableNormalize := fs.Bool("disable-normalize-tts-text", false, "禁用TTS文本正则化")
+	enableRobust := fs.Bool("enable-robust", true, "启用鲁棒性文本归一化 (标点/空格/括号处理)")
+	disableRobust := fs.Bool("disable-robust", false, "禁用鲁棒性文本归一化")
+	enableWeText := fs.Bool("enable-wetext", true, "启用WeTextProcessing (数字/日期/金额展开)")
+	disableWeText := fs.Bool("disable-wetext", false, "禁用WeTextProcessing")
 	seed := fs.Int("seed", -1, "随机种子 (-1 表示不设置)")
 	useMirror := fs.Bool("mirror", false, "使用国内加速镜像源下载依赖和模型")
 	fs.Parse(args)
@@ -97,7 +100,8 @@ func runInfer(args []string) {
 
 	resolvedText := resolveTextContent(*text, *textFile)
 	doSampleBool := *doSample != 0
-	normalizeEnabled := *enableNormalize && !*disableNormalize
+	robustEnabled := *enableRobust && !*disableRobust
+	wetextEnabled := *enableWeText && !*disableWeText
 	maxFrames := *maxNewFrames
 	seedOpt := (*int)(nil)
 	if *seed >= 0 {
@@ -128,12 +132,12 @@ func runInfer(args []string) {
 	}
 	defer rt.Close()
 
-	log.Printf("开始合成: text=%q voice=%s sample_mode=%s", resolvedText, *voice, *sampleMode)
-	result, err := rt.Synthesize(
+	log.Printf("开始合成: text=%q voice=%s sample_mode=%s robust=%v wetext=%v", resolvedText, *voice, *sampleMode, robustEnabled, wetextEnabled)
+	result, err := rt.SynthesizeEx(
 		resolvedText, *voice, *promptAudioPath, *outputPath,
 		*sampleMode, doSampleBool, false,
 		*maxNewFrames, *voiceCloneMaxTokens,
-		normalizeEnabled, seedOpt,
+		robustEnabled, wetextEnabled, seedOpt,
 	)
 	if err != nil {
 		log.Fatalf("合成失败: %v", err)
@@ -201,6 +205,14 @@ func runDownload(args []string) {
 	if err := deps.EnsureModels(cfg); err != nil {
 		log.Fatalf("下载模型文件失败: %v", err)
 	}
+
+	log.Println("构建文本归一化 FST 缓存（首次运行需要 5-10 分钟）...")
+	if err := normalizer.BuildCache(); err != nil {
+		log.Printf("警告: 文本归一化缓存构建异常: %v", err)
+	} else {
+		log.Println("文本归一化 FST 缓存构建完成!")
+	}
+
 	log.Println("所有依赖和模型下载完成!")
 }
 

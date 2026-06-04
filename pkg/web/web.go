@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/runtime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
@@ -184,6 +186,7 @@ func (s *Server) Start() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/api/progress", s.handleProgress)
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/synthesize", s.handleSynthesize)
@@ -206,6 +209,9 @@ func (s *Server) Start() error {
 
 func (s *Server) backgroundInit() {
 	s.emit(ProgressEvent{Phase: "check", Message: "正在检测运行环境...", Percent: 5})
+
+	s.emit(ProgressEvent{Phase: "load", Message: "正在初始化文本归一化引擎...", Percent: 8})
+	s.emit(ProgressEvent{Phase: "load", Message: "文本归一化引擎后台加载中（如首次运行需构建 FST 缓存，约 5-10 分钟）", Percent: 9})
 
 	s.emit(ProgressEvent{Phase: "download", Message: "正在检查 ONNX Runtime 本地依赖...", Percent: 10})
 	deps.SetDynlibPath(s.Cfg.LibDir)
@@ -242,6 +248,15 @@ func (s *Server) backgroundInit() {
 
 	s.mu.Lock()
 	s.Runtime = rt
+	s.mu.Unlock()
+
+	s.emit(ProgressEvent{Phase: "load", Message: "正在准备文本归一化引擎...", Percent: 96})
+	normalizer.EnsureInitializedSync(func(msg string, pct float64) {
+		s.emit(ProgressEvent{Phase: "load", Message: msg, Percent: pct})
+	})
+	s.emit(ProgressEvent{Phase: "load", Message: "文本归一化引擎就绪", Percent: 99})
+
+	s.mu.Lock()
 	s.Ready = true
 	s.mu.Unlock()
 
@@ -398,16 +413,25 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[API synthesize] 请求断开，取消合成")
 	}()
 
+	enableRobust := true
+	enableWeText := true
+	if req.EnableRobust != nil {
+		enableRobust = *req.EnableRobust
+	}
+	if req.EnableWeText != nil {
+		enableWeText = *req.EnableWeText
+	}
+
 	if req.Stream {
-		s.handleStreamSynthesize(w, ctx, rt, req, voice, promptAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens)
+		s.handleStreamSynthesize(w, ctx, rt, req, voice, promptAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
 		return
 	}
 
-	result, err := rt.SynthesizeWithContext(ctx,
+	result, err := rt.SynthesizeWithContextEx(ctx,
 		req.Text, voice, promptAudioPath, "",
 		sampleMode, doSample, false,
 		maxNewFrames, voiceCloneMaxTokens,
-		true, req.Seed,
+		enableRobust, enableWeText, req.Seed,
 	)
 	if err != nil {
 		log.Printf("[API synthesize] 合成失败: %v", err)
@@ -433,18 +457,18 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int) {
+func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	chunkChan, err := rt.SynthesizeStream(ctx,
+	chunkChan, err := rt.SynthesizeStreamEx(ctx,
 		req.Text, voice, promptAudioPath,
 		sampleMode, doSample,
 		maxNewFrames, voiceCloneMaxTokens,
-		true, req.Seed,
+		enableRobust, enableWeText, req.Seed,
 	)
 	if err != nil {
 		log.Printf("[API synthesize stream] 流式合成启动失败: %v", err)
@@ -681,6 +705,8 @@ type SynthesizeRequest struct {
 	VoiceCloneMaxTextTokens int    `json:"voice_clone_max_text_tokens"`
 	Seed                    *int   `json:"seed"`
 	Stream                  bool   `json:"stream"`
+	EnableRobust            *bool  `json:"enable_robust"`
+	EnableWeText            *bool  `json:"enable_wetext"`
 }
 
 type SynthesizeResponse struct {
@@ -890,6 +916,16 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
       <input id="voice-clone-max-text-tokens" type="number" value="75" min="1">
     </div>
   </div>
+  <div class="row" style="margin-top:8px;">
+    <div class="field">
+      <label><input id="enable-robust" type="checkbox" checked> 开启鲁棒性文本归一化</label>
+      <div class="meta">处理标点、空格、括号、重复符号等</div>
+    </div>
+    <div class="field">
+      <label><input id="enable-wetext" type="checkbox" checked> 开启 WeTextProcessing</label>
+      <div class="meta">数字/日期/金额等语义级展开</div>
+    </div>
+  </div>
 </details>
 
 <div class="field">
@@ -1073,7 +1109,9 @@ function getConfig() {
     sample_mode: document.getElementById('sample-mode').value,
     max_new_frames: parseInt(document.getElementById('max-new-frames').value) || 375,
     voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 75,
-    seed: seedVal === 0 ? null : seedVal
+    seed: seedVal === 0 ? null : seedVal,
+    enable_robust: document.getElementById('enable-robust').checked,
+    enable_wetext: document.getElementById('enable-wetext').checked
   };
 }
 

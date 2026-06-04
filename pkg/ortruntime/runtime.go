@@ -860,21 +860,39 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 	if ds, ok := gd["do_sample"]; ok {
 		doSample = toBool(ds)
 	}
-	temperature := 1.0
-	if t, ok := gd["temperature"]; ok {
-		temperature = toFloat64(t)
+	textTemperature := 1.0
+	if t, ok := gd["text_temperature"]; ok {
+		textTemperature = toFloat64(t)
+	} else if t, ok := gd["temperature"]; ok {
+		textTemperature = toFloat64(t)
 	}
-	topK := 50
-	if k, ok := gd["top_k"]; ok {
-		topK = int(toFloat64(k))
+	textTopK := 50
+	if k, ok := gd["text_top_k"]; ok {
+		textTopK = int(toFloat64(k))
+	} else if k, ok := gd["top_k"]; ok {
+		textTopK = int(toFloat64(k))
 	}
-	topP := 1.0
-	if p, ok := gd["top_p"]; ok {
-		topP = toFloat64(p)
+	textTopP := 1.0
+	if p, ok := gd["text_top_p"]; ok {
+		textTopP = toFloat64(p)
+	} else if p, ok := gd["top_p"]; ok {
+		textTopP = toFloat64(p)
 	}
-	repetitionPenalty := float32(1.0)
-	if rp, ok := gd["repetition_penalty"]; ok {
-		repetitionPenalty = float32(toFloat64(rp))
+	audioTemperature := 0.8
+	if t, ok := gd["audio_temperature"]; ok {
+		audioTemperature = toFloat64(t)
+	}
+	audioTopK := 25
+	if k, ok := gd["audio_top_k"]; ok {
+		audioTopK = int(toFloat64(k))
+	}
+	audioTopP := 0.95
+	if p, ok := gd["audio_top_p"]; ok {
+		audioTopP = toFloat64(p)
+	}
+	audioRepetitionPenalty := float32(1.0)
+	if rp, ok := gd["audio_repetition_penalty"]; ok {
+		audioRepetitionPenalty = float32(toFloat64(rp))
 	}
 
 	ghShape := []int64{1, int64(len(globalHidden))}
@@ -886,7 +904,7 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 		return false, nil, localPastData, localPVL
 	}
 
-	nextTextToken := sampler.SampleAssistantTextToken(textLogits, audioAssistSlotID, audioEndTokenID, doSample, temperature, topK, topP, rt.RNG)
+	nextTextToken := sampler.SampleAssistantTextToken(textLogits, audioAssistSlotID, audioEndTokenID, doSample, textTemperature, textTopK, textTopP, rt.RNG)
 	if nextTextToken != audioAssistSlotID {
 		return false, nil, localPastData, localPVL
 	}
@@ -902,7 +920,7 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 	firstChannelLogits := make([]float32, perChannel)
 	copy(firstChannelLogits, audioLogits[:minInt(perChannel, len(audioLogits))])
 
-	sampledToken := sampler.SampleAudioToken(firstChannelLogits, prevTokens[0], prevTokenSets[0], doSample, temperature, topK, topP, repetitionPenalty, rt.RNG)
+	sampledToken := sampler.SampleAudioToken(firstChannelLogits, prevTokens[0], prevTokenSets[0], doSample, audioTemperature, audioTopK, audioTopP, audioRepetitionPenalty, rt.RNG)
 	frame := []int{sampledToken}
 	previousToken := sampledToken
 
@@ -923,7 +941,7 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 			copy(channelLogits, audioLogits2[startOff:endOff])
 		}
 
-		sampledToken2 := sampler.SampleAudioToken(channelLogits, prevTokens[ci], prevTokenSets[ci], doSample, temperature, topK, topP, repetitionPenalty, rt.RNG)
+		sampledToken2 := sampler.SampleAudioToken(channelLogits, prevTokens[ci], prevTokenSets[ci], doSample, audioTemperature, audioTopK, audioTopP, audioRepetitionPenalty, rt.RNG)
 		frame = append(frame, sampledToken2)
 		previousToken = sampledToken2
 	}

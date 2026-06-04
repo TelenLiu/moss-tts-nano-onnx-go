@@ -91,9 +91,13 @@ func (t *OnnxTtsRuntime) CountTextTokens(text string) int {
 
 func (t *OnnxTtsRuntime) PrepareSynthesisText(text string, enableNormalize bool) string {
 	if enableNormalize {
-		return normalizer.NormalizeTTSText(text)
+		return normalizer.PrepareTTSText(text, true, true)
 	}
 	return text
+}
+
+func (t *OnnxTtsRuntime) PrepareSynthesisTextEx(text string, enableRobust bool, enableWeText bool) string {
+	return normalizer.PrepareTTSText(text, enableRobust, enableWeText)
 }
 
 func (t *OnnxTtsRuntime) SplitVoiceCloneText(text string, maxTokens int) []string {
@@ -409,6 +413,120 @@ func (t *OnnxTtsRuntime) Synthesize(text string, voice string, promptAudioPath s
 	return t.SynthesizeWithContext(context.Background(), text, voice, promptAudioPath, outputAudioPath, sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, enableNormalize, seed)
 }
 
+func (t *OnnxTtsRuntime) SynthesizeEx(text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
+	return t.SynthesizeWithContextEx(context.Background(), text, voice, promptAudioPath, outputAudioPath, sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, enableRobust, enableWeText, seed)
+}
+
+func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
+	startTime := time.Now()
+
+	t.OrtRuntime.CheckAndReleaseIdleSessions()
+
+	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
+
+	var rngSeed int64 = 1234
+	if seed != nil {
+		rngSeed = int64(*seed)
+		log.Printf("[Synthesize] 使用随机种子: %d", *seed)
+	} else {
+		rngSeed = time.Now().UnixNano()
+		log.Printf("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
+	}
+	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+
+	preparedText := t.PrepareSynthesisTextEx(text, enableRobust, enableWeText)
+	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
+	promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
+	if promptAudioCodes == nil {
+		log.Printf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
+		promptAudioCodes = [][]int{}
+	} else {
+		log.Printf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
+	}
+	textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
+	log.Printf("[Synthesize] 文本分块: %d 块", len(textChunks))
+	for i, chunk := range textChunks {
+		log.Printf("[Synthesize]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
+	}
+	codecMeta := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
+	sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
+	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
+	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
+	var allWaveforms [][]float32
+	for chunkIndex, chunkText := range textChunks {
+		select {
+		case <-ctx.Done():
+			log.Printf("[Synthesize] 合成被取消")
+			return nil, ctx.Err()
+		default:
+		}
+		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
+
+		textTokenIDs := t.EncodeText(chunkText)
+		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
+		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
+		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows)
+		if ctx.Err() != nil {
+			log.Printf("[Synthesize] 合成被取消")
+			return nil, ctx.Err()
+		}
+		log.Printf("[Synthesize]   音频帧生成完成: %d 帧", len(generatedFrames))
+		channelArrays, audioLength := t.OrtRuntime.DecodeFullAudioWithContext(ctx, generatedFrames)
+		if ctx.Err() != nil {
+			log.Printf("[Synthesize] 合成被取消")
+			return nil, ctx.Err()
+		}
+		log.Printf("[Synthesize]   音频解码完成: channels=%d samples=%d", len(channelArrays), audioLength)
+		if len(channelArrays) > 0 {
+			merged := audio.MergeAudioChannels(channelArrays)
+			allWaveforms = append(allWaveforms, merged)
+		}
+		if chunkIndex < len(textChunks)-1 {
+			pauseSeconds := estimateInterChunkPauseSeconds(chunkText)
+			pauseSamples := int(math.Round(float64(sampleRate) * pauseSeconds))
+			if pauseSamples > 0 {
+				allWaveforms = append(allWaveforms, audio.MakeSilence(pauseSamples, channels))
+			}
+		}
+	}
+	waveform := audio.ConcatWaveforms(allWaveforms)
+
+	var audioData []byte
+	var resolvedOutputPath string
+	if outputAudioPath != "" {
+		resolvedOutputPath = outputAudioPath
+		if err := audio.WriteWAV(resolvedOutputPath, waveform, channels, sampleRate); err != nil {
+			return nil, fmt.Errorf("写入 WAV 文件失败: %w", err)
+		}
+	}
+	audioData, err := audio.EncodeWAV(waveform, channels, sampleRate)
+	if err != nil {
+		return nil, fmt.Errorf("编码 WAV 失败: %w", err)
+	}
+
+	runtime.GC()
+
+	t.OrtRuntime.ResetSessions()
+	log.Printf("[Synthesize] Session 已重置，内存已释放")
+
+	elapsed := time.Since(startTime).Seconds()
+	audioSamples := len(waveform) / channels
+	return &SynthesisResult{
+		AudioPath:    resolvedOutputPath,
+		AudioData:    audioData,
+		SampleRate:   sampleRate,
+		AudioSamples: audioSamples,
+		Waveform:     waveform,
+		Channels:     channels,
+		TextChunks:   textChunks,
+		SampleMode:   sampleMode,
+		DoSample:     doSample,
+		Streaming:    streaming,
+		ElapsedSec:   elapsed,
+	}, nil
+}
+
 func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (*SynthesisResult, error) {
 	startTime := time.Now()
 
@@ -525,7 +643,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	}, nil
 }
 
-func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voice string, promptAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (<-chan StreamChunk, error) {
+func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (<-chan StreamChunk, error) {
 	chunkChan := make(chan StreamChunk, 16)
 
 	go func() {
@@ -535,7 +653,7 @@ func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voic
 			t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
 		}
 
-		preparedText := t.PrepareSynthesisText(text, enableNormalize)
+		preparedText := t.PrepareSynthesisTextEx(text, enableRobust, enableWeText)
 		promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
 		if promptAudioCodes == nil {
 			promptAudioCodes = [][]int{}
@@ -642,6 +760,10 @@ func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voic
 	}()
 
 	return chunkChan, nil
+}
+
+func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voice string, promptAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (<-chan StreamChunk, error) {
+	return t.SynthesizeStreamEx(ctx, text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTextTokens, true, true, seed)
 }
 
 func resolveStreamDecodeFrameBudget(emittedSamplesTotal, sampleRate int, firstAudioEmittedAt float64, hasEmittedAudio bool) int {
