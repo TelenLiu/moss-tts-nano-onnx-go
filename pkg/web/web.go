@@ -19,6 +19,7 @@ import (
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/device"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/runtime"
@@ -54,16 +55,18 @@ type DemoEntry struct {
 }
 
 type Server struct {
-	Cfg          *deps.Config
-	CpuThreads   int
-	MaxNewFrames int
-	Host         string
-	Port         int
-	AppRoot      string
+	Cfg             *deps.Config
+	CpuThreads      int
+	ExecutionMode   string // "hybrid", "cpu", "gpu"
+	MaxNewFrames    int
+	Host            string
+	Port            int
+	AppRoot         string
 
 	mu              sync.RWMutex
 	RuntimeManager  *runtime.RuntimeManager
 	Runtime         *ttsruntime.OnnxTtsRuntime
+	DeviceInfo      *device.DeviceInfo
 	Ready           bool
 	Progress        []ProgressEvent
 	subscribers     map[chan ProgressEvent]struct{}
@@ -72,7 +75,7 @@ type Server struct {
 	AssetsDir       string
 }
 
-func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, host string, port int, appRoot string) *Server {
+func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, host string, port int, appRoot string) *Server {
 	cwd, _ := os.Getwd()
 	assetsDir := filepath.Join(cwd, "assets")
 	demoPath := filepath.Join(assetsDir, "demo.jsonl")
@@ -80,6 +83,7 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, host string, port
 	s := &Server{
 		Cfg:             cfg,
 		CpuThreads:      cpuThreads,
+		ExecutionMode:   executionMode,
 		MaxNewFrames:    maxNewFrames,
 		Host:            host,
 		Port:            port,
@@ -87,6 +91,7 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, host string, port
 		subscribers:     make(map[chan ProgressEvent]struct{}),
 		DemoEntriesByID: make(map[string]*DemoEntry),
 		AssetsDir:       assetsDir,
+		DeviceInfo:      &device.DeviceInfo{}, // 初始化为空，后续在backgroundInit中填充
 	}
 
 	if _, err := os.Stat(demoPath); err == nil {
@@ -192,6 +197,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/debug/pprof/", pprof.Index)
 	mux.HandleFunc("/api/progress", s.handleProgress)
 	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/device-info", s.handleDeviceInfo)
 	mux.HandleFunc("/api/synthesize", s.handleSynthesize)
 	mux.HandleFunc("/api/voices", s.handleVoices)
 	mux.HandleFunc("/api/audio/", s.handleAudio)
@@ -238,10 +244,26 @@ func (s *Server) backgroundInit() {
 	}
 	s.emit(ProgressEvent{Phase: "load", Message: "ONNX Runtime 环境初始化成功", Percent: 70})
 
+	// 检测设备信息
+	s.emit(ProgressEvent{Phase: "load", Message: "正在检测设备信息...", Percent: 72})
+	deviceInfo := device.GetDeviceInfo()
+	s.mu.Lock()
+	s.DeviceInfo = deviceInfo
+	s.mu.Unlock()
+	log.Printf("[Device] CPU核心数: %d, GPU可用: %v, CUDA可用: %v", deviceInfo.CPUInfo.NumCores, deviceInfo.HasGPU, deviceInfo.HasCUDA)
+
+	// 如果用户选择GPU模式但没有GPU，自动切换到混合模式
+	if s.ExecutionMode == "gpu" && !deviceInfo.HasCUDA {
+		log.Printf("[Device] GPU不可用，自动切换到混合模式")
+		s.ExecutionMode = "hybrid"
+	}
+
+	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("设备检测完成: CPU %d核, GPU %v", deviceInfo.CPUInfo.NumCores, deviceInfo.HasGPU), Percent: 74})
+
 	s.emit(ProgressEvent{Phase: "load", Message: "正在加载 TTS 模型...", Percent: 75})
 	rt, err := ttsruntime.NewOnnxTtsRuntime(
 		s.Cfg.ModelDir, s.CpuThreads,
-		&s.MaxNewFrames, nil, nil,
+		&s.MaxNewFrames, nil, nil, s.ExecutionMode,
 	)
 	if err != nil {
 		s.emit(ProgressEvent{Phase: "error", Message: fmt.Sprintf("TTS 运行时初始化失败: %v", err), Error: fmt.Sprintf("TTS 运行时初始化失败: %v", err)})
@@ -337,6 +359,54 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"ready": ready})
+}
+
+func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	deviceInfo := s.DeviceInfo
+	executionMode := s.ExecutionMode
+	s.mu.RUnlock()
+
+	// 构建响应
+	response := map[string]interface{}{
+		"cpu": map[string]interface{}{
+			"num_cores":     deviceInfo.CPUInfo.NumCores,
+			"num_threads":   deviceInfo.CPUInfo.NumThreads,
+			"available_cores": deviceInfo.CPUInfo.AvailableCores,
+		},
+		"has_gpu":       deviceInfo.HasGPU,
+		"has_cuda":      deviceInfo.HasCUDA,
+		"has_coreml":    deviceInfo.HasCoreML,
+		"execution_mode": executionMode,
+		"available_modes": device.GetAvailableModes(deviceInfo.HasGPU),
+	}
+
+	// 如果有GPU信息，添加到响应中
+	if deviceInfo.HasGPU {
+		response["gpu"] = map[string]interface{}{
+			"available":    deviceInfo.GPUInfo.Available,
+			"name":         deviceInfo.GPUInfo.Name,
+			"vendor":       deviceInfo.GPUInfo.Vendor,
+			"device_id":    deviceInfo.GPUInfo.DeviceID,
+			"memory_mb":    deviceInfo.GPUInfo.MemoryMB,
+			"compute_units": deviceInfo.GPUInfo.ComputeUnits,
+		}
+	}
+
+	// 添加执行提供程序设备信息
+	if len(deviceInfo.EpDevices) > 0 {
+		epDevices := make([]map[string]string, len(deviceInfo.EpDevices))
+		for i, ep := range deviceInfo.EpDevices {
+			epDevices[i] = map[string]string{
+				"name":   ep.Name,
+				"vendor": ep.Vendor,
+			}
+		}
+		response["ep_devices"] = epDevices
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
@@ -890,6 +960,11 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
 <body>
 <h1>MOSS-TTS-Nano ONNX Demo <span class="badge">Ready</span></h1>
 
+<div class="result" id="device-info-box" style="margin-bottom:20px;">
+  <div style="font-weight:600;margin-bottom:8px;">设备信息</div>
+  <div id="device-info-content" style="font-size:13px;color:#666;">正在检测设备...</div>
+</div>
+
 <div class="field">
   <label for="demo">演示样例</label>
   <select id="demo" onchange="onDemoChange()"></select>
@@ -921,31 +996,43 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   <summary class="details-summary">高级选项</summary>
   <div class="row" style="margin-top:12px;">
     <div class="field">
+      <label for="execution-mode">推理方式</label>
+      <select id="execution-mode">
+        <option value="hybrid">CPU+GPU混合推理（推荐）</option>
+        <option value="cpu">仅CPU推理</option>
+        <option value="gpu">仅GPU推理</option>
+      </select>
+      <div class="meta">选择推理执行方式。如果GPU不可用，仅显示CPU选项。</div>
+    </div>
+    <div class="field">
       <label for="sample-mode">采样模式</label>
       <select id="sample-mode"><option value="fixed">fixed</option><option value="full">full</option><option value="greedy">greedy</option></select>
       <div class="meta">fixed 使用内置ONNX采样常数; full 使用页面参数采样; greedy 禁用采样</div>
     </div>
+  </div>
+  <div class="row">
     <div class="field">
       <label for="seed">随机种子</label>
       <input id="seed" type="number" step="1" value="0">
       <div class="meta">0 表示随机种子</div>
     </div>
-  </div>
-  <div class="row">
     <div class="field">
       <label for="max-new-frames">最大帧数</label>
       <input id="max-new-frames" type="number" value="2000" min="1">
     </div>
+  </div>
+  <div class="row" style="margin-top:8px;">
     <div class="field">
       <label for="voice-clone-max-text-tokens">最大文本Token数</label>
       <input id="voice-clone-max-text-tokens" type="number" value="300" min="1">
+      <div class="meta">克隆音色时的最大文本Token数</div>
     </div>
-  </div>
-  <div class="row" style="margin-top:8px;">
     <div class="field">
       <label><input id="enable-robust" type="checkbox" checked> 开启鲁棒性文本归一化</label>
       <div class="meta">处理标点、空格、括号、重复符号等</div>
     </div>
+  </div>
+  <div class="row" style="margin-top:8px;">
     <div class="field">
       <label><input id="enable-wetext" type="checkbox"> 开启 WeTextProcessing</label>
       <div class="meta">数字/日期/金额等语义级展开（首次调用耗时17秒，建议仅在需要时启用）</div>
@@ -998,6 +1085,57 @@ async function loadDemos() {
     });
   } catch (e) {
     console.error('Failed to load demos:', e);
+  }
+}
+
+async function loadDeviceInfo() {
+  try {
+    const r = await fetch('/api/device-info');
+    const info = await r.json();
+    const contentDiv = document.getElementById('device-info-content');
+
+    // 构建设备信息显示
+    let html = '<div style="margin-bottom:6px;"><strong>CPU:</strong> ' + info.cpu.num_cores + ' 核心</div>';
+
+    if (info.has_gpu) {
+      html += '<div style="margin-bottom:6px;"><strong>GPU:</strong> 可用';
+      if (info.gpu && info.gpu.name) {
+        html += ' (' + info.gpu.name + ')';
+      }
+      html += '</div>';
+    } else {
+      html += '<div style="margin-bottom:6px;"><strong>GPU:</strong> 不可用</div>';
+    }
+
+    html += '<div style="margin-bottom:6px;"><strong>当前推理模式:</strong> ' + info.execution_mode + '</div>';
+
+    contentDiv.innerHTML = html;
+
+    // 更新推理方式选项
+    const executionModeSel = document.getElementById('execution-mode');
+    executionModeSel.innerHTML = '';
+
+    // 添加可用模式
+    info.available_modes.forEach(mode => {
+      const o = document.createElement('option');
+      o.value = mode;
+      if (mode === 'hybrid') {
+        o.textContent = 'CPU+GPU混合推理（推荐）';
+      } else if (mode === 'cpu') {
+        o.textContent = '仅CPU推理';
+      } else if (mode === 'gpu') {
+        o.textContent = '仅GPU推理';
+      }
+      // 设置当前模式为选中
+      if (mode === info.execution_mode) {
+        o.selected = true;
+      }
+      executionModeSel.appendChild(o);
+    });
+
+  } catch (e) {
+    console.error('Failed to load device info:', e);
+    document.getElementById('device-info-content').textContent = '设备信息加载失败';
   }
 }
 
@@ -1346,6 +1484,7 @@ async function doStreamSynthesize(body, result, btn) {
 
 loadDemos();
 loadVoices();
+loadDeviceInfo();
 </script>
 </body>
 </html>

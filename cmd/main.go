@@ -64,6 +64,7 @@ func runInfer(args []string) {
 	sampleMode := fs.String("sample-mode", "fixed", "采样模式: greedy, fixed, full")
 	doSample := fs.Int("do-sample", 1, "是否采样 (0/1)")
 	cpuThreads := fs.Int("cpu-threads", defaultCpuThreads(), "ONNX Runtime 线程数 (默认: CPU核心数-1, 至少为1)")
+	executionMode := fs.String("execution-mode", "hybrid", "推理执行模式: hybrid(CPU+GPU混合), cpu(仅CPU), gpu(仅GPU)")
 	maxNewFrames := fs.Int("max-new-frames", 375, "最大生成音频帧数")
 	voiceCloneMaxTokens := fs.Int("voice-clone-max-text-tokens", 75, "文本分块token预算")
 	textTemp := fs.Float64("text-temperature", 1.0, "文本层采样温度")
@@ -125,8 +126,8 @@ func runInfer(args []string) {
 		*outputPath = filepath.Join(cwd, "infer_onnx_output.wav")
 	}
 
-	log.Printf("初始化 TTS 运行时 (model_dir=%s threads=%d)...", cfg.ModelDir, *cpuThreads)
-	rt, err := ttsruntime.NewOnnxTtsRuntime(cfg.ModelDir, *cpuThreads, &maxFrames, &doSampleBool, sampleMode)
+	log.Printf("初始化 TTS 运行时 (model_dir=%s threads=%d mode=%s)...", cfg.ModelDir, *cpuThreads, *executionMode)
+	rt, err := ttsruntime.NewOnnxTtsRuntime(cfg.ModelDir, *cpuThreads, &maxFrames, &doSampleBool, sampleMode, *executionMode)
 	if err != nil {
 		log.Fatalf("初始化 TTS 运行时失败: %v", err)
 	}
@@ -160,6 +161,7 @@ func runServe(args []string) {
 	host := fs.String("host", "", "监听地址 (留空监听所有网络接口)")
 	port := fs.Int("port", 18083, "监听端口")
 	cpuThreads := fs.Int("cpu-threads", defaultCpuThreads(), "ONNX Runtime 线程数 (默认: CPU核心数-1, 至少为1)")
+	executionMode := fs.String("execution-mode", "hybrid", "推理执行模式: hybrid(CPU+GPU混合), cpu(仅CPU), gpu(仅GPU)")
 	maxNewFrames := fs.Int("max-new-frames", 375, "最大生成音频帧数")
 	useMirror := fs.Bool("mirror", false, "使用国内加速镜像源下载依赖和模型")
 	fs.Parse(args)
@@ -175,7 +177,7 @@ func runServe(args []string) {
 		displayHost = "0.0.0.0"
 	}
 	appRoot := fmt.Sprintf("http://%s:%d", displayHost, *port)
-	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, *host, *port, appRoot)
+	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, *executionMode, *host, *port, appRoot)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Web 服务启动失败: %v", err)
 	}

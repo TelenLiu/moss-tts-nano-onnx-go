@@ -273,6 +273,7 @@ func (s *CodecStreamingDecodeSession) RunFrames(frameRows [][]int) ([][]float32,
 type OrtCpuRuntime struct {
 	ModelDir           string
 	ThreadCount        int
+	ExecutionMode      string // "hybrid", "cpu", "gpu"
 	ManifestPath       string
 	ManifestDir        string
 	Manifest           map[string]interface{}
@@ -286,10 +287,11 @@ type OrtCpuRuntime struct {
 	SessionMutex       sync.Mutex    // 保护 sessions 的并发访问
 }
 
-func NewOrtCpuRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string) (*OrtCpuRuntime, error) {
+func NewOrtCpuRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OrtCpuRuntime, error) {
 	rt := &OrtCpuRuntime{
 		ModelDir:           modelDir,
 		ThreadCount:        max(1, threadCount),
+		ExecutionMode:      executionMode,
 		RNG:                rand.New(rand.NewSource(time.Now().UnixNano())),
 		SessionIdleTimeout: 10 * time.Second, // 默认 10 秒超时
 	}
@@ -354,90 +356,230 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 	onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
 	sessions := &OnnxSessions{}
 
-	sessionOptions, err := ort.NewSessionOptions()
-	if err != nil {
-		return fmt.Errorf("创建 SessionOptions 失败: %w", err)
-	}
-	defer sessionOptions.Destroy()
-	if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevel(99)); err != nil {
-		log.Printf("  警告: 设置图优化级别失败: %v", err)
-	}
-	if err := sessionOptions.SetIntraOpNumThreads(rt.ThreadCount); err != nil {
-		log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
-	}
-	if err := sessionOptions.SetInterOpNumThreads(1); err != nil {
-		log.Printf("  警告: 设置 InterOp 线程数失败: %v", err)
-	}
+	// 尝试创建session，如果GPU加载失败则回退到CPU
+	tryCreateSessions := func(useGPU bool) error {
+		sessionOptions, err := ort.NewSessionOptions()
+		if err != nil {
+			return fmt.Errorf("创建 SessionOptions 失败: %w", err)
+		}
+		defer sessionOptions.Destroy()
+		if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevel(99)); err != nil {
+			log.Printf("  警告: 设置图优化级别失败: %v", err)
+		}
 
-	load := func(name, dir string, filename interface{}, inputNames, outputNames []string) error {
-		if filename == nil {
+		// 根据是否使用GPU配置SessionOptions
+		if useGPU {
+			gpuSuccess := false
+
+			// 尝试CUDA
+			cudaOptions, err := ort.NewCUDAProviderOptions()
+			if err == nil {
+				defer cudaOptions.Destroy()
+				cudaOptions.Update(map[string]string{
+					"device_id": "0",
+				})
+				if err := sessionOptions.AppendExecutionProviderCUDA(cudaOptions); err == nil {
+					log.Printf("  使用CUDA执行提供程序")
+					gpuSuccess = true
+				}
+			}
+
+			// 如果CUDA失败，尝试CoreML
+			if !gpuSuccess {
+				// 检查模型是否有外部数据文件，CoreML不支持外部数据
+				hasExternalData := hasExternalDataFiles(ttsDir, ttsFiles, codecDir, codecFiles)
+				if hasExternalData {
+					log.Printf("  模型使用外部数据文件，CoreML不支持此格式，跳过CoreML")
+				} else {
+					coremlFlags := uint32(0)
+					if err := sessionOptions.AppendExecutionProviderCoreML(coremlFlags); err == nil {
+						log.Printf("  使用CoreML执行提供程序 (Apple M1/M2)")
+						gpuSuccess = true
+					}
+				}
+			}
+
+			if gpuSuccess {
+				threads := rt.ThreadCount
+				if threads > 1 {
+					threads = threads - 1
+				}
+				if err := sessionOptions.SetIntraOpNumThreads(threads); err != nil {
+					log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+				}
+			} else {
+				log.Printf("  GPU不可用，使用CPU模式")
+				if err := sessionOptions.SetIntraOpNumThreads(rt.ThreadCount); err != nil {
+					log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+				}
+			}
+		} else {
+			log.Printf("  使用CPU执行提供程序")
+			if err := sessionOptions.SetIntraOpNumThreads(rt.ThreadCount); err != nil {
+				log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+			}
+		}
+
+		if err := sessionOptions.SetInterOpNumThreads(1); err != nil {
+			log.Printf("  警告: 设置 InterOp 线程数失败: %v", err)
+		}
+
+		// 加载模型
+		load := func(name, dir string, filename interface{}, inputNames, outputNames []string) error {
+			if filename == nil {
+				return nil
+			}
+			onnxPath := filepath.Join(dir, fmt.Sprintf("%v", filename))
+			log.Printf("  加载 ONNX session: %s (inputs=%d outputs=%d threads=%d)", name, len(inputNames), len(outputNames), rt.ThreadCount)
+			sess, err := ort.NewDynamicAdvancedSession(onnxPath, inputNames, outputNames, sessionOptions)
+			if err != nil {
+				return fmt.Errorf("创建 ONNX session 失败 (%s): %w", name, err)
+			}
+			switch name {
+			case "prefill":
+				sessions.Prefill = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "decode":
+				sessions.Decode = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "local_decoder":
+				sessions.LocalDecoder = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "local_cached_step":
+				sessions.LocalCachedStep = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "local_fixed_sampled_frame":
+				sessions.LocalFixedSampledFrame = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "codec_encode":
+				sessions.CodecEncode = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "codec_decode":
+				sessions.CodecDecode = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "codec_decode_step":
+				sessions.CodecDecodeStep = &TimedSession{Session: sess, LastUsed: time.Now()}
+			}
 			return nil
 		}
-		onnxPath := filepath.Join(dir, fmt.Sprintf("%v", filename))
-		log.Printf("  加载 ONNX session: %s (inputs=%d outputs=%d threads=%d)", name, len(inputNames), len(outputNames), rt.ThreadCount)
-		sess, err := ort.NewDynamicAdvancedSession(onnxPath, inputNames, outputNames, sessionOptions)
-		if err != nil {
-			return fmt.Errorf("创建 ONNX session 失败 (%s): %w", name, err)
+
+		prefillOutputs := toStrSlice(onnxInfo["prefill_output_names"])
+		if err := load("prefill", ttsDir, ttsFiles["prefill"], []string{"input_ids", "attention_mask"}, prefillOutputs); err != nil {
+			return err
 		}
-		switch name {
-		case "prefill":
-			sessions.Prefill = &TimedSession{Session: sess, LastUsed: time.Now()}
-		case "decode":
-			sessions.Decode = &TimedSession{Session: sess, LastUsed: time.Now()}
-		case "local_decoder":
-			sessions.LocalDecoder = &TimedSession{Session: sess, LastUsed: time.Now()}
-		case "local_cached_step":
-			sessions.LocalCachedStep = &TimedSession{Session: sess, LastUsed: time.Now()}
-		case "local_fixed_sampled_frame":
-			sessions.LocalFixedSampledFrame = &TimedSession{Session: sess, LastUsed: time.Now()}
-		case "codec_encode":
-			sessions.CodecEncode = &TimedSession{Session: sess, LastUsed: time.Now()}
-		case "codec_decode":
-			sessions.CodecDecode = &TimedSession{Session: sess, LastUsed: time.Now()}
-		case "codec_decode_step":
-			sessions.CodecDecodeStep = &TimedSession{Session: sess, LastUsed: time.Now()}
+
+		decodeInputs := toStrSlice(onnxInfo["decode_input_names"])
+		decodeOutputs := toStrSlice(onnxInfo["decode_output_names"])
+		if err := load("decode", ttsDir, ttsFiles["decode_step"], decodeInputs, decodeOutputs); err != nil {
+			return err
 		}
+
+		load("local_decoder", ttsDir, ttsFiles["local_decoder"], nil, nil)
+
+		if f, ok := ttsFiles["local_cached_step"]; ok && f != nil {
+			lcInputs := toStrSlice(onnxInfo["local_cached_input_names"])
+			lcOutputs := toStrSlice(onnxInfo["local_cached_output_names"])
+			load("local_cached_step", ttsDir, f, lcInputs, lcOutputs)
+		}
+		if f, ok := ttsFiles["local_fixed_sampled_frame"]; ok && f != nil {
+			lfInputs := toStrSlice(onnxInfo["local_fixed_sampled_frame_input_names"])
+			lfOutputs := toStrSlice(onnxInfo["local_fixed_sampled_frame_output_names"])
+			load("local_fixed_sampled_frame", ttsDir, f, lfInputs, lfOutputs)
+		}
+
+		if err := load("codec_encode", codecDir, codecFiles["encode"], []string{"waveform", "input_lengths"}, []string{"audio_codes", "audio_code_lengths"}); err != nil {
+			return err
+		}
+		if err := load("codec_decode", codecDir, codecFiles["decode_full"], []string{"audio_codes", "audio_code_lengths"}, []string{"audio", "audio_lengths"}); err != nil {
+			return err
+		}
+		if f, ok := codecFiles["decode_step"]; ok && f != nil {
+			codecOnnxInfo := rt.CodecMeta["onnx"].(map[string]interface{})
+			dsInputs := toStrSlice(codecOnnxInfo["decode_step_input_names"])
+			dsOutputs := toStrSlice(codecOnnxInfo["decode_step_output_names"])
+			load("codec_decode_step", codecDir, f, dsInputs, dsOutputs)
+		}
+
 		return nil
 	}
 
-	prefillOutputs := toStrSlice(onnxInfo["prefill_output_names"])
-	if err := load("prefill", ttsDir, ttsFiles["prefill"], []string{"input_ids", "attention_mask"}, prefillOutputs); err != nil {
-		return err
+	// 根据推理模式决定是否尝试GPU
+	useGPU := rt.ExecutionMode == "hybrid" || rt.ExecutionMode == "gpu"
+
+	// 如果是GPU模式或混合模式，先尝试GPU
+	if useGPU {
+		log.Printf("  尝试使用GPU加载模型...")
+		err := tryCreateSessions(true)
+		if err != nil {
+			log.Printf("  GPU加载失败: %v", err)
+			// 如果是混合模式，回退到CPU
+			if rt.ExecutionMode == "hybrid" {
+				log.Printf("  回退到CPU模式...")
+				rt.ExecutionMode = "cpu"
+				err = tryCreateSessions(false)
+				if err != nil {
+					return err
+				}
+			} else {
+				// 如果是仅GPU模式，返回错误
+				return fmt.Errorf("GPU模式加载失败，无法回退到CPU: %w", err)
+			}
+		}
+	} else {
+		// 仅CPU模式
+		err := tryCreateSessions(false)
+		if err != nil {
+			return err
+		}
 	}
 
-	decodeInputs := toStrSlice(onnxInfo["decode_input_names"])
-	decodeOutputs := toStrSlice(onnxInfo["decode_output_names"])
-	if err := load("decode", ttsDir, ttsFiles["decode_step"], decodeInputs, decodeOutputs); err != nil {
-		return err
-	}
-
-	load("local_decoder", ttsDir, ttsFiles["local_decoder"], nil, nil)
-
-	if f, ok := ttsFiles["local_cached_step"]; ok && f != nil {
-		lcInputs := toStrSlice(onnxInfo["local_cached_input_names"])
-		lcOutputs := toStrSlice(onnxInfo["local_cached_output_names"])
-		load("local_cached_step", ttsDir, f, lcInputs, lcOutputs)
-	}
-	if f, ok := ttsFiles["local_fixed_sampled_frame"]; ok && f != nil {
-		lfInputs := toStrSlice(onnxInfo["local_fixed_sampled_frame_input_names"])
-		lfOutputs := toStrSlice(onnxInfo["local_fixed_sampled_frame_output_names"])
-		load("local_fixed_sampled_frame", ttsDir, f, lfInputs, lfOutputs)
-	}
-
-	if err := load("codec_encode", codecDir, codecFiles["encode"], []string{"waveform", "input_lengths"}, []string{"audio_codes", "audio_code_lengths"}); err != nil {
-		return err
-	}
-	if err := load("codec_decode", codecDir, codecFiles["decode_full"], []string{"audio_codes", "audio_code_lengths"}, []string{"audio", "audio_lengths"}); err != nil {
-		return err
-	}
-	if f, ok := codecFiles["decode_step"]; ok && f != nil {
-		codecOnnxInfo := rt.CodecMeta["onnx"].(map[string]interface{})
-		dsInputs := toStrSlice(codecOnnxInfo["decode_step_input_names"])
-		dsOutputs := toStrSlice(codecOnnxInfo["decode_step_output_names"])
-		load("codec_decode_step", codecDir, f, dsInputs, dsOutputs)
-	}
 	rt.Onnx = sessions
 	return nil
+}
+
+// hasExternalDataFiles 检查指定目录下是否有外部数据文件（如 .data 文件）
+// CoreML不支持外部数据文件格式，所以有外部数据文件时不能使用CoreML
+func hasExternalDataFiles(ttsDir string, ttsFiles map[string]interface{}, codecDir string, codecFiles map[string]interface{}) bool {
+	checkDir := func(dir string, filenames []string) bool {
+		for _, fn := range filenames {
+			if fn == "" {
+				continue
+			}
+			// 移除可能的".onnx"后缀
+			baseName := strings.TrimSuffix(fn, ".onnx")
+			// 检查常见的外部数据文件名
+			candidates := []string{
+				baseName + ".data",
+				baseName + "_data",
+				baseName + ".onnx.data",
+			}
+			for _, candidate := range candidates {
+				dataPath := filepath.Join(dir, candidate)
+				if _, err := os.Stat(dataPath); err == nil {
+					log.Printf("  [hasExternalDataFiles] 发现外部数据文件: %s", dataPath)
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	// 收集TTS模型文件名
+	ttsFilenames := []string{}
+	for _, v := range ttsFiles {
+		if v != nil {
+			ttsFilenames = append(ttsFilenames, fmt.Sprintf("%v", v))
+		}
+	}
+	if checkDir(ttsDir, ttsFilenames) {
+		return true
+	}
+
+	// 收集Codec模型文件名
+	codecFilenames := []string{}
+	for _, v := range codecFiles {
+		if v != nil {
+			codecFilenames = append(codecFilenames, fmt.Sprintf("%v", v))
+		}
+	}
+	if checkDir(codecDir, codecFilenames) {
+		return true
+	}
+
+	return false
 }
 
 func InitializeORT(libDir string) error {

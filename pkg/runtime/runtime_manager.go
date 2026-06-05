@@ -130,7 +130,7 @@ func (m *RuntimeManager) doInitialize(ctx context.Context, progressCb ProgressCa
 	report("load", "正在加载 TTS 模型...", 75, nil)
 	rt, err := ttsruntime.NewOnnxTtsRuntime(
 		m.config.ModelDir, m.cpuThreads,
-		&m.maxNewFrames, nil, nil,
+		&m.maxNewFrames, nil, nil, "hybrid", // 默认使用混合模式
 	)
 	if err != nil {
 		report("error", fmt.Sprintf("TTS 运行时初始化失败：%v", err), 0, err)

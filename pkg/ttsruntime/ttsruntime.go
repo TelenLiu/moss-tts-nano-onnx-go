@@ -58,8 +58,8 @@ type OnnxTtsRuntime struct {
 	PreloadCache  *PreloadCache
 }
 
-func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string) (*OnnxTtsRuntime, error) {
-	rt, err := ortruntime.NewOrtCpuRuntime(modelDir, threadCount, maxNewFrames, doSample, sampleMode)
+func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OnnxTtsRuntime, error) {
+	rt, err := ortruntime.NewOrtCpuRuntime(modelDir, threadCount, maxNewFrames, doSample, sampleMode, executionMode)
 	if err != nil {
 		return nil, fmt.Errorf("创建 OrtCpuRuntime 失败: %w", err)
 	}
@@ -685,7 +685,8 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 }
 
 func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (<-chan StreamChunk, error) {
-	chunkChan := make(chan StreamChunk, 16)
+	// 增大channel buffer以避免阻塞音频生成
+	chunkChan := make(chan StreamChunk, 64)
 
 	go func() {
 		defer close(chunkChan)
@@ -809,21 +810,23 @@ func (t *OnnxTtsRuntime) SynthesizeStream(ctx context.Context, text string, voic
 
 func resolveStreamDecodeFrameBudget(emittedSamplesTotal, sampleRate int, firstAudioEmittedAt float64, hasEmittedAudio bool) int {
 	if !hasEmittedAudio || sampleRate <= 0 {
-		return 1
+		// 首次解码时立即返回较大的批次，尽快发出首个音频
+		return 4
 	}
 	elapsedSeconds := math.Max(0.0, float64(time.Now().UnixNano())/1e9-firstAudioEmittedAt)
 	emittedSeconds := float64(emittedSamplesTotal) / float64(sampleRate)
 	leadSeconds := emittedSeconds - elapsedSeconds
-	if leadSeconds < 0.20 {
-		return 1
-	}
-	if leadSeconds < 0.55 {
-		return 2
-	}
-	if leadSeconds < 1.10 {
+	// 优化：增加批处理大小，加快流式返回速度
+	if leadSeconds < 0.10 {
 		return 4
 	}
-	return 8
+	if leadSeconds < 0.30 {
+		return 8
+	}
+	if leadSeconds < 0.80 {
+		return 16
+	}
+	return 32
 }
 
 func (t *OnnxTtsRuntime) Close() {
