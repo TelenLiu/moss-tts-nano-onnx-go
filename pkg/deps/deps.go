@@ -8,12 +8,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/proxy"
 )
 
 const (
@@ -300,7 +304,8 @@ func EnsureModels(cfg *Config) error {
 func downloadHFRepo(cfg *Config, baseURL, repoID, localDir, label string) error {
 	os.MkdirAll(localDir, 0755)
 	apiURL := fmt.Sprintf("%s/api/models/%s/tree/main", baseURL, repoID)
-	resp, err := http.Get(apiURL)
+	client := newProxyHTTPClient()
+	resp, err := client.Get(apiURL)
 	if err != nil {
 		return fmt.Errorf("获取 HuggingFace 仓库文件列表失败: %w", err)
 	}
@@ -413,11 +418,7 @@ func downloadAndExtractOrtLibs(cfg *Config, url, destDir string) error {
 }
 
 func downloadFileTracked(cfg *Config, url, dest string, expectedSize int64, prefix string, groupDone, groupTotal int64, label string) error {
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-	}
+	client := newProxyHTTPClient()
 	resp, err := client.Get(url)
 	if err != nil {
 		return err
@@ -582,11 +583,7 @@ func extractOrtZip(src, dest string) error {
 }
 
 func downloadFile(url, dest string) error {
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return nil
-		},
-	}
+	client := newProxyHTTPClient()
 	resp, err := client.Get(url)
 	if err != nil {
 		return err
@@ -640,4 +637,65 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// httpTransportCache 缓存基于当前代理配置构造的 *http.Transport, 避免重复构造。
+// *http.Transport 内部使用 sync 保护并发, 可被多个 *http.Client 共享。
+// 代理配置一般不会在运行期改变, 这里使用一个简单的全局缓存。
+var (
+	httpTransportOnce sync.Once
+	httpTransportInst *http.Transport
+)
+
+// newProxyTransport 构造一个会走代理的 *http.Transport。
+// 当 pkg/proxy 未启用或加载失败时, 行为等同于使用 http.ProxyFromEnvironment。
+func newProxyTransport() *http.Transport {
+	httpTransportOnce.Do(func() {
+		cfg := proxy.GetGlobal()
+		if cfg == nil || !cfg.Enabled() {
+			httpTransportInst = &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   30 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			}
+			return
+		}
+		transport := &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+		if err := proxy.ApplyToTransport(transport); err != nil {
+			log.Printf("[Proxy] 注入代理配置失败, 回退到默认 transport: %v", err)
+			transport.Proxy = http.ProxyFromEnvironment
+		} else {
+			log.Printf("[Proxy] 已为下载请求启用代理: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
+		}
+		httpTransportInst = transport
+	})
+	return httpTransportInst
+}
+
+// newProxyHTTPClient 构造一个走代理的 *http.Client, 并跟随重定向。
+// Transport 来自 newProxyTransport() 的全局缓存。
+func newProxyHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: newProxyTransport(),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return nil
+		},
+	}
 }

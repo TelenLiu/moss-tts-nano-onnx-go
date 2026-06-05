@@ -12,9 +12,20 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/proxy"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/web"
 )
+
+func init() {
+	// 启动时尝试加载代理配置（conf/proxy.json）。
+	// 加载失败或不存在时不会影响对外 API/Web 服务的监听。
+	if cfg, err := proxy.Load(proxy.DefaultConfigPath()); err != nil {
+		//log.Printf("[Proxy] 警告: 加载代理配置失败, 已忽略: %v", err)
+	} else if cfg != nil {
+		log.Printf("[Proxy] 代理已启用: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
+	}
+}
 
 func main() {
 	if len(os.Args) < 2 {
