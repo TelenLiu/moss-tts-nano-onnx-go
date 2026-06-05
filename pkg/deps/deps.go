@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	OnnxRuntimeVersion = "1.25.0"
+	OnnxRuntimeVersion = "1.26.0"
 	DefaultHFBaseURL   = "https://huggingface.co"
 	MirrorHFBaseURL    = "https://hf-mirror.com"
 	OnnxRuntimeBaseURL = "https://github.com/microsoft/onnxruntime/releases/download"
@@ -196,13 +196,24 @@ func isOrtLibFile(name string) bool {
 	return false
 }
 
-func isOrtNeededFile(name string) bool {
-	normalizedPath := strings.ReplaceAll(name, "\\", "/")
-	parts := strings.Split(normalizedPath, "/")
-	if len(parts) < 2 {
-		return false
+// stripArchiveTopDir 规范化归档内路径：去除前导 "/", "./" 以及顶层目录。
+// onnxruntime 自 1.25.1 起在 tar/zip 中使用 "./onnxruntime-osx-arm64-1.x.x/..." 形式，
+// 因此单纯用 strings.Split 然后丢弃 parts[0] 会留下 ".onnxruntime-..." 这样的相对路径，
+// 导致后续 lib/ include/ 匹配全部失败。
+func stripArchiveTopDir(name string) string {
+	normalized := strings.ReplaceAll(name, "\\", "/")
+	normalized = strings.TrimLeft(normalized, "/")
+	for strings.HasPrefix(normalized, "./") {
+		normalized = strings.TrimPrefix(normalized, "./")
 	}
-	relativePath := strings.Join(parts[1:], "/")
+	if idx := strings.Index(normalized, "/"); idx >= 0 {
+		return normalized[idx+1:]
+	}
+	return normalized
+}
+
+func isOrtNeededFile(name string) bool {
+	relativePath := stripArchiveTopDir(name)
 	switch {
 	case strings.HasPrefix(relativePath, "lib/") && isOrtLibFile(name):
 		return true
@@ -510,18 +521,11 @@ func extractOrtTgz(src, dest string) error {
 		if !isOrtNeededFile(hdr.Name) {
 			continue
 		}
-		parts := strings.Split(hdr.Name, "/")
-		var target string
-		if len(parts) > 1 {
-			target = filepath.Join(dest, strings.Join(parts[1:], "/"))
-		} else {
-			target = filepath.Join(dest, hdr.Name)
-		}
-		if hdr.Typeflag == tar.TypeDir {
+		target := filepath.Join(dest, stripArchiveTopDir(hdr.Name))
+		switch hdr.Typeflag {
+		case tar.TypeDir:
 			os.MkdirAll(target, 0755)
-			continue
-		}
-		if hdr.Typeflag == tar.TypeReg {
+		case tar.TypeReg:
 			os.MkdirAll(filepath.Dir(target), 0755)
 			out, err := os.Create(target)
 			if err != nil {
@@ -532,6 +536,14 @@ func extractOrtTgz(src, dest string) error {
 				continue
 			}
 			out.Close()
+		case tar.TypeSymlink:
+			// 1.26.0+ 在 macOS 上额外增加了 libonnxruntime.1.dylib -> libonnxruntime.1.26.0.dylib
+			// 等符号链接，需要保留以便 dlopen 找到主库。
+			os.MkdirAll(filepath.Dir(target), 0755)
+			_ = os.Remove(target)
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				continue
+			}
 		}
 	}
 	return nil
@@ -547,13 +559,7 @@ func extractOrtZip(src, dest string) error {
 		if !isOrtNeededFile(f.Name) {
 			continue
 		}
-		parts := strings.Split(f.Name, "/")
-		var target string
-		if len(parts) > 1 {
-			target = filepath.Join(dest, strings.Join(parts[1:], "/"))
-		} else {
-			target = filepath.Join(dest, f.Name)
-		}
+		target := filepath.Join(dest, stripArchiveTopDir(f.Name))
 		if f.FileInfo().IsDir() {
 			os.MkdirAll(target, 0755)
 			continue
