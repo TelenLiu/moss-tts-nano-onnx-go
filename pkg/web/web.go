@@ -1338,6 +1338,8 @@ async function doSynthesize() {
       max_new_frames: cfg.max_new_frames,
       voice_clone_max_text_tokens: cfg.voice_clone_max_text_tokens,
       seed: cfg.seed,
+      enable_robust: cfg.enable_robust,
+      enable_wetext: cfg.enable_wetext,
       stream: playMode === 'stream'
     };
 
