@@ -34,15 +34,17 @@ func min(a, b int) int {
 }
 
 type ProgressEvent struct {
-	Phase      string  `json:"phase"`
-	Message    string  `json:"message"`
-	Percent    float64 `json:"percent"`
-	Error      string  `json:"error,omitempty"`
-	Done       bool    `json:"done"`
-	File       string  `json:"file,omitempty"`
-	BytesDone  int64   `json:"bytes_done,omitempty"`
-	BytesTotal int64   `json:"bytes_total,omitempty"`
-	SpeedMBps  float64 `json:"speed_mbps,omitempty"`
+	Phase             string  `json:"phase"`
+	Message           string  `json:"message"`
+	Percent           float64 `json:"percent"`
+	Error             string  `json:"error,omitempty"`
+	Done              bool    `json:"done"`
+	File              string  `json:"file,omitempty"`
+	BytesDone         int64   `json:"bytes_done,omitempty"`
+	BytesTotal        int64   `json:"bytes_total,omitempty"`
+	SpeedMBps         float64 `json:"speed_mbps,omitempty"`
+	ElapsedMs         int64   `json:"elapsed_ms,omitempty"`
+	EstimatedRemainMs int64   `json:"estimated_remain_ms,omitempty"`
 }
 
 type DemoEntry struct {
@@ -55,13 +57,13 @@ type DemoEntry struct {
 }
 
 type Server struct {
-	Cfg             *deps.Config
-	CpuThreads      int
-	ExecutionMode   string // "hybrid", "cpu", "gpu"
-	MaxNewFrames    int
-	Host            string
-	Port            int
-	AppRoot         string
+	Cfg           *deps.Config
+	CpuThreads    int
+	ExecutionMode string // "hybrid", "cpu", "gpu"
+	MaxNewFrames  int
+	Host          string
+	Port          int
+	AppRoot       string
 
 	mu              sync.RWMutex
 	RuntimeManager  *runtime.RuntimeManager
@@ -118,7 +120,16 @@ func (s *Server) emit(evt ProgressEvent) {
 		default:
 		}
 	}
-	log.Printf("[%s] %s (%.0f%%)", evt.Phase, evt.Message, evt.Percent)
+	msg := fmt.Sprintf("[%s] %s (%.0f%%)", evt.Phase, evt.Message, evt.Percent)
+	if evt.EstimatedRemainMs > 0 {
+		remainSec := evt.EstimatedRemainMs / 1000
+		if remainSec > 60 {
+			msg += fmt.Sprintf(" 预计需要: %dm%ds", remainSec/60, remainSec%60)
+		} else {
+			msg += fmt.Sprintf(" 预计需要: %ds", remainSec)
+		}
+	}
+	log.Print(msg)
 }
 
 func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
@@ -216,6 +227,25 @@ func (s *Server) Start() error {
 	return http.ListenAndServe(addr, mux)
 }
 
+// Close 释放服务器资源，包括 TTS 运行时和文本归一化引擎。
+// 应在服务停止时调用，以避免资源泄漏。
+func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 关闭 TTS 运行时
+	if s.Runtime != nil {
+		s.Runtime.Close()
+		s.Runtime = nil
+	}
+
+	// 关闭文本归一化引擎
+	normalizer.Close()
+
+	s.Ready = false
+	log.Printf("[Server] 资源已释放")
+}
+
 func (s *Server) backgroundInit() {
 	s.emit(ProgressEvent{Phase: "check", Message: "正在检测运行环境...", Percent: 5})
 
@@ -278,8 +308,16 @@ func (s *Server) backgroundInit() {
 	s.emit(ProgressEvent{Phase: "load", Message: "正在准备文本归一化引擎...", Percent: 96})
 	normalizer.EnsureInitializedSync(func(msg string, pct float64) {
 		s.emit(ProgressEvent{Phase: "load", Message: msg, Percent: pct})
+	}, func(msg string, pct float64, current, total int, elapsed time.Duration, estimatedRemaining time.Duration) {
+		s.emit(ProgressEvent{
+			Phase:             "load",
+			Message:           msg,
+			Percent:           pct,
+			ElapsedMs:         elapsed.Milliseconds(),
+			EstimatedRemainMs: estimatedRemaining.Milliseconds(),
+		})
 	})
-	s.emit(ProgressEvent{Phase: "load", Message: "文本归一化引擎就绪", Percent: 99})
+	s.emit(ProgressEvent{Phase: "load", Message: "文本归一化引擎就绪", Percent: 98})
 
 	s.mu.Lock()
 	s.Ready = true
@@ -370,25 +408,25 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	// 构建响应
 	response := map[string]interface{}{
 		"cpu": map[string]interface{}{
-			"num_cores":     deviceInfo.CPUInfo.NumCores,
-			"num_threads":   deviceInfo.CPUInfo.NumThreads,
+			"num_cores":       deviceInfo.CPUInfo.NumCores,
+			"num_threads":     deviceInfo.CPUInfo.NumThreads,
 			"available_cores": deviceInfo.CPUInfo.AvailableCores,
 		},
-		"has_gpu":       deviceInfo.HasGPU,
-		"has_cuda":      deviceInfo.HasCUDA,
-		"has_coreml":    deviceInfo.HasCoreML,
-		"execution_mode": executionMode,
+		"has_gpu":         deviceInfo.HasGPU,
+		"has_cuda":        deviceInfo.HasCUDA,
+		"has_coreml":      deviceInfo.HasCoreML,
+		"execution_mode":  executionMode,
 		"available_modes": device.GetAvailableModes(deviceInfo.HasGPU),
 	}
 
 	// 如果有GPU信息，添加到响应中
 	if deviceInfo.HasGPU {
 		response["gpu"] = map[string]interface{}{
-			"available":    deviceInfo.GPUInfo.Available,
-			"name":         deviceInfo.GPUInfo.Name,
-			"vendor":       deviceInfo.GPUInfo.Vendor,
-			"device_id":    deviceInfo.GPUInfo.DeviceID,
-			"memory_mb":    deviceInfo.GPUInfo.MemoryMB,
+			"available":     deviceInfo.GPUInfo.Available,
+			"name":          deviceInfo.GPUInfo.Name,
+			"vendor":        deviceInfo.GPUInfo.Vendor,
+			"device_id":     deviceInfo.GPUInfo.DeviceID,
+			"memory_mb":     deviceInfo.GPUInfo.MemoryMB,
 			"compute_units": deviceInfo.GPUInfo.ComputeUnits,
 		}
 	}
@@ -454,7 +492,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 	voiceCloneMaxTokens := req.VoiceCloneMaxTextTokens
 	if voiceCloneMaxTokens <= 0 {
-		voiceCloneMaxTokens = 300 // 默认值300，减少chunk数量，提高音频质量
+		voiceCloneMaxTokens = 75 // 与Python源码保持一致，保证长文本克隆质量
 	}
 
 	promptAudioPath := req.PromptAudioPath
@@ -511,6 +549,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	if req.EnableWeText != nil {
 		enableWeText = *req.EnableWeText
 	}
+	log.Printf("[API synthesize] enableRobust=%v enableWeText=%v", enableRobust, enableWeText)
 
 	if req.Stream {
 		s.handleStreamSynthesize(w, ctx, rt, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
@@ -896,7 +935,16 @@ es.onmessage=function(e){
   }else if(d.phase==='load'){
     ldPctVal=Math.max(ldPctVal,d.percent||0);
     ldBar.style.width=ldPctVal+'%';
-    ldPct.textContent=d.message;
+    let ldMsg=d.message;
+    if(d.estimated_remain_ms>0){
+      const remainSec=Math.ceil(d.estimated_remain_ms/1000);
+      if(remainSec>60){
+        ldMsg+=' 预计需要: '+Math.floor(remainSec/60)+'m'+(remainSec%60)+'s';
+      }else{
+        ldMsg+=' 预计需要: '+remainSec+'s';
+      }
+    }
+    ldPct.textContent=ldMsg;
   }else if(d.phase==='ready'){
     es.close();
     dlBar.style.width='100%';dlPct.textContent='100%';dlDetail.textContent='完成';
@@ -1024,7 +1072,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   <div class="row" style="margin-top:8px;">
     <div class="field">
       <label for="voice-clone-max-text-tokens">最大文本Token数</label>
-      <input id="voice-clone-max-text-tokens" type="number" value="300" min="1">
+      <input id="voice-clone-max-text-tokens" type="number" value="75" min="1">
       <div class="meta">克隆音色时的最大文本Token数</div>
     </div>
     <div class="field">

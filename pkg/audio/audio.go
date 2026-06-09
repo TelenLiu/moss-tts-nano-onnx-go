@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"os/exec"
@@ -265,6 +266,9 @@ func MakeSilence(durationSamples, channels int) []float32 {
 	return make([]float32, durationSamples*channels)
 }
 
+// MaxReferenceAudioDurationSec 参考音频最大时长（秒），超过此时长将被截断以避免 OOM
+const MaxReferenceAudioDurationSec = 15
+
 func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {
 	waveform, channels, sampleRate, err := ReadWAV(path)
 	if err != nil {
@@ -274,6 +278,14 @@ func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]fl
 	if sampleRate != targetSampleRate {
 		waveform = Resample(waveform, sampleRate, targetSampleRate, channels)
 		sampleRate = targetSampleRate
+	}
+
+	// 截断过长的参考音频，避免编码后帧数过多导致 OOM
+	maxSamples := MaxReferenceAudioDurationSec * sampleRate * channels
+	if len(waveform) > maxSamples {
+		log.Printf("[LoadReferenceAudio] 参考音频过长(%d样本, 约%.1f秒)，截断至%d秒",
+			len(waveform), float64(len(waveform))/float64(sampleRate*channels), float64(MaxReferenceAudioDurationSec))
+		waveform = waveform[:maxSamples]
 	}
 
 	if channels == targetChannels {

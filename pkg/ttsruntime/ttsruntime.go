@@ -22,8 +22,8 @@ import (
 )
 
 const (
-	DefaultInterChunkPauseShortSec = 0.15
-	DefaultInterChunkPauseLongSec  = 0.10
+	DefaultInterChunkPauseShortSec = 0.40
+	DefaultInterChunkPauseLongSec  = 0.24
 )
 
 var SentenceEndPunctuation = map[rune]bool{'.': true, '!': true, '?': true, '。': true, '！': true, '？': true, '；': true, ';': true}
@@ -261,6 +261,8 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodes(voice string, promptAudioPath s
 func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, promptAudioPath string, preloadId string, preloadAudioPath string) [][]int {
 	log.Printf("[ResolvePromptAudioCodes] voice=%q promptAudioPath=%q preloadId=%q preloadAudioPath=%q", voice, promptAudioPath, preloadId, preloadAudioPath)
 
+	var result [][]int
+
 	// 优先使用preloadId
 	if preloadId != "" && t.PreloadCache != nil {
 		log.Printf("[ResolvePromptAudioCodes] 尝试使用preload缓存: %s", preloadId)
@@ -276,19 +278,19 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 					data, err = t.PreloadCache.Get(preloadId)
 					if err == nil {
 						log.Printf("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
-						return data.AudioCodes
+						result = data.AudioCodes
 					}
 				}
 			}
 		} else {
 			log.Printf("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
-			return data.AudioCodes
+			result = data.AudioCodes
 		}
 	} else if preloadId != "" && t.PreloadCache == nil {
 		log.Printf("[ResolvePromptAudioCodes] 警告: PreloadCache未初始化，无法使用preloadId")
 	}
 
-	if promptAudioPath != "" {
+	if result == nil && promptAudioPath != "" {
 		log.Printf("[ResolvePromptAudioCodes] 使用上传的参考音频: %s", promptAudioPath)
 		codes := t.EncodeReferenceAudio(promptAudioPath)
 		if codes != nil {
@@ -297,74 +299,91 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 			log.Printf("[ResolvePromptAudioCodes] 参考音频编码失败，将回退到内置音色")
 		}
 		if codes != nil {
-			return codes
+			result = codes
 		}
 	}
-	resolvedVoice := voice
-	if resolvedVoice == "" {
-		voices := t.OrtRuntime.ListBuiltinVoices()
-		if len(voices) > 0 {
-			resolvedVoice = fmt.Sprintf("%v", voices[0]["voice"])
-		}
-	}
-	log.Printf("[ResolvePromptAudioCodes] 使用内置音色: %s", resolvedVoice)
-	for _, v := range t.OrtRuntime.ListBuiltinVoices() {
-		if fmt.Sprintf("%v", v["voice"]) == resolvedVoice {
-			codes, ok := v["prompt_audio_codes"].([]interface{})
-			if !ok {
-				log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的prompt_audio_codes格式不正确，跳过", resolvedVoice)
-				continue
+
+	if result == nil {
+		resolvedVoice := voice
+		if resolvedVoice == "" {
+			voices := t.OrtRuntime.ListBuiltinVoices()
+			if len(voices) > 0 {
+				resolvedVoice = fmt.Sprintf("%v", voices[0]["voice"])
 			}
-			result := make([][]int, len(codes))
-			allOk := true
-			for i, codeRow := range codes {
-				row, ok := codeRow.([]interface{})
+		}
+		log.Printf("[ResolvePromptAudioCodes] 使用内置音色: %s", resolvedVoice)
+		for _, v := range t.OrtRuntime.ListBuiltinVoices() {
+			if fmt.Sprintf("%v", v["voice"]) == resolvedVoice {
+				codes, ok := v["prompt_audio_codes"].([]interface{})
 				if !ok {
-					log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的第%d行格式不正确", resolvedVoice, i)
-					allOk = false
+					log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的prompt_audio_codes格式不正确，跳过", resolvedVoice)
+					continue
+				}
+				parsed := make([][]int, len(codes))
+				allOk := true
+				for i, codeRow := range codes {
+					row, ok := codeRow.([]interface{})
+					if !ok {
+						log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的第%d行格式不正确", resolvedVoice, i)
+						allOk = false
+						break
+					}
+					parsed[i] = make([]int, len(row))
+					for j, val := range row {
+						parsed[i][j] = int(ortruntime.ToFloat64(val))
+					}
+				}
+				if allOk {
+					log.Printf("[ResolvePromptAudioCodes] 内置音色 %s 加载成功: %d 帧", resolvedVoice, len(parsed))
+					result = parsed
 					break
 				}
-				result[i] = make([]int, len(row))
-				for j, val := range row {
-					result[i][j] = int(ortruntime.ToFloat64(val))
-				}
+				log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 加载失败，继续查找", resolvedVoice)
 			}
-			if allOk {
-				log.Printf("[ResolvePromptAudioCodes] 内置音色 %s 加载成功: %d 帧", resolvedVoice, len(result))
-				return result
-			}
-			log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 加载失败，继续查找", resolvedVoice)
 		}
-	}
-	log.Printf("[ResolvePromptAudioCodes] 警告: 未找到内置音色 %s，使用第一个内置音色作为默认", resolvedVoice)
-	voices := t.OrtRuntime.ListBuiltinVoices()
-	if len(voices) > 0 {
-		for _, v := range voices {
-			codes, ok := v["prompt_audio_codes"].([]interface{})
-			if !ok {
-				continue
-			}
-			result := make([][]int, len(codes))
-			allOk := true
-			for i, codeRow := range codes {
-				row, ok := codeRow.([]interface{})
-				if !ok {
-					allOk = false
-					break
+		if result == nil {
+			log.Printf("[ResolvePromptAudioCodes] 警告: 未找到内置音色 %s，使用第一个内置音色作为默认", resolvedVoice)
+			voices := t.OrtRuntime.ListBuiltinVoices()
+			if len(voices) > 0 {
+				for _, v := range voices {
+					codes, ok := v["prompt_audio_codes"].([]interface{})
+					if !ok {
+						continue
+					}
+					parsed := make([][]int, len(codes))
+					allOk := true
+					for i, codeRow := range codes {
+						row, ok := codeRow.([]interface{})
+						if !ok {
+							allOk = false
+							break
+						}
+						parsed[i] = make([]int, len(row))
+						for j, val := range row {
+							parsed[i][j] = int(ortruntime.ToFloat64(val))
+						}
+					}
+					if allOk {
+						log.Printf("[ResolvePromptAudioCodes] 使用第一个可用音色: %s (%d 帧)", fmt.Sprintf("%v", v["voice"]), len(parsed))
+						result = parsed
+						break
+					}
 				}
-				result[i] = make([]int, len(row))
-				for j, val := range row {
-					result[i][j] = int(ortruntime.ToFloat64(val))
-				}
-			}
-			if allOk {
-				log.Printf("[ResolvePromptAudioCodes] 使用第一个可用音色: %s (%d 帧)", fmt.Sprintf("%v", v["voice"]), len(result))
-				return result
 			}
 		}
 	}
-	log.Printf("[ResolvePromptAudioCodes] 错误: 没有可用的内置音色，返回空")
-	return nil
+
+	// 统一截断保护：限制 audio codes 帧数，避免 prefill 输入序列过长导致 OOM
+	const maxPromptAudioFrames = 300
+	if len(result) > maxPromptAudioFrames {
+		log.Printf("[ResolvePromptAudioCodes] 音频编码帧数过多(%d帧)，截断至%d帧", len(result), maxPromptAudioFrames)
+		result = result[:maxPromptAudioFrames]
+	}
+
+	if result == nil {
+		log.Printf("[ResolvePromptAudioCodes] 错误: 没有可用的内置音色，返回空")
+	}
+	return result
 }
 
 func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
@@ -428,6 +447,14 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	if len(audioCodesShape) >= 3 {
 		codeLength = minInt(codeLength, int(audioCodesShape[1]))
 	}
+
+	// 截断过长的音频编码帧，避免 prefill 输入序列过长导致 OOM
+	maxPromptAudioFrames := 300 // 约 24 秒（帧率 12.5/秒）
+	if codeLength > maxPromptAudioFrames {
+		log.Printf("[EncodeReferenceAudio] 音频编码帧数过多(%d帧)，截断至%d帧", codeLength, maxPromptAudioFrames)
+		codeLength = maxPromptAudioFrames
+	}
+
 	log.Printf("[EncodeReferenceAudio] 解析codeLength=%d", codeLength)
 
 	promptAudioCodes := make([][]int, codeLength)

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
@@ -189,6 +191,17 @@ func runServe(args []string) {
 	}
 	appRoot := fmt.Sprintf("http://%s:%d", displayHost, *port)
 	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, *executionMode, *host, *port, appRoot)
+
+	// 设置优雅退出：捕获中断信号并释放资源
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+		log.Println("\n收到退出信号，正在清理资源...")
+		srv.Close()
+		os.Exit(0)
+	}()
+
 	if err := srv.Start(); err != nil {
 		log.Fatalf("Web 服务启动失败: %v", err)
 	}

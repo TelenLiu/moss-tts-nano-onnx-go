@@ -12,6 +12,7 @@ import (
 
 	chinese "github.com/TelenLiu/WeTextProcessing-go/tn/chinese"
 	english "github.com/TelenLiu/WeTextProcessing-go/tn/english"
+	tn "github.com/TelenLiu/WeTextProcessing-go/tn"
 )
 
 var (
@@ -32,58 +33,127 @@ var (
 	enCacheDir = filepath.Join("lib", "cache", "wetext_en")
 )
 
-func initZh(progress ...func(stage string, current, total int)) {
-	var pf func(stage string, current, total int)
-	if len(progress) > 0 {
-		pf = progress[0]
+type ProgressFunc func(msg string, percent float64)
+
+type ProgressExFunc func(msg string, percent float64, current, total int, elapsed time.Duration, estimatedRemaining time.Duration)
+
+func initZh(progressEx ProgressExFunc, progress ...func(stage string, current, total int)) {
+	// Build extended progress callback for NewNormalizerEx
+	var exFn tn.BuildProgressExFn
+	if progressEx != nil {
+		exFn = func(stage string, current, total int, elapsed time.Duration, estimatedRemaining time.Duration) {
+			progressEx(fmt.Sprintf("中文: %s (%d/%d)", stage, current, total), 0, current, total, elapsed, estimatedRemaining)
+		}
 	}
-	zhNormalizer = chinese.NewNormalizer(
+	// Use NewNormalizerEx with exFn for time estimates.
+	// Don't pass basic progress fn to avoid duplicate progress reporting via ReportProgress
+	// (which calls both buildProgress and buildProgressEx).
+	zhNormalizer = chinese.NewNormalizerEx(
 		zhCacheDir,
 		false,
 		false, false, false, false, false, false,
-		pf,
+		exFn,
 	)
 	zhReady = true
 }
 
-func initEn(progress ...func(stage string, current, total int)) {
+func initEn(progressEx ProgressExFunc, progress ...func(stage string, current, total int)) {
 	var pf func(stage string, current, total int)
 	if len(progress) > 0 {
 		pf = progress[0]
 	}
-	enNormalizer = english.NewNormalizer(
+	var exFn tn.BuildProgressExFn
+	if progressEx != nil {
+		exFn = func(stage string, current, total int, elapsed time.Duration, estimatedRemaining time.Duration) {
+			progressEx(fmt.Sprintf("英文: %s (%d/%d)", stage, current, total), 0, current, total, elapsed, estimatedRemaining)
+		}
+	}
+	enNormalizer = english.NewNormalizerEx(
 		enCacheDir,
 		false,
+		exFn,
 		pf,
 	)
 	enReady = true
 }
 
-type ProgressFunc func(msg string, percent float64)
-
 func EnsureInitialized() {
-	go zhOnce.Do(func() { initZh() })
-	go enOnce.Do(func() { initEn() })
+	go zhOnce.Do(func() { initZh(nil) })
+	go enOnce.Do(func() { initEn(nil) })
 }
 
-func EnsureInitializedSync(progress ProgressFunc) {
+func EnsureInitializedSync(progress ProgressFunc, progressEx ...ProgressExFunc) {
+	var pex ProgressExFunc
+	if len(progressEx) > 0 {
+		pex = progressEx[0]
+	}
 	if progress != nil {
 		progress("正在初始化文本归一化引擎...", 8)
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	zhStart, zhEnd := 50.0, 74.0
-	enStart, enEnd := 75.0, 99.0
+	enStart, enEnd := 75.0, 97.0
+
+	// Chinese normalizer has two phases:
+	//   Phase 1: "构建Tagger-xxx" or "加载缓存-xxx" (11 steps)
+	//   Phase 2: "优化-xxx" (10 steps)
+	// Total: 21 steps, phase1 = 11/21, phase2 = 10/21
+	// Note: "构建基座FST" and "完成" are sub-steps within phase 1, ignored for pct calculation
+	zhProgressEx := func(msg string, pct float64, current, total int, elapsed time.Duration, estimatedRemaining time.Duration) {
+		var step, totalSteps float64
+		if strings.HasPrefix(msg, "中文: 构建Tagger-") || strings.HasPrefix(msg, "中文: 加载缓存-") {
+			// Phase 1: steps 1..11
+			step = float64(current)
+			totalSteps = 21.0
+		} else if strings.HasPrefix(msg, "中文: 优化-") {
+			// Phase 2: steps 12..21
+			step = 11.0 + float64(current)
+			totalSteps = 21.0
+		} else {
+			// Sub-steps like "构建基座FST", "完成" - map to first portion of phase 1
+			step = float64(current) * 11.0 / float64(total) * 0.5 // use half of phase 1
+			totalSteps = 21.0
+		}
+		calculatedPct := zhStart + (step/totalSteps)*(zhEnd-zhStart)
+		if pex != nil {
+			pex(msg, calculatedPct, current, total, elapsed, estimatedRemaining)
+		} else if progress != nil {
+			progress(msg, calculatedPct)
+		}
+	}
+
+	// English normalizer has two phases:
+	//   Phase 1: "构建Tagger-xxx" or "加载缓存-xxx" (14 steps)
+	//   Phase 2: "优化-xxx" (14 steps)
+	// Total: 28 steps, phase1 = 14/28, phase2 = 14/28
+	enProgressEx := func(msg string, pct float64, current, total int, elapsed time.Duration, estimatedRemaining time.Duration) {
+		var step, totalSteps float64
+		if strings.HasPrefix(msg, "英文: 构建Tagger-") || strings.HasPrefix(msg, "英文: 加载缓存-") {
+			step = float64(current)
+			totalSteps = 28.0
+		} else if strings.HasPrefix(msg, "英文: 优化-") {
+			step = 14.0 + float64(current)
+			totalSteps = 28.0
+		} else {
+			step = float64(current) * 14.0 / float64(total) * 0.5
+			totalSteps = 28.0
+		}
+		calculatedPct := enStart + (step/totalSteps)*(enEnd-enStart)
+		if pex != nil {
+			pex(msg, calculatedPct, current, total, elapsed, estimatedRemaining)
+		} else if progress != nil {
+			progress(msg, calculatedPct)
+		}
+	}
+
 	go func() {
 		defer wg.Done()
 		zhOnce.Do(func() {
-			initZh(func(stage string, current, total int) {
-				if progress != nil {
-					pct := zhStart + float64(current)/float64(total)*(zhEnd-zhStart)
-					progress(fmt.Sprintf("中文: %s (%d/%d)", stage, current, total), pct)
-				}
-			})
-			if progress != nil {
+			initZh(zhProgressEx)
+			if pex != nil {
+				pex("中文文本归一化引擎就绪", zhEnd, 0, 0, 0, 0)
+			} else if progress != nil {
 				progress("中文文本归一化引擎就绪", zhEnd)
 			}
 		})
@@ -91,13 +161,10 @@ func EnsureInitializedSync(progress ProgressFunc) {
 	go func() {
 		defer wg.Done()
 		enOnce.Do(func() {
-			initEn(func(stage string, current, total int) {
-				if progress != nil {
-					pct := enStart + float64(current)/float64(total)*(enEnd-enStart)
-					progress(fmt.Sprintf("英文: %s (%d/%d)", stage, current, total), pct)
-				}
-			})
-			if progress != nil {
+			initEn(enProgressEx)
+			if pex != nil {
+				pex("英文文本归一化引擎就绪", enEnd, 0, 0, 0, 0)
+			} else if progress != nil {
 				progress("英文文本归一化引擎就绪", enEnd)
 			}
 		})
@@ -135,9 +202,25 @@ func verifyCacheFiles(cacheDir, prefix string) error {
 }
 
 func BuildCache() error {
+	// 先检查缓存是否已存在，如果存在则跳过构建直接加载
+	zhCacheOK := verifyCacheFiles(zhCacheDir, "zh_tn") == nil
+	enCacheOK := verifyCacheFiles(enCacheDir, "en_tn") == nil
+
+	if zhCacheOK && enCacheOK {
+		log.Printf("[normalizer] FST 缓存文件已存在，跳过构建直接加载")
+		// 用 rebuild=false 初始化，从磁盘加载缓存
+		initZh(nil)
+		initEn(nil)
+		return nil
+	}
+
 	log.Printf("[normalizer] 开始构建 FST 缓存 (中文TN + 英文TN)")
 
-	buildLang := func(name, cacheDir, prefix string, fn func(func(string, int, int))) error {
+	buildLang := func(name, cacheDir, prefix string, cacheExists bool, fn func(func(string, int, int))) error {
+		if cacheExists {
+			log.Printf("[normalizer] %s: 缓存已存在，跳过构建", name)
+			return nil
+		}
 		log.Printf("[normalizer] %s: 开始构建", name)
 		t0 := time.Now()
 		fn(func(stage string, current, total int) {
@@ -152,7 +235,7 @@ func BuildCache() error {
 		return nil
 	}
 
-	if err := buildLang("中文TN", zhCacheDir, "zh_tn", func(p func(string, int, int)) {
+	if err := buildLang("中文TN", zhCacheDir, "zh_tn", zhCacheOK, func(p func(string, int, int)) {
 		zhNormalizer = chinese.NewNormalizer(
 			zhCacheDir, true,
 			false, false, false, false, false, false,
@@ -163,7 +246,7 @@ func BuildCache() error {
 		return fmt.Errorf("中文TN归一化缓存构建失败: %v", err)
 	}
 
-	if err := buildLang("英文TN", enCacheDir, "en_tn", func(p func(string, int, int)) {
+	if err := buildLang("英文TN", enCacheDir, "en_tn", enCacheOK, func(p func(string, int, int)) {
 		enNormalizer = english.NewNormalizer(
 			enCacheDir, true,
 			p,
@@ -244,7 +327,7 @@ func NormalizeTTSText(text string) string {
 	if text == "" {
 		return text
 	}
-	zhOnce.Do(func() { initZh() })
+	zhOnce.Do(func() { initZh(nil) })
 	normalized := zhNormalizer.Normalize(text)
 	normalized = strings.TrimSpace(normalized)
 	return normalized
@@ -257,10 +340,10 @@ func NormalizeWithWeText(text string, language string) string {
 	var result string
 	switch language {
 	case "en":
-		enOnce.Do(func() { initEn() })
+		enOnce.Do(func() { initEn(nil) })
 		result = enNormalizer.Normalize(text)
 	default:
-		zhOnce.Do(func() { initZh() })
+		zhOnce.Do(func() { initZh(nil) })
 		result = zhNormalizer.Normalize(text)
 	}
 	return strings.TrimSpace(result)
@@ -285,4 +368,19 @@ func PrepareTTSText(text string, enableRobust bool, enableWeText bool) string {
 		current = NormalizeRobust(current)
 	}
 	return current
+}
+
+// Close 释放文本归一化引擎的资源，包括停止后台缓存清理 goroutine。
+// 调用 Close 后不应再使用归一化功能。多次调用 Close 是安全的。
+func Close() {
+	if zhNormalizer != nil {
+		zhNormalizer.Close()
+		zhNormalizer = nil
+		zhReady = false
+	}
+	if enNormalizer != nil {
+		enNormalizer.Close()
+		enNormalizer = nil
+		enReady = false
+	}
 }
