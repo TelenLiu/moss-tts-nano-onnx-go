@@ -422,7 +422,7 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	outputs := make([]ort.Value, 2)
 
 	log.Printf("[EncodeReferenceAudio] 调用 codec_encode...")
-	err = t.OrtRuntime.Onnx.CodecEncode.Session.Run(inputs, outputs)
+	err = t.OrtRuntime.RunSession(t.OrtRuntime.Onnx.CodecEncode.Session, inputs, outputs)
 	waveformTensor.Destroy()
 	inputLengthsTensor.Destroy()
 
@@ -487,6 +487,9 @@ func (t *OnnxTtsRuntime) SynthesizeEx(text string, voice string, promptAudioPath
 
 func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
 	startTime := time.Now()
+
+	t.OrtRuntime.AcquireSession()
+	defer t.OrtRuntime.ReleaseSession()
 
 	t.OrtRuntime.CheckAndReleaseIdleSessions()
 
@@ -597,6 +600,9 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 
 func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableNormalize bool, seed *int) (*SynthesisResult, error) {
 	startTime := time.Now()
+
+	t.OrtRuntime.AcquireSession()
+	defer t.OrtRuntime.ReleaseSession()
 
 	// 检查并释放空闲超时的 Session
 	t.OrtRuntime.CheckAndReleaseIdleSessions()
@@ -718,6 +724,9 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 	go func() {
 		defer close(chunkChan)
 
+		t.OrtRuntime.AcquireSession()
+		defer t.OrtRuntime.ReleaseSession()
+
 		if seed != nil {
 			t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
 		}
@@ -733,7 +742,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 		sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 		channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
 
-		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session)
+		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
 		if streamingSession == nil {
 			log.Printf("[SynthesizeStream] 错误: 无法创建流式解码会话")
 			return

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/sampler"
@@ -48,15 +49,17 @@ type OnnxSessions struct {
 type CodecStreamingDecodeSession struct {
 	CodecMeta        map[string]interface{}
 	Session          *ort.DynamicAdvancedSession
+	Runtime          *OrtCpuRuntime // 用于并发安全的 Session.Run 调用
 	TransformerSpecs []map[string]interface{}
 	AttentionSpecs   []map[string]interface{}
 	StateFeeds       map[string]ort.Value
 }
 
-func NewCodecStreamingDecodeSession(codecMeta map[string]interface{}, session *ort.DynamicAdvancedSession) *CodecStreamingDecodeSession {
+func NewCodecStreamingDecodeSession(codecMeta map[string]interface{}, session *ort.DynamicAdvancedSession, runtime *OrtCpuRuntime) *CodecStreamingDecodeSession {
 	s := &CodecStreamingDecodeSession{
 		CodecMeta:  codecMeta,
 		Session:    session,
+		Runtime:    runtime,
 		StateFeeds: make(map[string]ort.Value),
 	}
 	if streamingDecode, ok := codecMeta["streaming_decode"].(map[string]interface{}); ok {
@@ -158,7 +161,7 @@ func (s *CodecStreamingDecodeSession) RunFrames(frameRows [][]int) ([][]float32,
 	}
 
 	outputs := make([]ort.Value, len(inputNames))
-	err := s.Session.Run(inputs, outputs)
+	err := s.Runtime.RunSession(s.Session, inputs, outputs)
 
 	audioCodesTensor.Destroy()
 	audioCodeLengthsTensor.Destroy()
@@ -285,6 +288,28 @@ type OrtCpuRuntime struct {
 	Onnx               *OnnxSessions
 	SessionIdleTimeout time.Duration // Session 空闲超时（默认 10 秒）
 	SessionMutex       sync.Mutex    // 保护 sessions 的并发访问
+	SessionRunMutex    sync.Mutex    // 保护所有 Session.Run 调用（ONNX Session 非线程安全）
+	ActiveRequests     atomic.Int64  // 当前活跃请求数，用于防止在请求期间销毁 session
+}
+
+// AcquireSession 标记有活跃请求正在使用 session，防止 session 被销毁。
+// 每个合成请求开始时调用，结束时调用 ReleaseSession。
+func (rt *OrtCpuRuntime) AcquireSession() {
+	rt.ActiveRequests.Add(1)
+}
+
+// ReleaseSession 标记活跃请求结束，允许 session 被销毁。
+func (rt *OrtCpuRuntime) ReleaseSession() {
+	rt.ActiveRequests.Add(-1)
+}
+
+// RunSession 安全地执行 ONNX Session.Run，通过互斥锁保证并发安全。
+// ONNX Runtime 的 Session 不是线程安全的，多个 goroutine 同时调用同一个 Session.Run 会导致 SIGSEGV。
+func (rt *OrtCpuRuntime) RunSession(session *ort.DynamicAdvancedSession, inputs []ort.Value, outputs []ort.Value) error {
+	rt.SessionRunMutex.Lock()
+	err := session.Run(inputs, outputs)
+	rt.SessionRunMutex.Unlock()
+	return err
 }
 
 func NewOrtCpuRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OrtCpuRuntime, error) {
@@ -730,7 +755,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 	prefillOutputs := make([]ort.Value, len(prefillOutputNames))
 
 	log.Printf("  运行 prefill (输入长度=%d)...", len(requestRows["inputIds"]))
-	if err := rt.Onnx.Prefill.Session.Run(prefillInputs, prefillOutputs); err != nil {
+	if err := rt.RunSession(rt.Onnx.Prefill.Session, prefillInputs, prefillOutputs); err != nil {
 		log.Printf("  prefill 失败：%v", err)
 		inputIDsTensor.Destroy()
 		attentionMaskTensor.Destroy()
@@ -845,7 +870,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		}
 
 		decodeOutputs := make([]ort.Value, len(decodeOutputNames))
-		if err := rt.Onnx.Decode.Session.Run(decodeInputs, decodeOutputs); err != nil {
+		if err := rt.RunSession(rt.Onnx.Decode.Session, decodeInputs, decodeOutputs); err != nil {
 			log.Printf("  decode_step 失败：%v", err)
 			nextRowTensor.Destroy()
 			pvlTensor.Destroy()
@@ -961,7 +986,7 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 	inputs := []ort.Value{ghTensor, repMaskTensor, assRUTensor, audioRUTensor}
 	outputs := make([]ort.Value, 2)
 
-	err := rt.Onnx.LocalFixedSampledFrame.Session.Run(inputs, outputs)
+	err := rt.RunSession(rt.Onnx.LocalFixedSampledFrame.Session, inputs, outputs)
 	ghTensor.Destroy()
 	repMaskTensor.Destroy()
 	assRUTensor.Destroy()
@@ -1128,7 +1153,7 @@ func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, 
 	}
 
 	outputs := make([]ort.Value, len(outputNames))
-	err := rt.Onnx.LocalCachedStep.Session.Run(inputs, outputs)
+	err := rt.RunSession(rt.Onnx.LocalCachedStep.Session, inputs, outputs)
 
 	ghTensor.Destroy()
 	ttTensor.Destroy()
@@ -1224,7 +1249,7 @@ func (rt *OrtCpuRuntime) DecodeFullAudioWithContext(ctx context.Context, generat
 	inputs := []ort.Value{audioCodesTensor, audioCodeLengthsTensor}
 	outputs := make([]ort.Value, 2)
 
-	err := rt.Onnx.CodecDecode.Session.Run(inputs, outputs)
+	err := rt.RunSession(rt.Onnx.CodecDecode.Session, inputs, outputs)
 	audioCodesTensor.Destroy()
 	audioCodeLengthsTensor.Destroy()
 
@@ -1324,9 +1349,16 @@ func (rt *OrtCpuRuntime) Close() {
 }
 
 // CheckAndReleaseIdleSessions 检查并释放所有空闲超时的 Session（导出方法）
+// 当有活跃请求时跳过，避免销毁正在使用的 session
 func (rt *OrtCpuRuntime) CheckAndReleaseIdleSessions() {
 	if rt.SessionIdleTimeout <= 0 {
 		return // 禁用超时释放
+	}
+
+	// 有活跃请求时不执行重置，避免销毁正在使用的 session
+	if rt.ActiveRequests.Load() > 0 {
+		log.Printf("[ORT] 跳过空闲 Session 检查：当前有 %d 个活跃请求", rt.ActiveRequests.Load())
+		return
 	}
 
 	now := time.Now()
@@ -1377,7 +1409,14 @@ func (rt *OrtCpuRuntime) UpdateSessionTime(timed *TimedSession) {
 }
 
 // ResetSessions 销毁并重新创建所有 ONNX Session
+// 当有活跃请求时跳过，避免销毁正在使用的 session
 func (rt *OrtCpuRuntime) ResetSessions() error {
+	// 有活跃请求时不执行重置，避免销毁正在使用的 session
+	if rt.ActiveRequests.Load() > 0 {
+		log.Printf("[ORT] 跳过 Session 重置：当前有 %d 个活跃请求", rt.ActiveRequests.Load())
+		return nil
+	}
+
 	log.Printf("[ORT] 销毁旧 sessions...")
 
 	// 获取互斥锁以防止与正在运行的请求发生竞态条件
