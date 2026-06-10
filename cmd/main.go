@@ -19,6 +19,10 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/web"
 )
 
+var (
+	Version = "0"
+)
+
 func init() {
 	// 启动时尝试加载代理配置（conf/proxy.json）。
 	// 加载失败或不存在时不会影响对外 API/Web 服务的监听。
@@ -30,6 +34,9 @@ func init() {
 }
 
 func main() {
+	//版本输出
+	fmt.Println("构建版本：", Version)
+
 	if len(os.Args) < 2 {
 		runServe(os.Args[1:])
 		return

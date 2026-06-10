@@ -1,0 +1,20 @@
+FROM golang:1.24.6 AS builder
+
+WORKDIR /app
+ENV GOPROXY https://goproxy.cn
+COPY go.mod go.sum ./
+RUN go mod tidy
+COPY . .
+RUN CGO_ENABLED=1 GOOS=linux go build -o moss-tts-nano-onnx-go ./cmd/
+
+FROM telenliu/moss-tts-nano-onnx-go:v26.06.1013
+
+RUN mkdir -p /app/conf
+WORKDIR /app
+COPY --from=builder /app/moss-tts-nano-onnx-go .
+COPY Dockerfile .
+
+EXPOSE 18083
+
+ENTRYPOINT ["/app/moss-tts-nano-onnx-go"]
+CMD ["serve", "--host", "0.0.0.0", "--port", "18083"]
