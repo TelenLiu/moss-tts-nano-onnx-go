@@ -13,6 +13,7 @@ import (
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/proxy"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
@@ -168,6 +169,10 @@ func runInfer(args []string) {
 }
 
 func defaultCpuThreads() int {
+	// 优先从 onnx.json 读取 coreCPUs
+	if cfg, err := onnxconfig.Load(""); err == nil && cfg.CoreCPUs > 0 {
+		return cfg.CoreCPUs
+	}
 	n := runtime.NumCPU()
 	if n > 1 {
 		return n - 1

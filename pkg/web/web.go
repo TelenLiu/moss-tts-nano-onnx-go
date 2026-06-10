@@ -21,6 +21,7 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/device"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/runtime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
@@ -64,10 +65,12 @@ type Server struct {
 	Host          string
 	Port          int
 	AppRoot       string
+	OnnxConfig    *onnxconfig.Config
 
 	mu              sync.RWMutex
 	RuntimeManager  *runtime.RuntimeManager
 	Runtime         *ttsruntime.OnnxTtsRuntime
+	Pool            *ttsruntime.Pool
 	DeviceInfo      *device.DeviceInfo
 	Ready           bool
 	Progress        []ProgressEvent
@@ -82,6 +85,14 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, ho
 	assetsDir := filepath.Join(cwd, "assets")
 	demoPath := filepath.Join(assetsDir, "demo.jsonl")
 
+	// 加载 onnx 配置
+	onnxCfg, err := onnxconfig.Load("")
+	if err != nil {
+		log.Printf("[Server] 加载 onnx 配置失败，使用默认值: %v", err)
+		onnxCfg = onnxconfig.DefaultConfig()
+	}
+	log.Printf("[Server] ONNX 配置: workCores=%d coreCPUs=%d", onnxCfg.WorkCores, onnxCfg.CoreCPUs)
+
 	s := &Server{
 		Cfg:             cfg,
 		CpuThreads:      cpuThreads,
@@ -90,6 +101,7 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, ho
 		Host:            host,
 		Port:            port,
 		AppRoot:         appRoot,
+		OnnxConfig:      onnxCfg,
 		subscribers:     make(map[chan ProgressEvent]struct{}),
 		DemoEntriesByID: make(map[string]*DemoEntry),
 		AssetsDir:       assetsDir,
@@ -233,6 +245,12 @@ func (s *Server) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 关闭推理单元池
+	if s.Pool != nil {
+		s.Pool.Close()
+		s.Pool = nil
+	}
+
 	// 关闭 TTS 运行时
 	if s.Runtime != nil {
 		s.Runtime.Close()
@@ -290,19 +308,27 @@ func (s *Server) backgroundInit() {
 
 	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("设备检测完成: CPU %d核, GPU %v", deviceInfo.CPUInfo.NumCores, deviceInfo.HasGPU), Percent: 74})
 
-	s.emit(ProgressEvent{Phase: "load", Message: "正在加载 TTS 模型...", Percent: 75})
-	rt, err := ttsruntime.NewOnnxTtsRuntime(
-		s.Cfg.ModelDir, s.CpuThreads,
+	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("正在加载 TTS 模型 (workCores=%d coreCPUs=%d)...", s.OnnxConfig.WorkCores, s.OnnxConfig.CoreCPUs), Percent: 75})
+	pool, err := ttsruntime.NewPoolFromConfig(
+		s.Cfg.ModelDir, s.OnnxConfig,
 		&s.MaxNewFrames, nil, nil, s.ExecutionMode,
 	)
 	if err != nil {
 		s.emit(ProgressEvent{Phase: "error", Message: fmt.Sprintf("TTS 运行时初始化失败: %v", err), Error: fmt.Sprintf("TTS 运行时初始化失败: %v", err)})
 		return
 	}
-	s.emit(ProgressEvent{Phase: "load", Message: "TTS 模型加载完成", Percent: 95})
+	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("TTS 模型加载完成 (%d 个推理单元)", pool.WorkCoreCount()), Percent: 95})
 
 	s.mu.Lock()
-	s.Runtime = rt
+	s.Pool = pool
+	// 兼容：如果只有一个推理单元，也设置 Runtime 字段
+	if pool.WorkCoreCount() == 1 {
+		core := pool.Acquire()
+		if core != nil {
+			s.Runtime = core.Runtime
+			pool.Release(core)
+		}
+	}
 	s.mu.Unlock()
 
 	s.emit(ProgressEvent{Phase: "load", Message: "正在准备文本归一化引擎...", Percent: 96})
@@ -443,17 +469,29 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 		response["ep_devices"] = epDevices
 	}
 
+	// 添加推理单元池信息
+	s.mu.RLock()
+	pool := s.Pool
+	s.mu.RUnlock()
+	if pool != nil {
+		response["onnx_pool"] = map[string]interface{}{
+			"work_cores": pool.WorkCoreCount(),
+			"cores":      pool.Status(),
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
+	pool := s.Pool
 	rt := s.Runtime
 	ready := s.Ready
 	s.mu.RUnlock()
 
-	if !ready || rt == nil {
+	if !ready || (pool == nil && rt == nil) {
 		http.Error(w, "系统尚未就绪，请等待加载完成", http.StatusServiceUnavailable)
 		return
 	}
@@ -552,17 +590,29 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API synthesize] enableRobust=%v enableWeText=%v", enableRobust, enableWeText)
 
 	if req.Stream {
-		s.handleStreamSynthesize(w, ctx, rt, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
+		s.handleStreamSynthesize(w, ctx, pool, rt, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
 		return
 	}
 
-	result, err := rt.SynthesizeWithContextEx(ctx,
-		req.Text, voice, promptAudioPath, "",
-		preloadId, preloadAudioPath,
-		sampleMode, doSample, false,
-		maxNewFrames, voiceCloneMaxTokens,
-		enableRobust, enableWeText, req.Seed,
-	)
+	var result *ttsruntime.SynthesisResult
+	var err error
+	if pool != nil {
+		result, err = pool.SynthesizeWithContextEx(ctx,
+			req.Text, voice, promptAudioPath, "",
+			preloadId, preloadAudioPath,
+			sampleMode, doSample, false,
+			maxNewFrames, voiceCloneMaxTokens,
+			enableRobust, enableWeText, req.Seed,
+		)
+	} else {
+		result, err = rt.SynthesizeWithContextEx(ctx,
+			req.Text, voice, promptAudioPath, "",
+			preloadId, preloadAudioPath,
+			sampleMode, doSample, false,
+			maxNewFrames, voiceCloneMaxTokens,
+			enableRobust, enableWeText, req.Seed,
+		)
+	}
 	if err != nil {
 		log.Printf("[API synthesize] 合成失败: %v", err)
 		http.Error(w, fmt.Sprintf("Synthesis failed: %v", err), http.StatusInternalServerError)
@@ -587,20 +637,32 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
+func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, pool *ttsruntime.Pool, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	chunkChan, err := rt.SynthesizeStreamEx(ctx,
-		req.Text, voice, promptAudioPath,
-		preloadId, preloadAudioPath,
-		sampleMode, doSample,
-		maxNewFrames, voiceCloneMaxTokens,
-		enableRobust, enableWeText, req.Seed,
-	)
+	var chunkChan <-chan ttsruntime.StreamChunk
+	var err error
+	if pool != nil {
+		chunkChan, err = pool.SynthesizeStreamEx(ctx,
+			req.Text, voice, promptAudioPath,
+			preloadId, preloadAudioPath,
+			sampleMode, doSample,
+			maxNewFrames, voiceCloneMaxTokens,
+			enableRobust, enableWeText, req.Seed,
+		)
+	} else {
+		chunkChan, err = rt.SynthesizeStreamEx(ctx,
+			req.Text, voice, promptAudioPath,
+			preloadId, preloadAudioPath,
+			sampleMode, doSample,
+			maxNewFrames, voiceCloneMaxTokens,
+			enableRobust, enableWeText, req.Seed,
+		)
+	}
 	if err != nil {
 		log.Printf("[API synthesize stream] 流式合成启动失败: %v", err)
 		return
@@ -658,17 +720,23 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 
 func (s *Server) handleVoices(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
+	pool := s.Pool
 	rt := s.Runtime
 	ready := s.Ready
 	s.mu.RUnlock()
 
-	if !ready || rt == nil {
+	if !ready || (pool == nil && rt == nil) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode([]map[string]string{})
 		return
 	}
 
-	voices := rt.OrtRuntime.ListBuiltinVoices()
+	var voices []map[string]interface{}
+	if pool != nil {
+		voices = pool.ListBuiltinVoices()
+	} else {
+		voices = rt.OrtRuntime.ListBuiltinVoices()
+	}
 	type voiceInfo struct {
 		Voice string `json:"voice"`
 		Label string `json:"label"`
