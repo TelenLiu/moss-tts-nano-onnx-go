@@ -512,6 +512,8 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		log.Printf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
 		promptAudioCodes = [][]int{}
 	} else {
+		// 截断过长的参考音频帧，减少 prefill 输入长度
+		promptAudioCodes = truncatePromptAudioCodes(promptAudioCodes, defaultMaxPromptAudioFrames)
 		log.Printf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
 	}
 	textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
@@ -523,6 +525,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
 	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
+
+	// 使用流式 codec 解码，避免一次性分配大 tensor 导致内存峰值过高
+	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
+	if streamingCodecSession != nil {
+		defer streamingCodecSession.Reset()
+	}
+
 	var allWaveforms [][]float32
 	for chunkIndex, chunkText := range textChunks {
 		select {
@@ -537,13 +546,25 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, maxNewFrames)
+
+		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
+		effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, effectiveMaxFrames)
 		if ctx.Err() != nil {
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频帧生成完成: %d 帧", len(generatedFrames))
-		channelArrays, audioLength := t.OrtRuntime.DecodeFullAudioWithContext(ctx, generatedFrames)
+		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d effective=%d)", len(generatedFrames), maxNewFrames, effectiveMaxFrames)
+
+		// 使用流式 codec 解码替代一次性全量解码，降低内存峰值
+		var channelArrays [][]float32
+		var audioLength int
+		if streamingCodecSession != nil {
+			streamingCodecSession.Reset()
+			channelArrays, audioLength = decodeFramesStreaming(streamingCodecSession, generatedFrames)
+		} else {
+			channelArrays, audioLength = t.OrtRuntime.DecodeFullAudioWithContext(ctx, generatedFrames)
+		}
 		if ctx.Err() != nil {
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
@@ -560,6 +581,9 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 				allWaveforms = append(allWaveforms, audio.MakeSilence(pauseSamples, channels))
 			}
 		}
+
+		// chunk 间强制 GC，帮助释放中间 tensor 内存
+		runtime.GC()
 	}
 	waveform := audio.ConcatWaveforms(allWaveforms)
 
@@ -628,6 +652,8 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		log.Printf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
 		promptAudioCodes = [][]int{}
 	} else {
+		// 截断过长的参考音频帧，减少 prefill 输入长度
+		promptAudioCodes = truncatePromptAudioCodes(promptAudioCodes, defaultMaxPromptAudioFrames)
 		log.Printf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
 	}
 	textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
@@ -639,6 +665,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
 	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
+
+	// 使用流式 codec 解码，避免一次性分配大 tensor 导致内存峰值过高
+	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
+	if streamingCodecSession != nil {
+		defer streamingCodecSession.Reset()
+	}
+
 	var allWaveforms [][]float32
 	for chunkIndex, chunkText := range textChunks {
 		select {
@@ -653,13 +686,25 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, maxNewFrames)
+
+		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
+		effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, effectiveMaxFrames)
 		if ctx.Err() != nil {
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频帧生成完成: %d 帧", len(generatedFrames))
-		channelArrays, audioLength := t.OrtRuntime.DecodeFullAudioWithContext(ctx, generatedFrames)
+		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d effective=%d)", len(generatedFrames), maxNewFrames, effectiveMaxFrames)
+
+		// 使用流式 codec 解码替代一次性全量解码，降低内存峰值
+		var channelArrays [][]float32
+		var audioLength int
+		if streamingCodecSession != nil {
+			streamingCodecSession.Reset()
+			channelArrays, audioLength = decodeFramesStreaming(streamingCodecSession, generatedFrames)
+		} else {
+			channelArrays, audioLength = t.OrtRuntime.DecodeFullAudioWithContext(ctx, generatedFrames)
+		}
 		if ctx.Err() != nil {
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
@@ -676,6 +721,9 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 				allWaveforms = append(allWaveforms, audio.MakeSilence(pauseSamples, channels))
 			}
 		}
+
+		// chunk 间强制 GC，帮助释放中间 tensor 内存
+		runtime.GC()
 	}
 	waveform := audio.ConcatWaveforms(allWaveforms)
 
@@ -692,11 +740,8 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		return nil, fmt.Errorf("编码 WAV 失败: %w", err)
 	}
 
-	// 强制 GC，释放内存
 	runtime.GC()
 
-	// 销毁所有 Session，强制 ONNX Runtime 释放内存池
-	// 这是防止内存持续增长的关键步骤
 	t.OrtRuntime.ResetSessions()
 	log.Printf("[Synthesize] Session 已重置，内存已释放")
 
@@ -735,6 +780,8 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 		promptAudioCodes := t.ResolvePromptAudioCodesWithPreload(voice, promptAudioPath, preloadId, preloadAudioPath)
 		if promptAudioCodes == nil {
 			promptAudioCodes = [][]int{}
+		} else {
+			promptAudioCodes = truncatePromptAudioCodes(promptAudioCodes, defaultMaxPromptAudioFrames)
 		}
 		textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
 
@@ -957,6 +1004,63 @@ func estimateInterChunkPauseSeconds(textChunk string) float64 {
 		return DefaultInterChunkPauseShortSec
 	}
 	return DefaultInterChunkPauseLongSec
+}
+
+// decodeFramesStreaming 使用流式 codec 解码，分批处理帧以降低内存峰值
+func decodeFramesStreaming(session *ortruntime.CodecStreamingDecodeSession, frames [][]int) ([][]float32, int) {
+	if len(frames) == 0 {
+		return nil, 0
+	}
+	const batchSize = 16
+	var allChannels [][]float32
+	totalSamples := 0
+	for i := 0; i < len(frames); i += batchSize {
+		end := i + batchSize
+		if end > len(frames) {
+			end = len(frames)
+		}
+		batch := frames[i:end]
+		channelArrays, audioLength := session.RunFrames(batch)
+		if audioLength > 0 && len(channelArrays) > 0 {
+			merged := audio.MergeAudioChannels(channelArrays)
+			allChannels = append(allChannels, merged)
+			totalSamples += audioLength
+		}
+	}
+	if len(allChannels) == 0 {
+		return nil, 0
+	}
+	// 合并所有批次的波形
+	waveform := audio.ConcatWaveforms(allChannels)
+	return [][]float32{waveform}, totalSamples
+}
+
+// estimateMaxNewFrames 根据文本 token 数估算合理的最大生成帧数
+// 经验值：每个 token 约生成 3-5 帧，下限 50 帧，上限为用户指定的 maxNewFrames
+func estimateMaxNewFrames(tokenCount int, maxNewFrames int) int {
+	estimated := tokenCount * 5
+	if estimated < 50 {
+		estimated = 50
+	}
+	if estimated > maxNewFrames {
+		estimated = maxNewFrames
+	}
+	return estimated
+}
+
+// truncatePromptAudioCodes 截断过长的参考音频帧，只保留前 maxFrames 帧
+// 参考音频只需提供音色特征，不需要完整音频
+const defaultMaxPromptAudioFrames = 20
+
+func truncatePromptAudioCodes(codes [][]int, maxFrames int) [][]int {
+	if maxFrames <= 0 {
+		maxFrames = defaultMaxPromptAudioFrames
+	}
+	if len(codes) <= maxFrames {
+		return codes
+	}
+	log.Printf("[TruncatePromptAudio] 参考音频从 %d 帧截断为 %d 帧", len(codes), maxFrames)
+	return codes[:maxFrames]
 }
 
 func ToFloat64(v interface{}) float64 {

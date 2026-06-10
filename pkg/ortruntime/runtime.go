@@ -388,8 +388,17 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 			return fmt.Errorf("创建 SessionOptions 失败: %w", err)
 		}
 		defer sessionOptions.Destroy()
-		if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevel(99)); err != nil {
+		// 使用 EXTENDED 级别替代 ALL(99)，减少内存预分配开销，推理速度差异极小
+		if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableExtended); err != nil {
 			log.Printf("  警告: 设置图优化级别失败: %v", err)
+		}
+		// 禁用内存模式优化，减少 ONNX Runtime 内存池预留空间
+		if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_pattern", "0"); err != nil {
+			log.Printf("  警告: 设置 enable_mem_pattern 失败: %v", err)
+		}
+		// 启用内存复用，允许释放的 tensor 内存被后续分配复用
+		if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_reuse", "1"); err != nil {
+			log.Printf("  警告: 设置 enable_mem_reuse 失败: %v", err)
 		}
 
 		// 根据是否使用GPU配置SessionOptions
