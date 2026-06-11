@@ -10,8 +10,154 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
+
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 )
+
+// MP3EncodeConfig MP3 编码配置
+type MP3EncodeConfig struct {
+	SampleRate int     // 目标采样率，默认 44100
+	VBRQuality float64 // VBR 质量 (0-9, 0最高 9最低)，默认 7 (较低质量节省空间)
+}
+
+// DefaultMP3EncodeConfig 默认 MP3 编码配置
+var DefaultMP3EncodeConfig = MP3EncodeConfig{
+	SampleRate: 44100,
+	VBRQuality: 7,
+}
+
+// mp3EncoderCache 缓存探测到的可用 MP3 编码器名称
+var (
+	mp3EncoderCache     string
+	mp3EncoderCacheOnce sync.Once
+	ffmpegPathCache     string
+	ffmpegPathOnce      sync.Once
+)
+
+// GetFFmpegPath 获取可用的 ffmpeg 路径：优先本地 lib/ffmpeg，然后系统 PATH
+func GetFFmpegPath() string {
+	ffmpegPathOnce.Do(func() {
+		// 1. 优先使用本地 lib/ffmpeg 下的 ffmpeg（含 libmp3lame）
+		// 尝试从可执行文件目录和工作目录查找
+		exePath, _ := os.Executable()
+		exeDir := filepath.Dir(exePath)
+		cwd, _ := os.Getwd()
+
+		searchDirs := []string{
+			filepath.Join(cwd, "lib"),
+			filepath.Join(exeDir, "lib"),
+		}
+		for _, libDir := range searchDirs {
+			localFFmpeg := deps.FindLocalFFmpeg(libDir)
+			if localFFmpeg != "" {
+				ffmpegPathCache = localFFmpeg
+				log.Printf("[Audio] 使用本地 FFmpeg: %s", localFFmpeg)
+				return
+			}
+		}
+		// 2. 使用系统 PATH 中的 ffmpeg
+		if path, err := exec.LookPath("ffmpeg"); err == nil {
+			ffmpegPathCache = path
+			log.Printf("[Audio] 使用系统 FFmpeg: %s", path)
+			return
+		}
+		ffmpegPathCache = ""
+		log.Printf("[Audio] 未找到 FFmpeg，MP3 编码不可用")
+	})
+	return ffmpegPathCache
+}
+
+// detectMP3Encoder 探测 ffmpeg 可用的 MP3 编码器
+func detectMP3Encoder(ffmpegBin string) string {
+	mp3EncoderCacheOnce.Do(func() {
+		if ffmpegBin == "" {
+			mp3EncoderCache = ""
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd := exec.CommandContext(ctx, ffmpegBin, "-hide_banner", "-encoders")
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Run()
+		cancel()
+
+		output := out.Bytes()
+		// 依次尝试 libmp3lame, mp3
+		for _, enc := range []string{"libmp3lame", "mp3"} {
+			if bytes.Contains(output, []byte(enc)) {
+				mp3EncoderCache = enc
+				log.Printf("[Audio] 检测到 FFmpeg MP3 编码器: %s", enc)
+				return
+			}
+		}
+		mp3EncoderCache = ""
+		log.Printf("[Audio] FFmpeg 未找到 MP3 编码器")
+	})
+	return mp3EncoderCache
+}
+
+// EncodeMP3 将 float32 波形编码为 MP3 格式，使用 ffmpeg 子进程
+// 如果 ffmpeg 不可用或无 MP3 编码器，回退到 WAV 格式
+func EncodeMP3(waveform []float32, channels, sampleRate int, cfg MP3EncodeConfig) ([]byte, error) {
+	ffmpegBin := GetFFmpegPath()
+	encoder := detectMP3Encoder(ffmpegBin)
+	if ffmpegBin == "" || encoder == "" {
+		log.Printf("[EncodeMP3] FFmpeg 或 MP3 编码器不可用，回退到 WAV 格式")
+		return EncodeWAV(waveform, channels, sampleRate)
+	}
+
+	// 先编码为 WAV 作为中间格式
+	wavData, err := EncodeWAV(waveform, channels, sampleRate)
+	if err != nil {
+		return nil, fmt.Errorf("编码 WAV 中间格式失败: %w", err)
+	}
+
+	// 构建 ffmpeg 命令：WAV -> MP3
+	args := []string{
+		"-y",
+		"-v", "fatal",
+		"-f", "wav",
+		"-i", "pipe:0",
+		"-c:a", encoder,
+		"-ar", fmt.Sprintf("%d", cfg.SampleRate),
+		"-q:a", fmt.Sprintf("%.0f", cfg.VBRQuality),
+		"-f", "mp3",
+		"pipe:1",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ffmpegBin, args...)
+	cmd.Stdin = bytes.NewReader(wavData)
+	var outBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &stderrBuf
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg MP3 编码失败: %w (stderr: %s)", err, stderrBuf.String())
+	}
+
+	return outBuf.Bytes(), nil
+}
+
+// WriteMP3 将 float32 波形编码为 MP3 文件
+func WriteMP3(path string, waveform []float32, channels, sampleRate int, cfg MP3EncodeConfig) error {
+	data, err := EncodeMP3(waveform, channels, sampleRate, cfg)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+// IsFFmpegAvailable 检查 ffmpeg 是否可用
+func IsFFmpegAvailable() bool {
+	_, err := exec.LookPath("ffmpeg")
+	return err == nil
+}
 
 func WriteWAV(path string, waveform []float32, channels, sampleRate int) error {
 	data, err := EncodeWAV(waveform, channels, sampleRate)
@@ -93,7 +239,7 @@ func ReadWAV(path string) ([]float32, int, int, error) {
 }
 
 func ReadWAVMaxDuration(path string, maxDurationSecs int) ([]float32, int, int, error) {
-	if _, err := exec.LookPath("ffmpeg"); err == nil {
+	if GetFFmpegPath() != "" {
 		return readWithFFmpeg(path)
 	}
 	return readRIFFWAV(path)
@@ -119,7 +265,7 @@ func readWithFFmpeg(path string) ([]float32, int, int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
+	cmd := exec.CommandContext(ctx, GetFFmpegPath(), "-y",
 		"-v", "fatal",
 		"-i", resolvedPath,
 		"-t", "30",

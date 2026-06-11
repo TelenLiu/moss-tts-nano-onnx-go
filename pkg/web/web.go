@@ -278,6 +278,8 @@ func (s *Server) backgroundInit() {
 	}
 	s.emit(ProgressEvent{Phase: "download", Message: "ONNX Runtime 依赖已就绪", Percent: 25})
 
+	s.emit(ProgressEvent{Phase: "download", Message: "正在检查 FFmpeg (MP3 编码)...", Percent: 27})
+	deps.EnsureFFmpeg(s.Cfg)
 	s.emit(ProgressEvent{Phase: "download", Message: "正在检查模型文件...", Percent: 30})
 	if err := deps.EnsureModels(s.Cfg); err != nil {
 		s.emit(ProgressEvent{Phase: "error", Message: fmt.Sprintf("模型文件准备失败: %v", err), Error: fmt.Sprintf("模型文件准备失败: %v", err)})
@@ -622,9 +624,39 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API synthesize] 合成成功: sampleRate=%d audioSamples=%d elapsed=%.2fs chunks=%d",
 		result.SampleRate, result.AudioSamples, result.ElapsedSec, len(result.TextChunks))
 
+	// 根据 format 参数选择编码格式
+	outputFormat := req.Format
+	if outputFormat == "" {
+		outputFormat = "mp3"
+	}
+
+	var audioData []byte
+	var actualFormat string
+	if outputFormat == "mp3" {
+		mp3Cfg := audio.DefaultMP3EncodeConfig
+		if req.MP3SampleRate > 0 {
+			mp3Cfg.SampleRate = req.MP3SampleRate
+		}
+		if req.MP3VBRQuality > 0 {
+			mp3Cfg.VBRQuality = req.MP3VBRQuality
+		}
+		mp3Data, err := audio.EncodeMP3(result.Waveform, result.Channels, result.SampleRate, mp3Cfg)
+		if err != nil {
+			log.Printf("[API synthesize] MP3 编码失败，回退 WAV: %v", err)
+			audioData = result.AudioData
+			actualFormat = "wav"
+		} else {
+			audioData = mp3Data
+			actualFormat = "mp3"
+		}
+	} else {
+		audioData = result.AudioData
+		actualFormat = "wav"
+	}
+
 	resp := SynthesizeResponse{
 		AudioPath:      "",
-		AudioDataB64:   base64.StdEncoding.EncodeToString(result.AudioData),
+		AudioDataB64:   base64.StdEncoding.EncodeToString(audioData),
 		SampleRate:     result.SampleRate,
 		AudioSamples:   result.AudioSamples,
 		ElapsedSeconds: result.ElapsedSec,
@@ -632,6 +664,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		TextChunks:     result.TextChunks,
 		SampleMode:     result.SampleMode,
 		DoSample:       result.DoSample,
+		Format:         actualFormat,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -668,11 +701,69 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		return
 	}
 
+	// 判断输出格式：MP3 需要收集完整波形后编码，PCM 可以实时流式输出
+	outputFormat := req.Format
+	if outputFormat == "" {
+		outputFormat = "mp3"
+	}
+
 	totalSamples := 0
 	chunkCount := 0
 	startTime := time.Now()
-	headersSent := false
 
+	if outputFormat == "mp3" {
+		// MP3 模式：收集完整波形后编码返回
+		var allWaveforms [][]float32
+		var sampleRate, channels int
+		for chunk := range chunkChan {
+			select {
+			case <-ctx.Done():
+				log.Printf("[API synthesize stream] 请求断开，停止流式输出")
+				return
+			default:
+			}
+			if len(chunk.Waveform) == 0 {
+				continue
+			}
+			allWaveforms = append(allWaveforms, chunk.Waveform)
+			sampleRate = chunk.SampleRate
+			channels = chunk.Channels
+			totalSamples += len(chunk.Waveform) / chunk.Channels
+			chunkCount++
+		}
+		if len(allWaveforms) == 0 {
+			return
+		}
+		waveform := audio.ConcatWaveforms(allWaveforms)
+		mp3Cfg := audio.DefaultMP3EncodeConfig
+		if req.MP3SampleRate > 0 {
+			mp3Cfg.SampleRate = req.MP3SampleRate
+		}
+		if req.MP3VBRQuality > 0 {
+			mp3Cfg.VBRQuality = req.MP3VBRQuality
+		}
+		mp3Data, err := audio.EncodeMP3(waveform, channels, sampleRate, mp3Cfg)
+		if err != nil {
+			log.Printf("[API synthesize stream] MP3 编码失败: %v", err)
+			http.Error(w, fmt.Sprintf("MP3 encoding failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		elapsed := time.Since(startTime).Seconds()
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(mp3Data)))
+		w.Header().Set("X-Audio-Sample-Rate", fmt.Sprintf("%d", sampleRate))
+		w.Header().Set("X-Audio-Channels", fmt.Sprintf("%d", channels))
+		w.Header().Set("X-Audio-Samples", fmt.Sprintf("%d", totalSamples))
+		w.Header().Set("X-Elapsed-Seconds", fmt.Sprintf("%.2f", elapsed))
+		w.Header().Set("X-Audio-Format", "mp3")
+		w.Write(mp3Data)
+		log.Printf("[API synthesize stream] MP3流式合成完成: chunks=%d totalSamples=%d elapsed=%.2fs mp3Size=%d",
+			chunkCount, totalSamples, elapsed, len(mp3Data))
+		return
+	}
+
+	// PCM 流式模式（默认 wav 格式走此路径）
+	headersSent := false
 	for chunk := range chunkChan {
 		select {
 		case <-ctx.Done():
@@ -774,7 +865,12 @@ func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[API audio] 提供音频: %s (大小: %d bytes)", filePath, info.Size())
-	w.Header().Set("Content-Type", "audio/wav")
+	// 根据文件扩展名设置 Content-Type
+	if strings.HasSuffix(strings.ToLower(filename), ".mp3") {
+		w.Header().Set("Content-Type", "audio/mpeg")
+	} else {
+		w.Header().Set("Content-Type", "audio/wav")
+	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	http.ServeFile(w, r, filePath)
 }
@@ -896,19 +992,22 @@ func (s *Server) handleDemoPromptAudio(w http.ResponseWriter, r *http.Request) {
 }
 
 type SynthesizeRequest struct {
-	Text                    string `json:"text"`
-	Voice                   string `json:"voice"`
-	DemoID                  string `json:"demo_id"`
-	PreloadID               string `json:"preload_id"`
-	PromptAudioPath         string `json:"prompt_audio_path"`
-	UploadedPromptAudio     string `json:"uploaded_prompt_audio"`
-	SampleMode              string `json:"sample_mode"`
-	MaxNewFrames            int    `json:"max_new_frames"`
-	VoiceCloneMaxTextTokens int    `json:"voice_clone_max_text_tokens"`
-	Seed                    *int   `json:"seed"`
-	Stream                  bool   `json:"stream"`
-	EnableRobust            *bool  `json:"enable_robust"`
-	EnableWeText            *bool  `json:"enable_wetext"`
+	Text                    string  `json:"text"`
+	Voice                   string  `json:"voice"`
+	DemoID                  string  `json:"demo_id"`
+	PreloadID               string  `json:"preload_id"`
+	PromptAudioPath         string  `json:"prompt_audio_path"`
+	UploadedPromptAudio     string  `json:"uploaded_prompt_audio"`
+	SampleMode              string  `json:"sample_mode"`
+	MaxNewFrames            int     `json:"max_new_frames"`
+	VoiceCloneMaxTextTokens int     `json:"voice_clone_max_text_tokens"`
+	Seed                    *int    `json:"seed"`
+	Stream                  bool    `json:"stream"`
+	EnableRobust            *bool   `json:"enable_robust"`
+	EnableWeText            *bool   `json:"enable_wetext"`
+	Format                  string  `json:"format"`
+	MP3SampleRate           int     `json:"mp3_sample_rate"`
+	MP3VBRQuality           float64 `json:"mp3_vbr_quality"`
 }
 
 type SynthesizeResponse struct {
@@ -921,6 +1020,7 @@ type SynthesizeResponse struct {
 	TextChunks     []string `json:"text_chunks"`
 	SampleMode     string   `json:"sample_mode"`
 	DoSample       bool     `json:"do_sample"`
+	Format         string   `json:"format"`
 }
 
 var _ = audio.WriteWAV
@@ -1165,6 +1265,15 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   <div class="meta">生成后播放：等待全部合成完成后播放；流式播放：边合成边播放（低延迟）</div>
 </div>
 
+<div class="field" id="format-field">
+  <label>输出格式</label>
+  <select id="output-format">
+    <option value="mp3">MP3 (默认，体积小)</option>
+    <option value="wav">WAV (无损，体积大)</option>
+  </select>
+  <div class="meta">MP3: 44100Hz VBR-Q7，体积约为WAV的1/10；WAV: 原始无损格式</div>
+</div>
+
 <button id="btn" onclick="doSynthesize()">开始合成</button>
 <div id="result" class="result" style="display:none"></div>
 
@@ -1400,7 +1509,8 @@ function getConfig() {
     voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 300,
     seed: seedVal === 0 ? null : seedVal,
     enable_robust: document.getElementById('enable-robust').checked,
-    enable_wetext: document.getElementById('enable-wetext').checked
+    enable_wetext: document.getElementById('enable-wetext').checked,
+    output_format: document.getElementById('output-format').value
   };
 }
 
@@ -1444,6 +1554,11 @@ async function doSynthesize() {
     }
 
     const cfg = getConfig();
+    // 流式播放模式下 MP3 无法实时播放，自动切换为 WAV
+    let effectiveFormat = cfg.output_format;
+    if (playMode === 'stream' && effectiveFormat === 'mp3') {
+      effectiveFormat = 'wav';
+    }
     const body = {
       text: cfg.text,
       voice: cfg.voice,
@@ -1456,7 +1571,8 @@ async function doSynthesize() {
       seed: cfg.seed,
       enable_robust: cfg.enable_robust,
       enable_wetext: cfg.enable_wetext,
-      stream: playMode === 'stream'
+      stream: playMode === 'stream',
+      format: effectiveFormat
     };
 
     if (playMode === 'stream') {
@@ -1486,7 +1602,9 @@ async function doBufferSynthesize(body, result, btn) {
     return;
   }
   const durationSec = data.sample_rate > 0 ? (data.audio_samples / data.sample_rate).toFixed(2) : '0.00';
-  result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + data.elapsed_seconds.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 采样率: ' + data.sample_rate + 'Hz</p><p>音色: ' + data.voice + ' | 采样模式: ' + data.sample_mode + ' | 分块数: ' + (data.text_chunks ? data.text_chunks.length : 0) + '</p>';
+  const fmt = data.format || 'wav';
+  const fmtLabel = fmt === 'mp3' ? 'MP3' : 'WAV';
+  result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + data.elapsed_seconds.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 格式: ' + fmtLabel + '</p><p>音色: ' + data.voice + ' | 采样模式: ' + data.sample_mode + ' | 分块数: ' + (data.text_chunks ? data.text_chunks.length : 0) + '</p>';
 
   if (data.audio_data_b64) {
     const byteCharacters = atob(data.audio_data_b64);
@@ -1495,11 +1613,11 @@ async function doBufferSynthesize(body, result, btn) {
       byteNumbers[i] = byteCharacters.charCodeAt(i);
     }
     const byteArray = new Uint8Array(byteNumbers);
-    const blob = new Blob([byteArray], { type: 'audio/wav' });
+    const mimeType = fmt === 'mp3' ? 'audio/mpeg' : 'audio/wav';
+    const blob = new Blob([byteArray], { type: mimeType });
     const audioUrl = URL.createObjectURL(blob);
     const audioEl = document.createElement('audio');
     audioEl.controls = true;
-    audioEl.type = 'audio/wav';
     audioEl.src = audioUrl;
     result.appendChild(audioEl);
   }
@@ -1530,6 +1648,30 @@ async function doStreamSynthesize(body, result, btn) {
       return;
     }
 
+    const contentType = r.headers.get('Content-Type') || '';
+
+    // MP3 格式：服务端返回完整 MP3 文件，直接创建音频播放
+    if (contentType.includes('audio/mpeg') || body.format === 'mp3') {
+      const blob = await r.blob();
+      const audioUrl = URL.createObjectURL(blob);
+      const audioEl = document.createElement('audio');
+      audioEl.controls = true;
+      audioEl.src = audioUrl;
+
+      // 从响应头获取元数据
+      const elapsedSec = parseFloat(r.headers.get('X-Elapsed-Seconds') || '0');
+      const audioSamples = parseInt(r.headers.get('X-Audio-Samples') || '0');
+      const sampleRate = parseInt(r.headers.get('X-Audio-Sample-Rate') || '0');
+      const durationSec = sampleRate > 0 ? (audioSamples / sampleRate).toFixed(2) : '0.00';
+
+      result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + elapsedSec.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 格式: MP3</p>';
+      result.appendChild(audioEl);
+      btn.disabled = false;
+      btn.textContent = '开始合成';
+      return;
+    }
+
+    // PCM 流式模式
     const sampleRate = parseInt(r.headers.get('X-Audio-Sample-Rate') || '24000');
     const channels = parseInt(r.headers.get('X-Audio-Channels') || '2');
 
@@ -1540,6 +1682,7 @@ async function doStreamSynthesize(body, result, btn) {
     let nextPlaybackTime = audioCtx.currentTime + 0.1;
     let totalSamplesReceived = 0;
     let chunkCount = 0;
+    const streamStartTime = performance.now();
 
     const reader = r.body.getReader();
     let remainder = new Uint8Array(0);
@@ -1586,7 +1729,9 @@ async function doStreamSynthesize(body, result, btn) {
       chunkCount++;
     }
 
-    result.querySelector('p').textContent = '流式合成完成! (共 ' + chunkCount + ' 个音频块)';
+    const durationSec = sampleRate > 0 ? (totalSamplesReceived / sampleRate).toFixed(2) : '0.00';
+    const elapsedSec = ((performance.now() - streamStartTime) / 1000).toFixed(2);
+    result.querySelector('p').innerHTML = '<strong>流式合成完成!</strong> 耗时: ' + elapsedSec + '秒 音频时长: ' + durationSec + '秒 格式: WAV (共 ' + chunkCount + ' 个音频块)';
   } catch (e) {
     if (e.name === 'AbortError') {
       result.innerHTML = '<p class="error">请求超时</p>';
@@ -1603,6 +1748,17 @@ async function doStreamSynthesize(body, result, btn) {
 loadDemos();
 loadVoices();
 loadDeviceInfo();
+
+// 播放模式切换时，隐藏/显示输出格式
+document.getElementById('play-mode').addEventListener('change', function() {
+  const formatField = document.getElementById('format-field');
+  formatField.style.display = this.value === 'stream' ? 'none' : '';
+});
+// 初始化：默认流式播放时隐藏格式选择
+(function() {
+  const playMode = document.getElementById('play-mode').value;
+  document.getElementById('format-field').style.display = playMode === 'stream' ? 'none' : '';
+})();
 </script>
 </body>
 </html>

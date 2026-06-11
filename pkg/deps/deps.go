@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -698,4 +699,268 @@ func newProxyHTTPClient() *http.Client {
 			return nil
 		},
 	}
+}
+
+// FFmpeg 相关常量和下载逻辑
+
+const (
+	FFmpegBaseURL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest"
+)
+
+// ffmpegDownloadURL 返回当前平台对应的 ffmpeg 静态构建下载 URL
+func ffmpegDownloadURL() string {
+	switch runtime.GOOS {
+	case "darwin":
+		if runtime.GOARCH == "arm64" {
+			// macOS Apple Silicon: osxexperts.net (含 libmp3lame)
+			return "https://www.osxexperts.net/ffmpeg81arm.zip"
+		}
+		// macOS Intel: evermeet.cx (含 libmp3lame)
+		return "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip"
+	case "linux":
+		if runtime.GOARCH == "arm64" {
+			return FFmpegBaseURL + "/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
+		}
+		return FFmpegBaseURL + "/ffmpeg-master-latest-linux64-gpl.tar.xz"
+	case "windows":
+		if runtime.GOARCH == "arm64" {
+			return FFmpegBaseURL + "/ffmpeg-master-latest-winarm64-gpl.zip"
+		}
+		return FFmpegBaseURL + "/ffmpeg-master-latest-win64-gpl.zip"
+	default:
+		return ""
+	}
+}
+
+// ffmpegBinName 返回当前平台的 ffmpeg 可执行文件名
+func ffmpegBinName() string {
+	if runtime.GOOS == "windows" {
+		return "ffmpeg.exe"
+	}
+	return "ffmpeg"
+}
+
+// FindLocalFFmpeg 查找本地 lib/ffmpeg 目录下的 ffmpeg 可执行文件
+func FindLocalFFmpeg(libDir string) string {
+	ffmpegDir := filepath.Join(libDir, "ffmpeg")
+	binName := ffmpegBinName()
+
+	// 直接在 ffmpeg 目录下查找
+	candidates := []string{
+		filepath.Join(ffmpegDir, binName),
+		filepath.Join(ffmpegDir, "bin", binName),
+	}
+	for _, p := range candidates {
+		if fileExists(p) {
+			return p
+		}
+	}
+
+	// 在 ffmpeg 目录下递归查找
+	matches, _ := filepath.Glob(filepath.Join(ffmpegDir, "**", binName))
+	if len(matches) > 0 {
+		return matches[0]
+	}
+
+	return ""
+}
+
+// EnsureFFmpeg 确保本地有可用的 ffmpeg（含 libmp3lame），下载到 lib/ffmpeg/
+func EnsureFFmpeg(cfg *Config) error {
+	ffmpegDir := filepath.Join(cfg.LibDir, "ffmpeg")
+	localFFmpeg := FindLocalFFmpeg(cfg.LibDir)
+
+	if localFFmpeg != "" {
+		log.Printf("FFmpeg 本地依赖已就绪: %s", localFFmpeg)
+		cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "FFmpeg 已就绪 (跳过下载)", Percent: 100})
+		return nil
+	}
+
+	url := ffmpegDownloadURL()
+	if url == "" {
+		log.Printf("[FFmpeg] 当前平台不支持自动下载 FFmpeg，MP3 编码将使用系统 ffmpeg 或回退 WAV")
+		cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "当前平台不支持自动下载 FFmpeg", Percent: 100})
+		return nil
+	}
+
+	log.Printf("开始下载 FFmpeg (含 libmp3lame)...")
+	cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "下载 FFmpeg..."})
+
+	os.MkdirAll(ffmpegDir, 0755)
+
+	// 根据下载 URL 确定临时文件后缀
+	ext := ".download"
+	if strings.HasSuffix(url, ".zip") {
+		ext = ".zip"
+	} else if strings.HasSuffix(url, ".tar.xz") || strings.HasSuffix(url, ".txz") {
+		ext = ".tar.xz"
+	} else if strings.HasSuffix(url, ".tgz") {
+		ext = ".tgz"
+	} else if strings.HasSuffix(url, ".tar.gz") {
+		ext = ".tar.gz"
+	}
+
+	tmpFile, err := os.CreateTemp("", "moss-tts-ffmpeg-*"+ext)
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if err := downloadFileTracked(cfg, url, tmpPath, 0, "FFmpeg", 0, 0, "FFmpeg"); err != nil {
+		// 下载失败不返回错误，MP3 编码会回退到 WAV
+		log.Printf("[FFmpeg] 下载失败: %v，MP3 编码将回退到 WAV", err)
+		cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "FFmpeg 下载失败，MP3 将回退 WAV", Percent: 100})
+		return nil
+	}
+
+	cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "解压 FFmpeg..."})
+
+	if err := extractFFmpeg(tmpPath, ffmpegDir); err != nil {
+		log.Printf("[FFmpeg] 解压失败: %v，MP3 编码将回退到 WAV", err)
+		return nil
+	}
+
+	// 验证解压结果
+	localFFmpeg = FindLocalFFmpeg(cfg.LibDir)
+	if localFFmpeg == "" {
+		log.Printf("[FFmpeg] 解压后未找到 ffmpeg 可执行文件")
+		return nil
+	}
+
+	// 设置可执行权限
+	os.Chmod(localFFmpeg, 0755)
+
+	log.Printf("FFmpeg 下载完成: %s", localFFmpeg)
+	cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "FFmpeg 下载完成", Percent: 100})
+	return nil
+}
+
+// extractFFmpeg 解压 ffmpeg 下载文件
+func extractFFmpeg(src, dest string) error {
+	if strings.HasSuffix(src, ".zip") {
+		return extractFFmpegZip(src, dest)
+	} else if strings.HasSuffix(src, ".tar.xz") || strings.HasSuffix(src, ".txz") {
+		return extractFFmpegTxz(src, dest)
+	} else if strings.HasSuffix(src, ".tgz") || strings.HasSuffix(src, ".tar.gz") {
+		return extractOrtTgz(src, dest)
+	}
+	return fmt.Errorf("不支持的 FFmpeg 下载格式: %s", src)
+}
+
+// extractFFmpegZip 解压 zip 格式的 ffmpeg
+func extractFFmpegZip(src, dest string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	binName := ffmpegBinName()
+	for _, f := range r.File {
+		base := filepath.Base(f.Name)
+		if base != binName {
+			continue
+		}
+		// 提取到 dest/binName
+		target := filepath.Join(dest, binName)
+		os.MkdirAll(filepath.Dir(target), 0755)
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
+		out, err := os.Create(target)
+		if err != nil {
+			rc.Close()
+			continue
+		}
+		io.Copy(out, rc)
+		out.Close()
+		rc.Close()
+		return nil
+	}
+	return fmt.Errorf("zip 中未找到 %s", binName)
+}
+
+// extractFFmpegTxz 解压 .tar.xz 格式的 ffmpeg (Linux BtbN builds)
+func extractFFmpegTxz(src, dest string) error {
+	// Go 标准库不支持 xz，使用系统 xz 命令解压
+	// 先解压 xz 得到 tar，再解压 tar
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// 使用 xz 命令解压到临时文件
+	tmpTar := src + ".tar"
+	defer os.Remove(tmpTar)
+
+	xzCmd := exec.Command("xz", "-d", "-k", "-f", "-c")
+	xzCmd.Stdin = f
+	tmpTarFile, err := os.Create(tmpTar)
+	if err != nil {
+		return err
+	}
+	xzCmd.Stdout = tmpTarFile
+	if err := xzCmd.Run(); err != nil {
+		tmpTarFile.Close()
+		// xz 不可用，尝试 unxz
+		f.Seek(0, 0)
+		unxzCmd := exec.Command("unxz", "-c")
+		unxzCmd.Stdin = f
+		tmpTarFile2, err := os.Create(tmpTar)
+		if err != nil {
+			return err
+		}
+		unxzCmd.Stdout = tmpTarFile2
+		if err := unxzCmd.Run(); err != nil {
+			tmpTarFile2.Close()
+			return fmt.Errorf("xz/unxz 解压失败: %w", err)
+		}
+		tmpTarFile2.Close()
+	} else {
+		tmpTarFile.Close()
+	}
+
+	// 解压 tar，只提取 ffmpeg 二进制
+	return extractFFmpegFromTar(tmpTar, dest)
+}
+
+// extractFFmpegFromTar 从 tar 文件中提取 ffmpeg 二进制
+func extractFFmpegFromTar(src, dest string) error {
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	tr := tar.NewReader(f)
+	binName := ffmpegBinName()
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		base := filepath.Base(hdr.Name)
+		if base != binName {
+			continue
+		}
+		target := filepath.Join(dest, binName)
+		os.MkdirAll(filepath.Dir(target), 0755)
+		out, err := os.Create(target)
+		if err != nil {
+			continue
+		}
+		if _, err := io.Copy(out, tr); err != nil {
+			out.Close()
+			continue
+		}
+		out.Close()
+		return nil
+	}
+	return fmt.Errorf("tar 中未找到 %s", binName)
 }

@@ -119,6 +119,8 @@ func runInfer(args []string) {
 	if err := deps.EnsureModels(cfg); err != nil {
 		log.Fatalf("模型准备失败: %v", err)
 	}
+	// 下载 FFmpeg（含 libmp3lame），用于 MP3 编码
+	deps.EnsureFFmpeg(cfg)
 
 	resolvedText := resolveTextContent(*text, *textFile)
 	doSampleBool := *doSample != 0
@@ -243,6 +245,8 @@ func runDownload(args []string) {
 	if err := deps.EnsureModels(cfg); err != nil {
 		log.Fatalf("下载模型文件失败: %v", err)
 	}
+	log.Println("下载 FFmpeg (MP3 编码依赖)...")
+	deps.EnsureFFmpeg(cfg)
 
 	log.Println("构建文本归一化 FST 缓存（首次运行需要 5-10 分钟）...")
 	if err := normalizer.BuildCache(); err != nil {
