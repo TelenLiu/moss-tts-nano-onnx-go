@@ -17,6 +17,7 @@ type WorkCore struct {
 	ID       int
 	Runtime  *OnnxTtsRuntime
 	ActiveReqs atomic.Int64 // 当前活跃请求数
+	mu      sync.Mutex     // 互斥锁，确保同一时间只有一个请求使用该推理单元
 }
 
 // Pool 管理多个推理单元，提供负载均衡访问。
@@ -86,6 +87,7 @@ func (p *Pool) Acquire() *WorkCore {
 	// 单个单元直接返回
 	if len(p.cores) == 1 {
 		core := p.cores[0]
+		core.mu.Lock() // 获取互斥锁，确保串行访问
 		core.ActiveReqs.Add(1)
 		return core
 	}
@@ -102,14 +104,16 @@ func (p *Pool) Acquire() *WorkCore {
 	}
 
 	core := p.cores[bestIdx]
+	core.mu.Lock() // 获取互斥锁，确保串行访问
 	core.ActiveReqs.Add(1)
 	return core
 }
 
-// Release 释放推理单元（减少活跃请求计数）。
+// Release 释放推理单元（减少活跃请求计数并释放互斥锁）。
 func (p *Pool) Release(core *WorkCore) {
 	if core != nil {
 		core.ActiveReqs.Add(-1)
+		core.mu.Unlock() // 释放互斥锁，允许下一个请求使用
 	}
 }
 

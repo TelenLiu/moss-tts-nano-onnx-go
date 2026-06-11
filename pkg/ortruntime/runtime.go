@@ -400,6 +400,11 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 		if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_reuse", "1"); err != nil {
 			log.Printf("  警告: 设置 enable_mem_reuse 失败: %v", err)
 		}
+		// 禁用 arena 分配器，避免 ONNX Runtime 使用 jemalloc 等内存池导致内存不释放
+		// arena 分配器会缓存已释放的内存块供后续复用，但不会归还给操作系统
+		if err := sessionOptions.AddSessionConfigEntry("session.use_arena", "0"); err != nil {
+			log.Printf("  警告: 设置 use_arena 失败: %v", err)
+		}
 
 		// 根据是否使用GPU配置SessionOptions
 		if useGPU {
@@ -782,6 +787,18 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 
 	globalHidden := extractLastHidden(namedPrefillOutputs["global_hidden"])
 
+	// 立即销毁 global_hidden tensor，数据已拷贝到 globalHidden 切片
+	if gh, ok := namedPrefillOutputs["global_hidden"]; ok && gh != nil {
+		gh.Destroy()
+		namedPrefillOutputs["global_hidden"] = nil
+		// 同步清理 prefillOutputs 中的引用
+		for i, name := range prefillOutputNames {
+			if name == "global_hidden" && i < len(prefillOutputs) {
+				prefillOutputs[i] = nil
+			}
+		}
+	}
+
 	pastValidLength := int32(0)
 	for _, v := range requestRows["attentionMask"][0] {
 		pastValidLength += v
@@ -790,7 +807,9 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 	pastByName := make(map[string]ort.Value)
 	for _, name := range prefillOutputNames[1:] {
 		pastName := strings.Replace(name, "present_", "past_", 1)
-		pastByName[pastName] = namedPrefillOutputs[name]
+		if v, ok := namedPrefillOutputs[name]; ok && v != nil {
+			pastByName[pastName] = v
+		}
 	}
 
 	var generatedFrames [][]int
@@ -810,11 +829,29 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		select {
 		case <-ctx.Done():
 			log.Printf("  生成被取消")
+			// 先销毁 pastByName，然后将 prefillOutputs 中对应的值设为 nil 避免 double-free
 			for _, v := range pastByName {
-				v.Destroy()
+				if v != nil {
+					v.Destroy()
+				}
+			}
+			// pastByName 中的值和 prefillOutputs 共享同一 ort.Value 对象
+			// 需要将 prefillOutputs 中已销毁的设为 nil
+			destroyedSet := make(map[ort.Value]bool)
+			for _, v := range pastByName {
+				if v != nil {
+					destroyedSet[v] = true
+				}
+			}
+			for i, v := range prefillOutputs {
+				if v != nil && destroyedSet[v] {
+					prefillOutputs[i] = nil
+				}
 			}
 			for _, v := range prefillOutputs {
-				v.Destroy()
+				if v != nil {
+					v.Destroy()
+				}
 			}
 			return nil
 		default:
@@ -896,13 +933,33 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		}
 
 		globalHidden = extractLastHidden(namedDecodeOutputs["global_hidden"])
+
+		// 立即销毁 global_hidden tensor，数据已拷贝到 globalHidden 切片
+		if gh, ok := namedDecodeOutputs["global_hidden"]; ok && gh != nil {
+			gh.Destroy()
+			namedDecodeOutputs["global_hidden"] = nil
+		}
+
 		pastValidLength++
 
-		// 销毁旧的 past 值和 decodeOutputs
+		// 销毁旧的 past 值
 		for _, oldPast := range pastByName {
 			oldPast.Destroy()
 		}
-		// 注意：namedDecodeOutputs 中的值会被转移到 newPastByName，所以这里不需要销毁
+
+		// 销毁 decodeOutputs 中非 past 的输出（如 logits 等），避免内存累积
+		for _, name := range decodeOutputNames {
+			if name == "global_hidden" {
+				continue // 已销毁
+			}
+			isPast := strings.HasPrefix(name, "present_")
+			if !isPast {
+				if v, ok := namedDecodeOutputs[name]; ok && v != nil {
+					v.Destroy()
+					namedDecodeOutputs[name] = nil
+				}
+			}
+		}
 
 		// 创建新的 pastByName，只保存需要传递到下一轮的 past 值
 		newPastByName := make(map[string]ort.Value)
@@ -920,10 +977,27 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 	}
 
 	for _, v := range pastByName {
-		v.Destroy()
+		if v != nil {
+			v.Destroy()
+		}
+	}
+	// pastByName 中的值和 prefillOutputs 共享同一 ort.Value 对象
+	// 需要将 prefillOutputs 中已销毁的设为 nil 避免 double-free
+	destroyedSet := make(map[ort.Value]bool)
+	for _, v := range pastByName {
+		if v != nil {
+			destroyedSet[v] = true
+		}
+	}
+	for i, v := range prefillOutputs {
+		if v != nil && destroyedSet[v] {
+			prefillOutputs[i] = nil
+		}
 	}
 	for _, v := range prefillOutputs {
-		v.Destroy()
+		if v != nil {
+			v.Destroy()
+		}
 	}
 
 	log.Printf("  生成完成: %d 帧", len(generatedFrames))
@@ -1420,8 +1494,18 @@ func (rt *OrtCpuRuntime) UpdateSessionTime(timed *TimedSession) {
 // ResetSessions 销毁并重新创建所有 ONNX Session
 // 当有活跃请求时跳过，避免销毁正在使用的 session
 func (rt *OrtCpuRuntime) ResetSessions() error {
-	// 有活跃请求时不执行重置，避免销毁正在使用的 session
-	if rt.ActiveRequests.Load() > 0 {
+	return rt.resetSessionsInternal(false)
+}
+
+// ForceResetSessions 强制销毁并重新创建所有 ONNX Session，即使有活跃请求
+// 用于推理完成后立即释放 ONNX Runtime 内存池
+func (rt *OrtCpuRuntime) ForceResetSessions() error {
+	return rt.resetSessionsInternal(true)
+}
+
+func (rt *OrtCpuRuntime) resetSessionsInternal(force bool) error {
+	// 有活跃请求时不执行重置，避免销毁正在使用的 session（除非强制）
+	if !force && rt.ActiveRequests.Load() > 0 {
 		log.Printf("[ORT] 跳过 Session 重置：当前有 %d 个活跃请求", rt.ActiveRequests.Load())
 		return nil
 	}
