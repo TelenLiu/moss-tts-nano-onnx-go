@@ -69,7 +69,6 @@ type Server struct {
 
 	mu              sync.RWMutex
 	RuntimeManager  *runtime.RuntimeManager
-	Runtime         *ttsruntime.OnnxTtsRuntime
 	Pool            *ttsruntime.Pool
 	DeviceInfo      *device.DeviceInfo
 	Ready           bool
@@ -251,12 +250,6 @@ func (s *Server) Close() {
 		s.Pool = nil
 	}
 
-	// 关闭 TTS 运行时
-	if s.Runtime != nil {
-		s.Runtime.Close()
-		s.Runtime = nil
-	}
-
 	// 关闭文本归一化引擎
 	normalizer.Close()
 
@@ -323,14 +316,6 @@ func (s *Server) backgroundInit() {
 
 	s.mu.Lock()
 	s.Pool = pool
-	// 兼容：如果只有一个推理单元，也设置 Runtime 字段
-	if pool.WorkCoreCount() == 1 {
-		core := pool.Acquire()
-		if core != nil {
-			s.Runtime = core.Runtime
-			pool.Release(core)
-		}
-	}
 	s.mu.Unlock()
 
 	s.emit(ProgressEvent{Phase: "load", Message: "正在准备文本归一化引擎...", Percent: 96})
@@ -489,11 +474,10 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	pool := s.Pool
-	rt := s.Runtime
 	ready := s.Ready
 	s.mu.RUnlock()
 
-	if !ready || (pool == nil && rt == nil) {
+	if !ready || pool == nil {
 		http.Error(w, "系统尚未就绪，请等待加载完成", http.StatusServiceUnavailable)
 		return
 	}
@@ -592,29 +576,17 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API synthesize] enableRobust=%v enableWeText=%v", enableRobust, enableWeText)
 
 	if req.Stream {
-		s.handleStreamSynthesize(w, ctx, pool, rt, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
+		s.handleStreamSynthesize(w, ctx, pool, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
 		return
 	}
 
-	var result *ttsruntime.SynthesisResult
-	var err error
-	if pool != nil {
-		result, err = pool.SynthesizeWithContextEx(ctx,
-			req.Text, voice, promptAudioPath, "",
-			preloadId, preloadAudioPath,
-			sampleMode, doSample, false,
-			maxNewFrames, voiceCloneMaxTokens,
-			enableRobust, enableWeText, req.Seed,
-		)
-	} else {
-		result, err = rt.SynthesizeWithContextEx(ctx,
-			req.Text, voice, promptAudioPath, "",
-			preloadId, preloadAudioPath,
-			sampleMode, doSample, false,
-			maxNewFrames, voiceCloneMaxTokens,
-			enableRobust, enableWeText, req.Seed,
-		)
-	}
+	result, err := pool.SynthesizeWithContextEx(ctx,
+		req.Text, voice, promptAudioPath, "",
+		preloadId, preloadAudioPath,
+		sampleMode, doSample, false,
+		maxNewFrames, voiceCloneMaxTokens,
+		enableRobust, enableWeText, req.Seed,
+	)
 	if err != nil {
 		log.Printf("[API synthesize] 合成失败: %v", err)
 		http.Error(w, fmt.Sprintf("Synthesis failed: %v", err), http.StatusInternalServerError)
@@ -670,32 +642,20 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, pool *ttsruntime.Pool, rt *ttsruntime.OnnxTtsRuntime, req SynthesizeRequest, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
+func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, pool *ttsruntime.Pool, req SynthesizeRequest, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
 		return
 	}
 
-	var chunkChan <-chan ttsruntime.StreamChunk
-	var err error
-	if pool != nil {
-		chunkChan, err = pool.SynthesizeStreamEx(ctx,
-			req.Text, voice, promptAudioPath,
-			preloadId, preloadAudioPath,
-			sampleMode, doSample,
-			maxNewFrames, voiceCloneMaxTokens,
-			enableRobust, enableWeText, req.Seed,
-		)
-	} else {
-		chunkChan, err = rt.SynthesizeStreamEx(ctx,
-			req.Text, voice, promptAudioPath,
-			preloadId, preloadAudioPath,
-			sampleMode, doSample,
-			maxNewFrames, voiceCloneMaxTokens,
-			enableRobust, enableWeText, req.Seed,
-		)
-	}
+	chunkChan, err := pool.SynthesizeStreamEx(ctx,
+		req.Text, voice, promptAudioPath,
+		preloadId, preloadAudioPath,
+		sampleMode, doSample,
+		maxNewFrames, voiceCloneMaxTokens,
+		enableRobust, enableWeText, req.Seed,
+	)
 	if err != nil {
 		log.Printf("[API synthesize stream] 流式合成启动失败: %v", err)
 		return
@@ -812,22 +772,16 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 func (s *Server) handleVoices(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	pool := s.Pool
-	rt := s.Runtime
 	ready := s.Ready
 	s.mu.RUnlock()
 
-	if !ready || (pool == nil && rt == nil) {
+	if !ready || pool == nil {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode([]map[string]string{})
 		return
 	}
 
-	var voices []map[string]interface{}
-	if pool != nil {
-		voices = pool.ListBuiltinVoices()
-	} else {
-		voices = rt.OrtRuntime.ListBuiltinVoices()
-	}
+	voices := pool.ListBuiltinVoices()
 	type voiceInfo struct {
 		Voice string `json:"voice"`
 		Label string `json:"label"`

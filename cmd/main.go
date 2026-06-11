@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -14,7 +15,6 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
-	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/proxy"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/web"
@@ -48,6 +48,8 @@ func main() {
 		runInfer(os.Args[2:])
 	case "serve":
 		runServe(os.Args[2:])
+	case "worker":
+		runWorker(os.Args[2:])
 	case "download":
 		runDownload(os.Args[2:])
 	case "help", "-h", "--help":
@@ -69,6 +71,7 @@ func printUsage() {
 	fmt.Println("  moss-tts-nano-onnx-go              启动Web体验服务 (默认)")
 	fmt.Println("  moss-tts-nano-onnx-go serve [选项]  启动Web体验服务")
 	fmt.Println("  moss-tts-nano-onnx-go infer [选项]  运行语音合成推理")
+	fmt.Println("  moss-tts-nano-onnx-go worker [选项]  启动推理子进程(内部使用)")
 	fmt.Println("  moss-tts-nano-onnx-go download [选项] 下载模型和依赖")
 	fmt.Println()
 	fmt.Println("使用 'serve -h', 'infer -h', 'download -h' 查看子命令详细帮助")
@@ -140,26 +143,23 @@ func runInfer(args []string) {
 	_ = audioTopK
 	_ = audioRepPenalty
 
-	if err := ortruntime.InitializeORT(cfg.LibDir); err != nil {
-		log.Fatalf("初始化 ONNX Runtime 环境失败: %v", err)
-	}
-
 	cwd, _ := os.Getwd()
 	if *outputPath == "" {
 		*outputPath = filepath.Join(cwd, "infer_onnx_output.wav")
 	}
 
 	log.Printf("初始化 TTS 运行时 (model_dir=%s threads=%d mode=%s)...", cfg.ModelDir, *cpuThreads, *executionMode)
-	rt, err := ttsruntime.NewOnnxTtsRuntime(cfg.ModelDir, *cpuThreads, 0, &maxFrames, &doSampleBool, sampleMode, *executionMode)
+	wp, err := ttsruntime.NewWorkerProcess(0, cfg.ModelDir, *cpuThreads, 0, &maxFrames, &doSampleBool, sampleMode, *executionMode)
 	if err != nil {
 		log.Fatalf("初始化 TTS 运行时失败: %v", err)
 	}
-	defer rt.Close()
+	defer wp.Close()
 
 	log.Printf("开始合成: text=%q voice=%s sample_mode=%s robust=%v wetext=%v", resolvedText, *voice, *sampleMode, robustEnabled, wetextEnabled)
-	result, err := rt.SynthesizeEx(
+	result, err := wp.SynthesizeWithContextEx(
+		context.Background(),
 		resolvedText, *voice, *promptAudioPath, *outputPath,
-		*sampleMode, doSampleBool, false,
+		"", "", *sampleMode, doSampleBool, false,
 		*maxNewFrames, *voiceCloneMaxTokens,
 		robustEnabled, wetextEnabled, seedOpt,
 	)
@@ -274,4 +274,10 @@ func resolveTextContent(text, textFile string) string {
 		log.Fatalf("读取文本文件失败: %v", err)
 	}
 	return string(data)
+}
+
+func runWorker(args []string) {
+	// worker 子进程入口，由主进程启动
+	// 从 stdin 读取初始化参数，然后加载模型并监听 TCP
+	workerMain()
 }

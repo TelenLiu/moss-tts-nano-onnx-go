@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
-	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 )
 
@@ -30,8 +30,7 @@ type RuntimeManager struct {
 	maxNewFrames int
 
 	mu       sync.RWMutex
-	ort      *ortruntime.OrtCpuRuntime
-	tts      *ttsruntime.OnnxTtsRuntime
+	pool     *ttsruntime.Pool
 	ready    bool
 	initErr  error
 	progress []InitProgress
@@ -117,33 +116,29 @@ func (m *RuntimeManager) doInitialize(ctx context.Context, progressCb ProgressCa
 	}
 	report("download", "模型下载完成，正在加载...", 50, nil)
 
-	report("load", "正在初始化 ONNX Runtime 环境...", 55, nil)
-	if err := ortruntime.InitializeORT(m.config.LibDir); err != nil {
-		report("error", fmt.Sprintf("ONNX Runtime 初始化失败：%v", err), 0, err)
-		m.mu.Lock()
-		m.initErr = fmt.Errorf("ONNX Runtime 初始化失败：%w", err)
-		m.mu.Unlock()
-		return
-	}
-	report("load", "ONNX Runtime 环境初始化成功", 70, nil)
+	report("load", "正在初始化推理单元池...", 55, nil)
 
-	report("load", "正在加载 TTS 模型...", 75, nil)
-	rt, err := ttsruntime.NewOnnxTtsRuntime(
-		m.config.ModelDir, m.cpuThreads, 0,
-		&m.maxNewFrames, nil, nil, "hybrid", // 默认使用混合模式
+	// 加载 onnx 配置
+	onnxCfg := onnxconfig.DefaultConfig()
+	if loadedCfg, err := onnxconfig.Load(""); err == nil && loadedCfg != nil {
+		onnxCfg = loadedCfg
+	}
+
+	pool, err := ttsruntime.NewPoolFromConfig(
+		m.config.ModelDir, onnxCfg,
+		&m.maxNewFrames, nil, nil, "hybrid",
 	)
 	if err != nil {
-		report("error", fmt.Sprintf("TTS 运行时初始化失败：%v", err), 0, err)
+		report("error", fmt.Sprintf("推理单元池初始化失败：%v", err), 0, err)
 		m.mu.Lock()
-		m.initErr = fmt.Errorf("TTS 运行时初始化失败：%w", err)
+		m.initErr = fmt.Errorf("推理单元池初始化失败：%w", err)
 		m.mu.Unlock()
 		return
 	}
-	report("load", "TTS 模型加载完成", 95, nil)
+	report("load", "推理单元池初始化完成", 95, nil)
 
 	m.mu.Lock()
-	m.ort = nil
-	m.tts = rt
+	m.pool = pool
 	m.ready = true
 	m.mu.Unlock()
 
@@ -174,7 +169,7 @@ func (m *RuntimeManager) WaitReady(ctx context.Context) error {
 	}
 }
 
-func (m *RuntimeManager) GetTTSRuntime() (*ttsruntime.OnnxTtsRuntime, error) {
+func (m *RuntimeManager) GetPool() (*ttsruntime.Pool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -185,7 +180,7 @@ func (m *RuntimeManager) GetTTSRuntime() (*ttsruntime.OnnxTtsRuntime, error) {
 		return nil, ErrNotInitialized
 	}
 
-	return m.tts, nil
+	return m.pool, nil
 }
 
 func (m *RuntimeManager) IsReady() bool {
@@ -207,13 +202,9 @@ func (m *RuntimeManager) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.tts != nil {
-		m.tts.Close()
-		m.tts = nil
-	}
-	if m.ort != nil {
-		m.ort.Close()
-		m.ort = nil
+	if m.pool != nil {
+		m.pool.Close()
+		m.pool = nil
 	}
 	m.ready = false
 }
