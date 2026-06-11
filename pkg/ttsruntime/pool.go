@@ -31,8 +31,8 @@ type Pool struct {
 }
 
 // NewPool 创建推理单元池。
-// workCores: 推理单元数量，coreCPUs: 每个单元的CPU线程数。
-func NewPool(modelDir string, workCores, coreCPUs int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*Pool, error) {
+// workCores: 推理单元数量，coreCPUs: 每个单元的CPU线程数，coreMemMB: 每个单元的内存阈值MB。
+func NewPool(modelDir string, workCores, coreCPUs, coreMemMB int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*Pool, error) {
 	if workCores < 1 {
 		workCores = 1
 	}
@@ -48,7 +48,7 @@ func NewPool(modelDir string, workCores, coreCPUs int, maxNewFrames *int, doSamp
 
 	for i := 0; i < workCores; i++ {
 		log.Printf("[Pool] 初始化推理单元 #%d (threads=%d)...", i, coreCPUs)
-		rt, err := NewOnnxTtsRuntime(modelDir, coreCPUs, maxNewFrames, doSample, sampleMode, executionMode)
+		rt, err := NewOnnxTtsRuntime(modelDir, coreCPUs, coreMemMB, maxNewFrames, doSample, sampleMode, executionMode)
 		if err != nil {
 			// 清理已创建的单元
 			for j := 0; j < i; j++ {
@@ -71,7 +71,7 @@ func NewPool(modelDir string, workCores, coreCPUs int, maxNewFrames *int, doSamp
 
 // NewPoolFromConfig 从 onnx 配置创建推理单元池。
 func NewPoolFromConfig(modelDir string, cfg *onnxconfig.Config, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*Pool, error) {
-	return NewPool(modelDir, cfg.WorkCores, cfg.CoreCPUs, maxNewFrames, doSample, sampleMode, executionMode)
+	return NewPool(modelDir, cfg.WorkCores, cfg.CoreCPUs, cfg.CoreMemMB, maxNewFrames, doSample, sampleMode, executionMode)
 }
 
 // Acquire 使用最少连接策略获取一个推理单元。

@@ -1,4 +1,5 @@
 {
-  "workCores": 2,
-  "coreCPUs": 4
+  "workCores": 1,
+  "coreCPUs": 2,
+  "coreMemMB": 800
 }

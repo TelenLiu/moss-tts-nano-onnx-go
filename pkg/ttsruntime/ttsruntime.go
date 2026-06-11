@@ -54,12 +54,13 @@ type StreamChunk struct {
 }
 
 type OnnxTtsRuntime struct {
-	OrtRuntime   *ortruntime.OrtCpuRuntime
-	SPModel      *tokenizer.Processor
-	PreloadCache *PreloadCache
+	OrtRuntime        *ortruntime.OrtCpuRuntime
+	SPModel           *tokenizer.Processor
+	PreloadCache      *PreloadCache
+	MemoryThresholdMB int // 长文本多 chunk 推理时，单 chunk 处理后的内存上限MB，超过此阈值触发 ForceResetSessions
 }
 
-func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OnnxTtsRuntime, error) {
+func NewOnnxTtsRuntime(modelDir string, threadCount int, coreMemMB int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OnnxTtsRuntime, error) {
 	rt, err := ortruntime.NewOrtCpuRuntime(modelDir, threadCount, maxNewFrames, doSample, sampleMode, executionMode)
 	if err != nil {
 		return nil, fmt.Errorf("创建 OrtCpuRuntime 失败: %w", err)
@@ -80,9 +81,13 @@ func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSa
 	}
 
 	// 创建preload缓存
+	if coreMemMB <= 0 {
+		coreMemMB = 800
+	}
 	ttsRuntime := &OnnxTtsRuntime{
-		OrtRuntime: rt,
-		SPModel:    sp,
+		OrtRuntime:        rt,
+		SPModel:           sp,
+		MemoryThresholdMB: coreMemMB,
 	}
 	// 使用 lib/cache/assets_preload 作为缓存目录
 	cacheDir := filepath.Join(filepath.Dir(modelDir), "lib", "cache", "assets_preload")
@@ -1161,21 +1166,21 @@ func logMemoryStats(label string) uint64 {
 	return m.Alloc
 }
 
-// memoryThresholdMB 长文本多 chunk 推理时，单 chunk 处理后的内存上限
-// 超过此阈值才触发 ForceResetSessions 释放 ONNX C++ 内存池
-const memoryThresholdMB = 800
-
 // resetSessionsIfOverMemory 检查当前内存，超过阈值时执行 ForceResetSessions
 // 返回是否执行了重置，以及重建后的 codec streaming session
 func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortruntime.CodecStreamingDecodeSession, chunkLabel string) (*ortruntime.CodecStreamingDecodeSession, bool) {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	allocMB := float64(m.Alloc) / 1024 / 1024
-	if allocMB <= float64(memoryThresholdMB) {
-		log.Printf("[Memory] %s: Alloc=%.1fMB (阈值=%dMB), 跳过Session重置", chunkLabel, allocMB, memoryThresholdMB)
+	threshold := t.MemoryThresholdMB
+	if threshold <= 0 {
+		threshold = 800
+	}
+	if allocMB <= float64(threshold) {
+		log.Printf("[Memory] %s: Alloc=%.1fMB (阈值=%dMB), 跳过Session重置", chunkLabel, allocMB, threshold)
 		return streamingCodecSession, false
 	}
-	log.Printf("[Memory] %s: Alloc=%.1fMB > 阈值%dMB, 执行ForceResetSessions", chunkLabel, allocMB, memoryThresholdMB)
+	log.Printf("[Memory] %s: Alloc=%.1fMB > 阈值%dMB, 执行ForceResetSessions", chunkLabel, allocMB, threshold)
 	// 1. 重置 codec streaming 状态
 	if streamingCodecSession != nil {
 		streamingCodecSession.Reset()
