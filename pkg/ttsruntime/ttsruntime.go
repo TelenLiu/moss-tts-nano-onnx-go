@@ -54,9 +54,9 @@ type StreamChunk struct {
 }
 
 type OnnxTtsRuntime struct {
-	OrtRuntime    *ortruntime.OrtCpuRuntime
-	SPModel       *tokenizer.Processor
-	PreloadCache  *PreloadCache
+	OrtRuntime   *ortruntime.OrtCpuRuntime
+	SPModel      *tokenizer.Processor
+	PreloadCache *PreloadCache
 }
 
 func NewOnnxTtsRuntime(modelDir string, threadCount int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OnnxTtsRuntime, error) {
@@ -607,23 +607,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 处理完成", chunkIndex+1, len(textChunks)))
 
-		// 长文本多 chunk 间：强制重置 ONNX Session 释放 C++ 内存池
-		// 使长文本内存峰值与短文本一致，避免 ONNX 内部分配器缓存导致内存累积
+		// 长文本多 chunk 间：先做轻量清理，内存超阈值时才 ForceResetSessions
+		// 避免每个 chunk 间都重建 Session 的开销（约1-2秒/次）
 		if chunkIndex < len(textChunks)-1 && len(textChunks) > 1 {
-			// 1. 重置 codec streaming 状态（销毁状态 tensor）
-			if streamingCodecSession != nil {
-				streamingCodecSession.Reset()
-			}
-			// 2. Go 侧内存释放
 			runtime.GC()
 			debug.FreeOSMemory()
-			// 3. 销毁并重建 ONNX Session，释放 C++ 内存池
-			if err := t.OrtRuntime.ForceResetSessions(); err != nil {
-				log.Printf("[Synthesize] 警告: chunk 间 Session 重置失败: %v", err)
-			}
-			// 4. 用新 Session 重建 codec streaming session
-			streamingCodecSession = ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
-			logMemoryStats(fmt.Sprintf("chunk %d/%d Session重置后", chunkIndex+1, len(textChunks)))
+			streamingCodecSession, _ = t.resetSessionsIfOverMemory(streamingCodecSession,
+				fmt.Sprintf("chunk %d/%d", chunkIndex+1, len(textChunks)))
 		}
 	}
 	// 最终清理 codec streaming session
@@ -789,23 +779,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 处理完成", chunkIndex+1, len(textChunks)))
 
-		// 长文本多 chunk 间：强制重置 ONNX Session 释放 C++ 内存池
-		// 使长文本内存峰值与短文本一致，避免 ONNX 内部分配器缓存导致内存累积
+		// 长文本多 chunk 间：先做轻量清理，内存超阈值时才 ForceResetSessions
+		// 避免每个 chunk 间都重建 Session 的开销（约1-2秒/次）
 		if chunkIndex < len(textChunks)-1 && len(textChunks) > 1 {
-			// 1. 重置 codec streaming 状态（销毁状态 tensor）
-			if streamingCodecSession != nil {
-				streamingCodecSession.Reset()
-			}
-			// 2. Go 侧内存释放
 			runtime.GC()
 			debug.FreeOSMemory()
-			// 3. 销毁并重建 ONNX Session，释放 C++ 内存池
-			if err := t.OrtRuntime.ForceResetSessions(); err != nil {
-				log.Printf("[Synthesize] 警告: chunk 间 Session 重置失败: %v", err)
-			}
-			// 4. 用新 Session 重建 codec streaming session
-			streamingCodecSession = ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
-			logMemoryStats(fmt.Sprintf("chunk %d/%d Session重置后", chunkIndex+1, len(textChunks)))
+			streamingCodecSession, _ = t.resetSessionsIfOverMemory(streamingCodecSession,
+				fmt.Sprintf("chunk %d/%d", chunkIndex+1, len(textChunks)))
 		}
 	}
 	// 最终清理 codec streaming session
@@ -975,15 +955,11 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 			logMemoryStats(fmt.Sprintf("stream chunk %d/%d 处理完成", chunkIndex+1, len(textChunks)))
 
 			if chunkIndex < len(textChunks)-1 {
-				// 长文本多 chunk 间：强制重置 ONNX Session 释放 C++ 内存池
+				// 长文本多 chunk 间：先做轻量清理，内存超阈值时才 ForceResetSessions
 				runtime.GC()
 				debug.FreeOSMemory()
-				if err := t.OrtRuntime.ForceResetSessions(); err != nil {
-					log.Printf("[SynthesizeStream] 警告: chunk 间 Session 重置失败: %v", err)
-				}
-				// 用新 Session 重建 streaming session
-				streamingSession = ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
-				logMemoryStats(fmt.Sprintf("stream chunk %d/%d Session重置后", chunkIndex+1, len(textChunks)))
+				streamingSession, _ = t.resetSessionsIfOverMemory(streamingSession,
+					fmt.Sprintf("stream chunk %d/%d", chunkIndex+1, len(textChunks)))
 
 				pauseSeconds := estimateInterChunkPauseSeconds(chunkText)
 				pauseSamples := int(math.Round(float64(sampleRate) * pauseSeconds))
@@ -1175,12 +1151,47 @@ func estimateMaxNewFrames(tokenCount int, maxNewFrames int) int {
 }
 
 // logMemoryStats 记录当前进程内存使用情况，帮助诊断内存增长
-func logMemoryStats(label string) {
+// 返回当前 Alloc 字节数，供内存阈值判断使用
+func logMemoryStats(label string) uint64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	log.Printf("[Memory] %s: Alloc=%.1fMB Sys=%.1fMB HeapAlloc=%.1fMB HeapSys=%.1fMB",
 		label, float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024,
 		float64(m.HeapAlloc)/1024/1024, float64(m.HeapSys)/1024/1024)
+	return m.Alloc
+}
+
+// memoryThresholdMB 长文本多 chunk 推理时，单 chunk 处理后的内存上限
+// 超过此阈值才触发 ForceResetSessions 释放 ONNX C++ 内存池
+const memoryThresholdMB = 800
+
+// resetSessionsIfOverMemory 检查当前内存，超过阈值时执行 ForceResetSessions
+// 返回是否执行了重置，以及重建后的 codec streaming session
+func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortruntime.CodecStreamingDecodeSession, chunkLabel string) (*ortruntime.CodecStreamingDecodeSession, bool) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	allocMB := float64(m.Alloc) / 1024 / 1024
+	if allocMB <= float64(memoryThresholdMB) {
+		log.Printf("[Memory] %s: Alloc=%.1fMB (阈值=%dMB), 跳过Session重置", chunkLabel, allocMB, memoryThresholdMB)
+		return streamingCodecSession, false
+	}
+	log.Printf("[Memory] %s: Alloc=%.1fMB > 阈值%dMB, 执行ForceResetSessions", chunkLabel, allocMB, memoryThresholdMB)
+	// 1. 重置 codec streaming 状态
+	if streamingCodecSession != nil {
+		streamingCodecSession.Reset()
+	}
+	// 2. Go 侧内存释放
+	runtime.GC()
+	debug.FreeOSMemory()
+	// 3. 销毁并重建 ONNX Session，释放 C++ 内存池
+	if err := t.OrtRuntime.ForceResetSessions(); err != nil {
+		log.Printf("[Memory] 警告: ForceResetSessions失败: %v", err)
+		return streamingCodecSession, false
+	}
+	// 4. 用新 Session 重建 codec streaming session
+	newSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
+	logMemoryStats(chunkLabel + " ForceResetSessions后")
+	return newSession, true
 }
 
 // truncatePromptAudioCodes 截断过长的参考音频帧，只保留前 maxFrames 帧
