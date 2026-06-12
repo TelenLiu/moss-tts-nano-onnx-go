@@ -1,15 +1,22 @@
 package stream
 
 import (
+	"bytes"
+	"fmt"
 	"log"
+	"os"
+	"os/exec"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 type MemoryStats struct {
-	Alloc        uint64 `json:"alloc_bytes"`
-	Sys          uint64 `json:"sys_bytes"`
+	RSS          uint64 `json:"rss_bytes"`   // 进程实际物理内存（含C++库），用于阈值判断
+	Alloc        uint64 `json:"alloc_bytes"` // Go 堆分配
+	Sys          uint64 `json:"sys_bytes"`   // Go 从OS申请的总内存
 	NumGC        uint32 `json:"num_gc"`
 	PauseTotalNs uint64 `json:"pause_total_ns"`
 	Timestamp    int64  `json:"timestamp"`
@@ -33,11 +40,60 @@ func NewMemoryMonitor(warningMB, criticalMB uint64) *MemoryMonitor {
 	}
 }
 
+// getProcessRSSBytes 获取当前进程的实际物理内存占用（RSS），单位字节
+// runtime.MemStats.Alloc 只统计 Go 堆内存，不包括 ONNX Runtime 等 C++ 库的内存分配
+func getProcessRSSBytes() uint64 {
+	pid := os.Getpid()
+
+	// Linux: 从 /proc/self/status 读取 VmRSS
+	if data, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "VmRSS:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					if kb, err := strconv.ParseFloat(parts[1], 64); err == nil {
+						return uint64(kb * 1024) // kB → bytes
+					}
+				}
+			}
+		}
+	}
+
+	// macOS / 其他 Unix: 使用 ps 命令
+	cmd := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid))
+	if output, err := cmd.Output(); err == nil {
+		output = bytes.TrimSpace(output)
+		if kb, err := strconv.ParseFloat(string(output), 64); err == nil {
+			return uint64(kb * 1024) // kB → bytes
+		}
+	}
+
+	// Windows: 使用 tasklist 命令
+	cmd2 := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH")
+	if output, err := cmd2.Output(); err == nil {
+		fields := strings.Split(string(output), ",")
+		if len(fields) >= 5 {
+			memStr := strings.TrimSpace(strings.Trim(fields[len(fields)-1], `" K\r\n`))
+			memStr = strings.ReplaceAll(memStr, ",", "")
+			if kb, err := strconv.ParseFloat(memStr, 64); err == nil {
+				return uint64(kb * 1024)
+			}
+		}
+	}
+
+	// 兜底：使用 Go 的 Sys 作为粗略估计
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.Sys
+}
+
 func (m *MemoryMonitor) Sample() MemoryStats {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
+	rssBytes := getProcessRSSBytes()
 
 	stats := MemoryStats{
+		RSS:          rssBytes,
 		Alloc:        mem.Alloc,
 		Sys:          mem.Sys,
 		NumGC:        mem.NumGC,
@@ -54,12 +110,14 @@ func (m *MemoryMonitor) Sample() MemoryStats {
 		m.history = m.history[1:]
 	}
 
-	if stats.Alloc > m.criticalThreshold {
-		log.Printf("[内存警告] 严重：当前内存使用 %.1f MB (阈值：%.1f MB)",
-			float64(stats.Alloc)/1024/1024, float64(m.criticalThreshold)/1024/1024)
-	} else if stats.Alloc > m.warningThreshold {
-		log.Printf("[内存警告] 当前内存使用 %.1f MB (阈值：%.1f MB)",
-			float64(stats.Alloc)/1024/1024, float64(m.warningThreshold)/1024/1024)
+	if stats.RSS > m.criticalThreshold {
+		log.Printf("[内存警告] 严重：RSS=%.1fMB Alloc=%.1fMB (阈值：%.1fMB)",
+			float64(stats.RSS)/1024/1024, float64(stats.Alloc)/1024/1024,
+			float64(m.criticalThreshold)/1024/1024)
+	} else if stats.RSS > m.warningThreshold {
+		log.Printf("[内存警告] RSS=%.1fMB Alloc=%.1fMB (阈值：%.1fMB)",
+			float64(stats.RSS)/1024/1024, float64(stats.Alloc)/1024/1024,
+			float64(m.warningThreshold)/1024/1024)
 	}
 
 	return stats

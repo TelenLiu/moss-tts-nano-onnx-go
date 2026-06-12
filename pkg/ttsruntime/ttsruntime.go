@@ -1,6 +1,7 @@
 package ttsruntime
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -8,12 +9,14 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"os"
+	"os/exec"
 	"path/filepath"
-	"strings"
-	"time"
-
 	"runtime"
 	"runtime/debug"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
@@ -1219,32 +1222,85 @@ func estimateMaxNewFrames(tokenCount int, maxNewFrames int) int {
 	return estimated
 }
 
+// getProcessRSSMB 获取当前进程的实际物理内存占用（RSS），单位 MB
+// runtime.MemStats.Alloc 只统计 Go 堆内存，不包括 ONNX Runtime 等 C++ 库的内存分配
+// 因此必须使用操作系统级 RSS 来做内存阈值判断
+func getProcessRSSMB() float64 {
+	pid := os.Getpid()
+
+	// Linux: 从 /proc/self/status 读取 VmRSS
+	if data, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "VmRSS:") {
+				// VmRSS:    1234567 kB
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					if kb, err := strconv.ParseFloat(parts[1], 64); err == nil {
+						return kb / 1024 // kB → MB
+					}
+				}
+			}
+		}
+	}
+
+	// macOS / 其他 Unix: 使用 ps 命令
+	cmd := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid))
+	if output, err := cmd.Output(); err == nil {
+		output = bytes.TrimSpace(output)
+		if kb, err := strconv.ParseFloat(string(output), 64); err == nil {
+			return kb / 1024 // kB → MB
+		}
+	}
+
+	// Windows: 使用 tasklist 命令
+	cmd2 := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH")
+	if output, err := cmd2.Output(); err == nil {
+		// 输出格式: "moss-tts-nano-onnx-go.exe","12345","Services","0","1,623,456 K"
+		fields := strings.Split(string(output), ",")
+		if len(fields) >= 5 {
+			memStr := strings.TrimSpace(strings.Trim(fields[len(fields)-1], `" K\r\n`))
+			memStr = strings.ReplaceAll(memStr, ",", "")
+			if kb, err := strconv.ParseFloat(memStr, 64); err == nil {
+				return kb / 1024
+			}
+		}
+	}
+
+	// 兜底：使用 Go 的 Sys 作为粗略估计
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return float64(m.Sys) / 1024 / 1024
+}
+
 // logMemoryStats 记录当前进程内存使用情况，帮助诊断内存增长
-// 返回当前 Alloc 字节数，供内存阈值判断使用
+// 返回当前 RSS 字节数，供内存阈值判断使用
 func logMemoryStats(label string) uint64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	log.Printf("[Memory] %s: Alloc=%.1fMB Sys=%.1fMB HeapAlloc=%.1fMB HeapSys=%.1fMB",
-		label, float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024,
-		float64(m.HeapAlloc)/1024/1024, float64(m.HeapSys)/1024/1024)
-	return m.Alloc
+	rssMB := getProcessRSSMB()
+	log.Printf("[Memory] %s: RSS=%.1fMB Alloc=%.1fMB Sys=%.1fMB HeapAlloc=%.1fMB",
+		label, rssMB, float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024,
+		float64(m.HeapAlloc)/1024/1024)
+	// 返回 RSS 字节数
+	return uint64(rssMB * 1024 * 1024)
 }
 
-// resetSessionsIfOverMemory 检查当前内存，超过阈值时执行 ForceResetSessions
+// resetSessionsIfOverMemory 检查当前内存（使用进程RSS），超过阈值时执行 ForceResetSessions
 // 返回是否执行了重置，以及重建后的 codec streaming session
 func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortruntime.CodecStreamingDecodeSession, chunkLabel string) (*ortruntime.CodecStreamingDecodeSession, bool) {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	allocMB := float64(m.Alloc) / 1024 / 1024
+	rssMB := getProcessRSSMB()
 	threshold := t.MemoryThresholdMB
 	if threshold <= 0 {
 		threshold = 800
 	}
-	if allocMB <= float64(threshold) {
-		log.Printf("[Memory] %s: Alloc=%.1fMB (阈值=%dMB), 跳过Session重置", chunkLabel, allocMB, threshold)
+	if rssMB <= float64(threshold) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		log.Printf("[Memory] %s: RSS=%.1fMB (阈值=%dMB), Alloc=%.1fMB, 跳过Session重置",
+			chunkLabel, rssMB, threshold, float64(m.Alloc)/1024/1024)
 		return streamingCodecSession, false
 	}
-	log.Printf("[Memory] %s: Alloc=%.1fMB > 阈值%dMB, 执行ForceResetSessions", chunkLabel, allocMB, threshold)
+	log.Printf("[Memory] %s: RSS=%.1fMB > 阈值%dMB, 执行ForceResetSessions", chunkLabel, rssMB, threshold)
 	// 1. 重置 codec streaming 状态
 	if streamingCodecSession != nil {
 		streamingCodecSession.Reset()

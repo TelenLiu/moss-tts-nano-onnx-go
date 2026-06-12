@@ -2,6 +2,6 @@
   "workCores": 1,
   "reserveWorkCores": 2,
   "coreCPUs": 2,
-  "coreMemMB": 800,
+  "coreMemMB": 1600,
   "audoCloneGobExpHour": 48
 }

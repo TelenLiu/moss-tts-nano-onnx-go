@@ -13,7 +13,7 @@ type Config struct {
 	WorkCores            int `json:"workCores"`           // 常驻内存的推理单元数（默认1，至少1），进程命名从1开始
 	ReserveWorkCores     int `json:"reserveWorkCores"`    // 预留备用推理单元数（默认0），闲置1分钟自动销毁，进程命名从r1开始
 	CoreCPUs             int `json:"coreCPUs"`            // 每个推理单元最大允许的CPU内核数（默认4，至少1）
-	CoreMemMB            int `json:"coreMemMB"`           // 每个推理单元的内存阈值MB（默认800,单元内存峰值控制在3.2GB），超过时触发Session重置
+	CoreMemMB            int `json:"coreMemMB"`           // 每个推理单元的内存阈值MB（默认1600,单元内存峰值控制在2GB），超过时触发Session重置
 	AudioCloneGobExpHour int `json:"audoCloneGobExpHour"` // 音频克隆gob缓存过期小时数（默认24）
 }
 
@@ -29,7 +29,7 @@ func DefaultConfig() *Config {
 		WorkCores:            1,
 		ReserveWorkCores:     0,
 		CoreCPUs:             4,
-		CoreMemMB:            800,
+		CoreMemMB:            1600,
 		AudioCloneGobExpHour: 24,
 	}
 }
