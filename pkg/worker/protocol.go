@@ -47,6 +47,15 @@ type Request struct {
 	// PreparedText 主进程已预处理好的文本，子进程直接使用不再调用 PrepareSynthesisTextEx
 	PreparedText         string `json:"preparedText,omitempty"`
 
+	// 运行时采样参数覆盖（可选，不传则使用 manifest 默认值）
+	TextTemperature        *float64 `json:"textTemperature,omitempty"`
+	TextTopK               *int     `json:"textTopK,omitempty"`
+	TextTopP               *float64 `json:"textTopP,omitempty"`
+	AudioTemperature       *float64 `json:"audioTemperature,omitempty"`
+	AudioTopK              *int     `json:"audioTopK,omitempty"`
+	AudioTopP              *float64 `json:"audioTopP,omitempty"`
+	AudioRepetitionPenalty *float64 `json:"audioRepetitionPenalty,omitempty"`
+
 	// EncodeText / CountTokens 参数
 	TextContent string `json:"textContent,omitempty"`
 

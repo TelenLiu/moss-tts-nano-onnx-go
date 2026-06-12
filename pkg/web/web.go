@@ -585,8 +585,19 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[API synthesize] enableRobust=%v enableWeText=%v", enableRobust, enableWeText)
 
+	// 构建采样参数覆盖
+	overrides := &ortruntime.GenerationOverrides{
+		TextTemperature:        req.TextTemperature,
+		TextTopK:               req.TextTopK,
+		TextTopP:               req.TextTopP,
+		AudioTemperature:       req.AudioTemperature,
+		AudioTopK:              req.AudioTopK,
+		AudioTopP:              req.AudioTopP,
+		AudioRepetitionPenalty: req.AudioRepetitionPenalty,
+	}
+
 	if req.Stream {
-		s.handleStreamSynthesize(w, ctx, pool, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText)
+		s.handleStreamSynthesize(w, ctx, pool, req, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTokens, enableRobust, enableWeText, overrides)
 		return
 	}
 
@@ -595,7 +606,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		preloadId, preloadAudioPath,
 		sampleMode, doSample, false,
 		maxNewFrames, voiceCloneMaxTokens,
-		enableRobust, enableWeText, req.Seed,
+		enableRobust, enableWeText, req.Seed, overrides,
 	)
 	if err != nil {
 		log.Printf("[API synthesize] 合成失败: %v", err)
@@ -652,7 +663,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, pool *ttsruntime.Pool, req SynthesizeRequest, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool) {
+func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Context, pool *ttsruntime.Pool, req SynthesizeRequest, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode string, doSample bool, maxNewFrames, voiceCloneMaxTokens int, enableRobust, enableWeText bool, overrides *ortruntime.GenerationOverrides) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
@@ -664,7 +675,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		preloadId, preloadAudioPath,
 		sampleMode, doSample,
 		maxNewFrames, voiceCloneMaxTokens,
-		enableRobust, enableWeText, req.Seed,
+		enableRobust, enableWeText, req.Seed, overrides,
 	)
 	if err != nil {
 		log.Printf("[API synthesize stream] 流式合成启动失败: %v", err)
@@ -952,22 +963,29 @@ func (s *Server) handleDemoPromptAudio(w http.ResponseWriter, r *http.Request) {
 }
 
 type SynthesizeRequest struct {
-	Text                    string  `json:"text"`
-	Voice                   string  `json:"voice"`
-	DemoID                  string  `json:"demo_id"`
-	PreloadID               string  `json:"preload_id"`
-	PromptAudioPath         string  `json:"prompt_audio_path"`
-	UploadedPromptAudio     string  `json:"uploaded_prompt_audio"`
-	SampleMode              string  `json:"sample_mode"`
-	MaxNewFrames            int     `json:"max_new_frames"`
-	VoiceCloneMaxTextTokens int     `json:"voice_clone_max_text_tokens"`
-	Seed                    *int    `json:"seed"`
-	Stream                  bool    `json:"stream"`
-	EnableRobust            *bool   `json:"enable_robust"`
-	EnableWeText            *bool   `json:"enable_wetext"`
-	Format                  string  `json:"format"`
-	MP3SampleRate           int     `json:"mp3_sample_rate"`
-	MP3VBRQuality           float64 `json:"mp3_vbr_quality"`
+	Text                    string   `json:"text"`
+	Voice                   string   `json:"voice"`
+	DemoID                  string   `json:"demo_id"`
+	PreloadID               string   `json:"preload_id"`
+	PromptAudioPath         string   `json:"prompt_audio_path"`
+	UploadedPromptAudio     string   `json:"uploaded_prompt_audio"`
+	SampleMode              string   `json:"sample_mode"`
+	MaxNewFrames            int      `json:"max_new_frames"`
+	VoiceCloneMaxTextTokens int      `json:"voice_clone_max_text_tokens"`
+	Seed                    *int     `json:"seed"`
+	Stream                  bool     `json:"stream"`
+	EnableRobust            *bool    `json:"enable_robust"`
+	EnableWeText            *bool    `json:"enable_wetext"`
+	Format                  string   `json:"format"`
+	MP3SampleRate           int      `json:"mp3_sample_rate"`
+	MP3VBRQuality           float64  `json:"mp3_vbr_quality"`
+	TextTemperature         *float64 `json:"text_temperature"`
+	TextTopK                *int     `json:"text_top_k"`
+	TextTopP                *float64 `json:"text_top_p"`
+	AudioTemperature        *float64 `json:"audio_temperature"`
+	AudioTopK               *int     `json:"audio_top_k"`
+	AudioTopP               *float64 `json:"audio_top_p"`
+	AudioRepetitionPenalty  *float64 `json:"audio_repetition_penalty"`
 }
 
 type SynthesizeResponse struct {

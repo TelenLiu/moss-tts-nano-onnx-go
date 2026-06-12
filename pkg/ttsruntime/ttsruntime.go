@@ -57,11 +57,12 @@ type StreamChunk struct {
 }
 
 type OnnxTtsRuntime struct {
-	OrtRuntime        *ortruntime.OrtCpuRuntime
-	SPModel           *tokenizer.Processor
-	PreloadCache      *PreloadCache
-	AudioCloneCache   *AudioCloneCache // 音频克隆编码的文件缓存（hash key + gob，跨进程共享）
-	MemoryThresholdMB int              // 长文本多 chunk 推理时，单 chunk 处理后的内存上限MB，超过此阈值触发 ForceResetSessions
+	OrtRuntime          *ortruntime.OrtCpuRuntime
+	SPModel             *tokenizer.Processor
+	PreloadCache        *PreloadCache
+	AudioCloneCache     *AudioCloneCache                // 音频克隆编码的文件缓存（hash key + gob，跨进程共享）
+	MemoryThresholdMB   int                             // 长文本多 chunk 推理时，单 chunk 处理后的内存上限MB，超过此阈值触发 ForceResetSessions
+	GenerationOverrides *ortruntime.GenerationOverrides // 运行时采样参数覆盖
 }
 
 func NewOnnxTtsRuntime(modelDir string, threadCount int, coreMemMB int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OnnxTtsRuntime, error) {
@@ -111,6 +112,16 @@ func (t *OnnxTtsRuntime) CountTextTokens(text string) int {
 	return t.SPModel.CountTokens(text)
 }
 
+func (t *OnnxTtsRuntime) buildGenerationOverrides(sampleMode string, doSample bool) *ortruntime.GenerationOverrides {
+	o := t.GenerationOverrides
+	if o == nil {
+		o = &ortruntime.GenerationOverrides{}
+	}
+	o.SampleMode = &sampleMode
+	o.DoSample = &doSample
+	return o
+}
+
 func (t *OnnxTtsRuntime) PrepareSynthesisText(text string, enableNormalize bool) string {
 	if enableNormalize {
 		return normalizer.PrepareTTSText(text, true, true)
@@ -120,6 +131,10 @@ func (t *OnnxTtsRuntime) PrepareSynthesisText(text string, enableNormalize bool)
 
 func (t *OnnxTtsRuntime) PrepareSynthesisTextEx(text string, enableRobust bool, enableWeText bool) string {
 	return normalizer.PrepareTTSText(text, enableRobust, enableWeText)
+}
+
+func (t *OnnxTtsRuntime) PrepareSynthesisTextWithVoice(text string, enableRobust bool, enableWeText bool, voice string) string {
+	return normalizer.PrepareTTSTextWithVoice(text, enableRobust, enableWeText, voice)
 }
 
 func (t *OnnxTtsRuntime) SplitVoiceCloneText(text string, maxTokens int) []string {
@@ -582,7 +597,10 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	}
 	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
 
-	preparedText := t.PrepareSynthesisTextEx(text, enableRobust, enableWeText)
+	// 构建采样参数覆盖
+	overrides := t.buildGenerationOverrides(sampleMode, doSample)
+
+	preparedText := t.PrepareSynthesisTextWithVoice(text, enableRobust, enableWeText, voice)
 	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
 	promptAudioCodes := t.ResolvePromptAudioCodesWithPreload(voice, promptAudioPath, preloadId, preloadAudioPath)
 	if promptAudioCodes == nil {
@@ -642,7 +660,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 
 		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
 		effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, effectiveMaxFrames)
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContextAndOverrides(ctx, requestRows, effectiveMaxFrames, overrides)
 		if ctx.Err() != nil {
 			interrupted = true
 			if streamingCodecSession != nil {
@@ -762,6 +780,9 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	}
 	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
 
+	// 构建采样参数覆盖
+	overrides := t.buildGenerationOverrides(sampleMode, doSample)
+
 	preparedText := t.PrepareSynthesisText(text, enableNormalize)
 	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d", len(text), len(preparedText))
 	promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
@@ -818,7 +839,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 
 		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
 		effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContext(ctx, requestRows, effectiveMaxFrames)
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContextAndOverrides(ctx, requestRows, effectiveMaxFrames, overrides)
 		if ctx.Err() != nil {
 			interrupted = true
 			if streamingCodecSession != nil {
@@ -930,7 +951,10 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 			t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
 		}
 
-		preparedText := t.PrepareSynthesisTextEx(text, enableRobust, enableWeText)
+		// 构建采样参数覆盖
+		overrides := t.buildGenerationOverrides(sampleMode, doSample)
+
+		preparedText := t.PrepareSynthesisTextWithVoice(text, enableRobust, enableWeText, voice)
 		promptAudioCodes := t.ResolvePromptAudioCodesWithPreload(voice, promptAudioPath, preloadId, preloadAudioPath)
 		if promptAudioCodes == nil {
 			promptAudioCodes = [][]int{}
@@ -1029,7 +1053,9 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 				decodePending(false)
 			}
 
-			_ = t.OrtRuntime.GenerateAudioFramesWithCallback(ctx, requestRows, maxNewFrames, onFrame)
+			// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
+			effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
+			_ = t.OrtRuntime.GenerateAudioFramesWithCallbackAndOverrides(ctx, requestRows, effectiveMaxFrames, onFrame, overrides)
 			// 如果推理被中断，标记并退出
 			select {
 			case <-ctx.Done():

@@ -166,7 +166,7 @@ func runInfer(args []string) {
 		preparedText, *voice, *promptAudioPath, *outputPath,
 		"", "", *sampleMode, doSampleBool, false,
 		*maxNewFrames, *voiceCloneMaxTokens,
-		seedOpt,
+		seedOpt, nil,
 	)
 	if err != nil {
 		log.Fatalf("合成失败: %v", err)

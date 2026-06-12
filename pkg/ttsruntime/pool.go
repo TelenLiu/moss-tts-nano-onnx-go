@@ -10,6 +10,7 @@ import (
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 )
 
 // CoreType 推理单元类型
@@ -472,7 +473,7 @@ func (p *Pool) AcquireForRead() *WorkCore {
 
 // SynthesizeWithContextEx 在可用的推理单元上执行合成。
 // 文本预处理（包括 WeTextProcessing）在主进程完成，子进程只做推理，避免加载 WeTextProcessing 增加子进程内存。
-func (p *Pool) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
+func (p *Pool) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int, overrides *ortruntime.GenerationOverrides) (*SynthesisResult, error) {
 	core, err := p.Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("获取推理单元失败: %w", err)
@@ -484,12 +485,12 @@ func (p *Pool) SynthesizeWithContextEx(ctx context.Context, text string, voice s
 	log.Printf("[Pool] 文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
 
 	log.Printf("[Pool] 请求分配到推理子进程 #%s (type=%s, active=%d)", core.Name, core.Type, core.ActiveReqs.Load())
-	return core.Worker.SynthesizeWithPreparedText(ctx, preparedText, voice, promptAudioPath, outputAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, seed)
+	return core.Worker.SynthesizeWithPreparedText(ctx, preparedText, voice, promptAudioPath, outputAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, seed, overrides)
 }
 
 // SynthesizeStreamEx 在可用的推理单元上执行流式合成。
 // 文本预处理（包括 WeTextProcessing）在主进程完成，子进程只做推理，避免加载 WeTextProcessing 增加子进程内存。
-func (p *Pool) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (<-chan StreamChunk, error) {
+func (p *Pool) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int, overrides *ortruntime.GenerationOverrides) (<-chan StreamChunk, error) {
 	core, err := p.Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("获取推理单元失败: %w", err)
@@ -501,7 +502,7 @@ func (p *Pool) SynthesizeStreamEx(ctx context.Context, text string, voice string
 
 	log.Printf("[Pool] 流式请求分配到推理子进程 #%s (type=%s, active=%d)", core.Name, core.Type, core.ActiveReqs.Load())
 
-	chunkChan, err := core.Worker.SynthesizeStreamWithPreparedText(ctx, preparedText, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTextTokens, seed)
+	chunkChan, err := core.Worker.SynthesizeStreamWithPreparedText(ctx, preparedText, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTextTokens, seed, overrides)
 	if err != nil {
 		p.Release(core)
 		return nil, err

@@ -42,6 +42,7 @@ type InferenceSessions struct {
 	Prefill                *TimedSession
 	Decode                 *TimedSession
 	LocalDecoder           *TimedSession
+	LocalGreedyFrame       *TimedSession
 	LocalCachedStep        *TimedSession
 	LocalFixedSampledFrame *TimedSession
 	CodecDecode            *TimedSession
@@ -491,6 +492,8 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 				infSessions.Decode = &TimedSession{Session: sess, LastUsed: time.Now()}
 			case "local_decoder":
 				infSessions.LocalDecoder = &TimedSession{Session: sess, LastUsed: time.Now()}
+			case "local_greedy_frame":
+				infSessions.LocalGreedyFrame = &TimedSession{Session: sess, LastUsed: time.Now()}
 			case "local_cached_step":
 				infSessions.LocalCachedStep = &TimedSession{Session: sess, LastUsed: time.Now()}
 			case "local_fixed_sampled_frame":
@@ -519,6 +522,12 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 		}
 
 		load("local_decoder", ttsDir, ttsFiles["local_decoder"], nil, nil)
+
+		if f, ok := ttsFiles["local_greedy_frame"]; ok && f != nil {
+			lgInputs := []string{"global_hidden", "repetition_seen_mask", "repetition_penalty"}
+			lgOutputs := []string{"should_continue", "frame_token_ids"}
+			load("local_greedy_frame", ttsDir, f, lgInputs, lgOutputs)
+		}
 
 		if f, ok := ttsFiles["local_cached_step"]; ok && f != nil {
 			lcInputs := toStrSlice(onnxInfo["local_cached_input_names"])
@@ -740,12 +749,33 @@ func (rt *OrtCpuRuntime) GenerateAudioFrames(requestRows map[string][][]int32) [
 }
 
 func (rt *OrtCpuRuntime) GenerateAudioFramesWithContext(ctx context.Context, requestRows map[string][][]int32, maxNewFrames int) [][]int {
-	return rt.GenerateAudioFramesWithCallback(ctx, requestRows, maxNewFrames, nil)
+	return rt.GenerateAudioFramesWithCallbackAndOverrides(ctx, requestRows, maxNewFrames, nil, nil)
+}
+
+func (rt *OrtCpuRuntime) GenerateAudioFramesWithContextAndOverrides(ctx context.Context, requestRows map[string][][]int32, maxNewFrames int, overrides *GenerationOverrides) [][]int {
+	return rt.GenerateAudioFramesWithCallbackAndOverrides(ctx, requestRows, maxNewFrames, nil, overrides)
 }
 
 type FrameCallback func(generatedFrames [][]int, stepIndex int, frame []int)
 
+// GenerationOverrides 运行时采样参数覆盖，优先级高于 manifest 中的 generation_defaults
+type GenerationOverrides struct {
+	DoSample              *bool
+	SampleMode            *string
+	TextTemperature       *float64
+	TextTopK              *int
+	TextTopP              *float64
+	AudioTemperature      *float64
+	AudioTopK             *int
+	AudioTopP             *float64
+	AudioRepetitionPenalty *float64
+}
+
 func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, requestRows map[string][][]int32, maxNewFrames int, onFrame FrameCallback) [][]int {
+	return rt.GenerateAudioFramesWithCallbackAndOverrides(ctx, requestRows, maxNewFrames, onFrame, nil)
+}
+
+func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context.Context, requestRows map[string][][]int32, maxNewFrames int, onFrame FrameCallback, overrides *GenerationOverrides) [][]int {
 	rt.SessionMutex.Lock()
 	defer rt.SessionMutex.Unlock()
 
@@ -764,6 +794,37 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		audioCodebookSize = audioCodebookSizes[0]
 	}
 	sampleMode := fmt.Sprintf("%v", gd["sample_mode"])
+
+	// 应用运行时参数覆盖
+	if overrides != nil {
+		if overrides.SampleMode != nil {
+			sampleMode = *overrides.SampleMode
+		}
+		if overrides.DoSample != nil {
+			gd["do_sample"] = *overrides.DoSample
+		}
+		if overrides.TextTemperature != nil {
+			gd["text_temperature"] = *overrides.TextTemperature
+		}
+		if overrides.TextTopK != nil {
+			gd["text_top_k"] = *overrides.TextTopK
+		}
+		if overrides.TextTopP != nil {
+			gd["text_top_p"] = *overrides.TextTopP
+		}
+		if overrides.AudioTemperature != nil {
+			gd["audio_temperature"] = *overrides.AudioTemperature
+		}
+		if overrides.AudioTopK != nil {
+			gd["audio_top_k"] = *overrides.AudioTopK
+		}
+		if overrides.AudioTopP != nil {
+			gd["audio_top_p"] = *overrides.AudioTopP
+		}
+		if overrides.AudioRepetitionPenalty != nil {
+			gd["audio_repetition_penalty"] = *overrides.AudioRepetitionPenalty
+		}
+	}
 
 	select {
 	case <-ctx.Done():
@@ -835,8 +896,15 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 	decodeInputNames := toStrSlice(onnxInfo["decode_input_names"])
 	decodeOutputNames := toStrSlice(onnxInfo["decode_output_names"])
 
-	localPast := make(map[string][]float32)
-	localPVL := 0
+	// 获取 audio_repetition_penalty 默认值（用于 local_greedy_frame）
+	audioRepetitionPenalty := float32(1.0)
+	if rp, ok := gd["audio_repetition_penalty"]; ok {
+		audioRepetitionPenalty = float32(toFloat64(rp))
+	}
+	doSample := true
+	if ds, ok := gd["do_sample"]; ok {
+		doSample = toBool(ds)
+	}
 
 	for stepIndex := 0; stepIndex < maxNewFrames; stepIndex++ {
 		select {
@@ -873,12 +941,24 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 		var frame []int
 		shouldContinue := true
 
-		if rt.Onnx.Inference.LocalFixedSampledFrame != nil && sampleMode == sampler.SampleModeFixed {
+		if rt.Onnx.Inference.LocalGreedyFrame != nil && !doSample {
+			shouldContinue, frame = rt.runLocalGreedyFrame(
+				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize, audioRepetitionPenalty)
+		} else if rt.Onnx.Inference.LocalFixedSampledFrame != nil && (sampleMode == sampler.SampleModeFixed || (!doSample && rt.Onnx.Inference.LocalGreedyFrame == nil)) {
+			// greedy 模式且无 local_greedy_frame 时，也使用 local_fixed_sampled_frame
+			// 因为 argmax 采样会产生静音帧，回退到与 fixed 模式相同的概率采样
 			shouldContinue, frame = rt.runLocalFixedSampledFrame(
 				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize)
 		} else if rt.Onnx.Inference.LocalCachedStep != nil {
-			shouldContinue, frame, localPast, localPVL = rt.runLocalCachedStepFull(
+			// local_past 每帧重置，与 Python 行为一致
+			localPast := make(map[string][]float32)
+			localPVL := 0
+			shouldContinue, frame, _, _ = rt.runLocalCachedStepFull(
 				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd, localPast, localPVL)
+		} else if rt.Onnx.Inference.LocalDecoder != nil {
+			// local_decoder 兜底路径：无 KV cache 的原始解码器
+			shouldContinue, frame = rt.runLocalDecoderFull(
+				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd)
 		} else {
 			log.Printf("  step %d: 无可用的 local 模型", stepIndex)
 			break
@@ -886,7 +966,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallback(ctx context.Context, re
 
 		// 按照 Python 源码的顺序：先检查停止信号，如果停止则不添加帧
 		if !shouldContinue {
-			log.Printf("  step %d: 停止信号", stepIndex)
+			log.Printf("  step %d: 停止信号 (frame=nil=%v)", stepIndex, frame == nil)
 			break
 		}
 
@@ -1053,6 +1133,162 @@ func extractLastHidden(v ort.Value) []float32 {
 	result := make([]float32, lastDim)
 	copy(result, data[startOff:])
 	return result
+}
+
+func (rt *OrtCpuRuntime) runLocalDecoder(globalHidden []float32, textTokenID int, framePrefix []int, nvq int) ([]float32, []float32) {
+	ttsConfig := rt.Manifest["tts_config"].(map[string]interface{})
+	audioPad := int(toFloat64(ttsConfig["audio_pad_token_id"]))
+
+	ghShape := []int64{1, int64(len(globalHidden))}
+	ghTensor, _ := ort.NewTensor(ghShape, globalHidden)
+	ttTensor, _ := ort.NewTensor([]int64{1}, []int32{int32(textTokenID)})
+
+	paddedPrefix := make([]int32, nvq-1)
+	for i := range paddedPrefix {
+		paddedPrefix[i] = int32(audioPad)
+	}
+	for i := 0; i < len(framePrefix) && i < nvq-1; i++ {
+		paddedPrefix[i] = int32(framePrefix[i])
+	}
+	apShape := []int64{1, int64(nvq - 1)}
+	apTensor, _ := ort.NewTensor(apShape, paddedPrefix)
+
+	inputs := []ort.Value{ghTensor, ttTensor, apTensor}
+	outputs := make([]ort.Value, 2)
+
+	err := rt.RunSession(rt.Onnx.Inference.LocalDecoder.Session, inputs, outputs)
+	ghTensor.Destroy()
+	ttTensor.Destroy()
+	apTensor.Destroy()
+
+	if err != nil {
+		log.Printf("  local_decoder 失败: %v", err)
+		return nil, nil
+	}
+	rt.UpdateSessionTime(rt.Onnx.Inference.LocalDecoder)
+
+	textLogits := getFloat32Data(outputs[0])
+	audioLogits := getFloat32Data(outputs[1])
+
+	outputs[0].Destroy()
+	outputs[1].Destroy()
+	return textLogits, audioLogits
+}
+
+func (rt *OrtCpuRuntime) runLocalDecoderFull(globalHidden []float32, prevTokens [][]int, prevTokenSets []map[int]bool, nvq, audioCodebookSize int, gd map[string]interface{}) (bool, []int) {
+	ttsConfig := rt.Manifest["tts_config"].(map[string]interface{})
+	audioAssistSlotID := int(toFloat64(ttsConfig["audio_assistant_slot_token_id"]))
+
+	doSample := true
+	if ds, ok := gd["do_sample"]; ok {
+		doSample = toBool(ds)
+	}
+	textTemperature := 1.0
+	if t, ok := gd["text_temperature"]; ok {
+		textTemperature = toFloat64(t)
+	}
+	textTopK := 50
+	if k, ok := gd["text_top_k"]; ok {
+		textTopK = int(toFloat64(k))
+	}
+	textTopP := 1.0
+	if p, ok := gd["text_top_p"]; ok {
+		textTopP = toFloat64(p)
+	}
+	audioTemperature := 0.8
+	if t, ok := gd["audio_temperature"]; ok {
+		audioTemperature = toFloat64(t)
+	}
+	audioTopK := 25
+	if k, ok := gd["audio_top_k"]; ok {
+		audioTopK = int(toFloat64(k))
+	}
+	audioTopP := 0.95
+	if p, ok := gd["audio_top_p"]; ok {
+		audioTopP = toFloat64(p)
+	}
+	audioRepetitionPenalty := float32(1.0)
+	if rp, ok := gd["audio_repetition_penalty"]; ok {
+		audioRepetitionPenalty = float32(toFloat64(rp))
+	}
+
+	localTextLogits, _ := rt.runLocalDecoder(globalHidden, 0, nil, nvq)
+	if localTextLogits == nil {
+		return false, nil
+	}
+
+	nextTextToken := sampler.SampleAssistantTextToken(localTextLogits, audioAssistSlotID, int(toFloat64(ttsConfig["audio_end_token_id"])), doSample, textTemperature, textTopK, textTopP, rt.RNG)
+	if nextTextToken != audioAssistSlotID {
+		return false, nil
+	}
+
+	var frame []int
+	for ci := 0; ci < nvq; ci++ {
+		_, audioLogits := rt.runLocalDecoder(globalHidden, nextTextToken, frame, nvq)
+		if audioLogits == nil {
+			break
+		}
+		perChannel := audioCodebookSize
+		startOff := ci * perChannel
+		endOff := minInt(startOff+perChannel, len(audioLogits))
+		channelLogits := make([]float32, perChannel)
+		if startOff < len(audioLogits) {
+			copy(channelLogits, audioLogits[startOff:endOff])
+		}
+		sampledToken := sampler.SampleAudioToken(channelLogits, prevTokens[ci], prevTokenSets[ci], doSample, audioTemperature, audioTopK, audioTopP, audioRepetitionPenalty, rt.RNG)
+		frame = append(frame, sampledToken)
+		prevTokens[ci] = append(prevTokens[ci], sampledToken)
+		prevTokenSets[ci][sampledToken] = true
+	}
+	return true, frame
+}
+
+func (rt *OrtCpuRuntime) runLocalGreedyFrame(globalHidden []float32, prevTokenSets []map[int]bool, nvq, audioCodebookSize int, repetitionPenalty float32) (bool, []int) {
+	ghShape := []int64{1, int64(len(globalHidden))}
+	ghTensor, _ := ort.NewTensor(ghShape, globalHidden)
+
+	repetitionMask := make([]int32, nvq*audioCodebookSize)
+	for ci, tokenSet := range prevTokenSets {
+		for tid := range tokenSet {
+			if tid >= 0 && tid < audioCodebookSize {
+				repetitionMask[ci*audioCodebookSize+tid] = 1
+			}
+		}
+	}
+	repMaskShape := []int64{1, int64(nvq), int64(audioCodebookSize)}
+	repMaskTensor, _ := ort.NewTensor(repMaskShape, repetitionMask)
+
+	repPenaltyTensor, _ := ort.NewTensor([]int64{1}, []float32{repetitionPenalty})
+
+	inputs := []ort.Value{ghTensor, repMaskTensor, repPenaltyTensor}
+	outputs := make([]ort.Value, 2)
+
+	err := rt.RunSession(rt.Onnx.Inference.LocalGreedyFrame.Session, inputs, outputs)
+	ghTensor.Destroy()
+	repMaskTensor.Destroy()
+	repPenaltyTensor.Destroy()
+
+	if err != nil {
+		log.Printf("  local_greedy_frame 失败: %v", err)
+		return false, nil
+	}
+	rt.UpdateSessionTime(rt.Onnx.Inference.LocalGreedyFrame)
+
+	shouldContinueData := getInt32Data(outputs[0])
+	shouldContinue := int32(0)
+	if len(shouldContinueData) > 0 {
+		shouldContinue = shouldContinueData[0]
+	}
+
+	frameData := getInt32Data(outputs[1])
+	frame := make([]int, nvq)
+	for i := 0; i < nvq && i < len(frameData); i++ {
+		frame[i] = int(frameData[i])
+	}
+
+	outputs[0].Destroy()
+	outputs[1].Destroy()
+	return shouldContinue != 0, frame
 }
 
 func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevTokenSets []map[int]bool, nvq, audioCodebookSize int) (bool, []int) {
@@ -1240,12 +1476,16 @@ func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, 
 	}
 	for i := 6; i < len(inputNames); i++ {
 		pastData, ok := localPast[inputNames[i]]
-		if !ok {
-			pastData = make([]float32, 0)
+		if !ok || len(pastData) == 0 {
+			pastShape := []int64{1, 0, localHeads, localHeadDim}
+			t, _ := ort.NewTensor(pastShape, make([]float32, 0))
+			inputs[i] = t
+		} else {
+			seqLen := int64(len(pastData)) / (localHeads * localHeadDim)
+			pastShape := []int64{1, seqLen, localHeads, localHeadDim}
+			t, _ := ort.NewTensor(pastShape, pastData)
+			inputs[i] = t
 		}
-		pastShape := []int64{1, 0, localHeads, localHeadDim}
-		t, _ := ort.NewTensor(pastShape, pastData)
-		inputs[i] = t
 	}
 
 	outputs := make([]ort.Value, len(outputNames))
@@ -1433,6 +1673,10 @@ func (rt *OrtCpuRuntime) destroyInferenceSessions() {
 		inf.LocalDecoder.Session.Destroy()
 		inf.LocalDecoder = nil
 	}
+	if inf.LocalGreedyFrame != nil {
+		inf.LocalGreedyFrame.Session.Destroy()
+		inf.LocalGreedyFrame = nil
+	}
 	if inf.LocalCachedStep != nil {
 		inf.LocalCachedStep.Session.Destroy()
 		inf.LocalCachedStep = nil
@@ -1484,6 +1728,7 @@ func (rt *OrtCpuRuntime) CheckAndReleaseIdleSessions() {
 	count += rt.checkAndReleaseOne("prefill", rt.Onnx.Inference.Prefill, now)
 	count += rt.checkAndReleaseOne("decode", rt.Onnx.Inference.Decode, now)
 	count += rt.checkAndReleaseOne("local_decoder", rt.Onnx.Inference.LocalDecoder, now)
+	count += rt.checkAndReleaseOne("local_greedy_frame", rt.Onnx.Inference.LocalGreedyFrame, now)
 	count += rt.checkAndReleaseOne("local_cached_step", rt.Onnx.Inference.LocalCachedStep, now)
 	count += rt.checkAndReleaseOne("local_fixed_sampled_frame", rt.Onnx.Inference.LocalFixedSampledFrame, now)
 	count += rt.checkAndReleaseOne("codec_encode", rt.Onnx.CodecEncode, now)

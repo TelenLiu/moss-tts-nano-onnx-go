@@ -284,7 +284,19 @@ func ContainsCJK(text string) bool {
 	return false
 }
 
+var EnglishVoices = map[string]bool{
+	"Trump":  true,
+	"Ava":    true,
+	"Bella":  true,
+	"Adam":   true,
+	"Nathan": true,
+}
+
 func ResolveNormalizationLanguage(text string) string {
+	return ResolveNormalizationLanguageWithVoice(text, "")
+}
+
+func ResolveNormalizationLanguageWithVoice(text string, voice string) string {
 	if cjkRegex.MatchString(text) {
 		return "zh"
 	}
@@ -296,6 +308,9 @@ func ResolveNormalizationLanguage(text string) string {
 		}
 	}
 	if hasLatin {
+		return "en"
+	}
+	if EnglishVoices[voice] {
 		return "en"
 	}
 	return "zh"
@@ -350,6 +365,10 @@ func NormalizeWithWeText(text string, language string) string {
 }
 
 func PrepareTTSText(text string, enableRobust bool, enableWeText bool) string {
+	return PrepareTTSTextWithVoice(text, enableRobust, enableWeText, "")
+}
+
+func PrepareTTSTextWithVoice(text string, enableRobust bool, enableWeText bool, voice string) string {
 	if text == "" {
 		return text
 	}
@@ -358,7 +377,7 @@ func PrepareTTSText(text string, enableRobust bool, enableWeText bool) string {
 		current = NormalizeRobust(current)
 	}
 	if enableWeText {
-		lang := ResolveNormalizationLanguage(current)
+		lang := ResolveNormalizationLanguageWithVoice(current, voice)
 		if lang == "zh" {
 			current = RewriteHyphensBeforeZhWeText(current)
 		}

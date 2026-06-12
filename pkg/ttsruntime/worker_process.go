@@ -18,6 +18,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/worker"
 )
 
@@ -531,8 +532,8 @@ func (wp *WorkerProcess) SynthesizeWithContextEx(ctx context.Context, text strin
 }
 
 // SynthesizeWithPreparedText 执行合成，使用主进程已预处理的文本，子进程不再调用 PrepareSynthesisTextEx
-func (wp *WorkerProcess) SynthesizeWithPreparedText(ctx context.Context, preparedText string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, seed *int) (*SynthesisResult, error) {
-	resp, attachment, err := wp.sendRequest(ctx, &worker.Request{
+func (wp *WorkerProcess) SynthesizeWithPreparedText(ctx context.Context, preparedText string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, seed *int, overrides *ortruntime.GenerationOverrides) (*SynthesisResult, error) {
+	req := &worker.Request{
 		Type:                    worker.MsgSynthesize,
 		Text:                    preparedText,
 		Voice:                   voice,
@@ -547,7 +548,17 @@ func (wp *WorkerProcess) SynthesizeWithPreparedText(ctx context.Context, prepare
 		VoiceCloneMaxTextTokens: voiceCloneMaxTextTokens,
 		PreparedText:            preparedText,
 		Seed:                    seed,
-	})
+	}
+	if overrides != nil {
+		req.TextTemperature = overrides.TextTemperature
+		req.TextTopK = overrides.TextTopK
+		req.TextTopP = overrides.TextTopP
+		req.AudioTemperature = overrides.AudioTemperature
+		req.AudioTopK = overrides.AudioTopK
+		req.AudioTopP = overrides.AudioTopP
+		req.AudioRepetitionPenalty = overrides.AudioRepetitionPenalty
+	}
+	resp, attachment, err := wp.sendRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -623,8 +634,8 @@ func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, vo
 }
 
 // SynthesizeStreamWithPreparedText 执行流式合成，使用主进程已预处理的文本，子进程不再调用 PrepareSynthesisTextEx
-func (wp *WorkerProcess) SynthesizeStreamWithPreparedText(ctx context.Context, preparedText string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, seed *int) (<-chan StreamChunk, error) {
-	streamCh, err := wp.sendStreamRequest(ctx, &worker.Request{
+func (wp *WorkerProcess) SynthesizeStreamWithPreparedText(ctx context.Context, preparedText string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, seed *int, overrides *ortruntime.GenerationOverrides) (<-chan StreamChunk, error) {
+	req := &worker.Request{
 		Type:                    worker.MsgSynthesizeStream,
 		Text:                    preparedText,
 		Voice:                   voice,
@@ -637,7 +648,17 @@ func (wp *WorkerProcess) SynthesizeStreamWithPreparedText(ctx context.Context, p
 		VoiceCloneMaxTextTokens: voiceCloneMaxTextTokens,
 		PreparedText:            preparedText,
 		Seed:                    seed,
-	})
+	}
+	if overrides != nil {
+		req.TextTemperature = overrides.TextTemperature
+		req.TextTopK = overrides.TextTopK
+		req.TextTopP = overrides.TextTopP
+		req.AudioTemperature = overrides.AudioTemperature
+		req.AudioTopK = overrides.AudioTopK
+		req.AudioTopP = overrides.AudioTopP
+		req.AudioRepetitionPenalty = overrides.AudioRepetitionPenalty
+	}
+	streamCh, err := wp.sendStreamRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}

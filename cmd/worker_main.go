@@ -232,6 +232,22 @@ func workerHandleSynthesize(conn net.Conn, req *worker.Request, rt *ttsruntime.O
 		log.Printf("[Worker] 请求 #%d 使用主进程预处理的文本，跳过文本预处理", req.ID)
 	}
 
+	// 应用请求中的采样参数覆盖
+	if req.TextTemperature != nil || req.TextTopK != nil || req.TextTopP != nil ||
+		req.AudioTemperature != nil || req.AudioTopK != nil || req.AudioTopP != nil || req.AudioRepetitionPenalty != nil {
+		rt.GenerationOverrides = &ortruntime.GenerationOverrides{
+			TextTemperature:        req.TextTemperature,
+			TextTopK:               req.TextTopK,
+			TextTopP:               req.TextTopP,
+			AudioTemperature:       req.AudioTemperature,
+			AudioTopK:              req.AudioTopK,
+			AudioTopP:              req.AudioTopP,
+			AudioRepetitionPenalty: req.AudioRepetitionPenalty,
+		}
+	} else {
+		rt.GenerationOverrides = nil
+	}
+
 	result, err := rt.SynthesizeWithContextEx(
 		ctx,
 		text, req.Voice, req.PromptAudioPath, req.OutputAudioPath,
@@ -295,6 +311,22 @@ func workerHandleSynthesizeStream(conn net.Conn, req *worker.Request, rt *ttsrun
 		enableRobust = false
 		enableWeText = false
 		log.Printf("[Worker] 流式请求 #%d 使用主进程预处理的文本，跳过文本预处理", req.ID)
+	}
+
+	// 应用请求中的采样参数覆盖
+	if req.TextTemperature != nil || req.TextTopK != nil || req.TextTopP != nil ||
+		req.AudioTemperature != nil || req.AudioTopK != nil || req.AudioTopP != nil || req.AudioRepetitionPenalty != nil {
+		rt.GenerationOverrides = &ortruntime.GenerationOverrides{
+			TextTemperature:        req.TextTemperature,
+			TextTopK:               req.TextTopK,
+			TextTopP:               req.TextTopP,
+			AudioTemperature:       req.AudioTemperature,
+			AudioTopK:              req.AudioTopK,
+			AudioTopP:              req.AudioTopP,
+			AudioRepetitionPenalty: req.AudioRepetitionPenalty,
+		}
+	} else {
+		rt.GenerationOverrides = nil
 	}
 
 	chunkChan, err := rt.SynthesizeStreamEx(
