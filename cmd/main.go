@@ -156,12 +156,17 @@ func runInfer(args []string) {
 	defer wp.Close()
 
 	log.Printf("开始合成: text=%q voice=%s sample_mode=%s robust=%v wetext=%v", resolvedText, *voice, *sampleMode, robustEnabled, wetextEnabled)
-	result, err := wp.SynthesizeWithContextEx(
+
+	// 主进程完成文本预处理，子进程不再需要加载 WeTextProcessing
+	preparedText := normalizer.PrepareTTSText(resolvedText, robustEnabled, wetextEnabled)
+	log.Printf("文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(resolvedText), len(preparedText), robustEnabled, wetextEnabled)
+
+	result, err := wp.SynthesizeWithPreparedText(
 		context.Background(),
-		resolvedText, *voice, *promptAudioPath, *outputPath,
+		preparedText, *voice, *promptAudioPath, *outputPath,
 		"", "", *sampleMode, doSampleBool, false,
 		*maxNewFrames, *voiceCloneMaxTokens,
-		robustEnabled, wetextEnabled, seedOpt,
+		seedOpt,
 	)
 	if err != nil {
 		log.Fatalf("合成失败: %v", err)

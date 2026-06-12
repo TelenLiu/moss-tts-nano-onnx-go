@@ -471,10 +471,10 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	if pool != nil {
 		response["onnx_pool"] = map[string]interface{}{
-			"work_cores":        pool.WorkCoreCount(),
-			"reserve_cores":     pool.ReserveCoreCount(),
-			"pending_requests":  pool.PendingCount(),
-			"cores":             pool.Status(),
+			"work_cores":       pool.WorkCoreCount(),
+			"reserve_cores":    pool.ReserveCoreCount(),
+			"pending_requests": pool.PendingCount(),
+			"cores":            pool.Status(),
 		}
 	}
 
@@ -1215,7 +1215,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   </div>
   <div class="row" style="margin-top:8px;">
     <div class="field">
-      <label><input id="enable-wetext" type="checkbox"> 开启 WeTextProcessing</label>
+      <label><input id="enable-wetext" type="checkbox" checked> 开启 WeTextProcessing</label>
       <div class="meta">数字/日期/金额等语义级展开（首次调用耗时17秒，建议仅在需要时启用）</div>
     </div>
   </div>

@@ -487,7 +487,7 @@ func (wp *WorkerProcess) PreloadVoice(preloadID, audioPath, voice string) error 
 	return nil
 }
 
-// SynthesizeWithContextEx 执行合成
+// SynthesizeWithContextEx 执行合成（兼容旧接口，主进程未预处理时使用）
 func (wp *WorkerProcess) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
 	resp, attachment, err := wp.sendRequest(ctx, &worker.Request{
 		Type:                    worker.MsgSynthesize,
@@ -530,7 +530,49 @@ func (wp *WorkerProcess) SynthesizeWithContextEx(ctx context.Context, text strin
 	return result, nil
 }
 
-// SynthesizeStreamEx 执行流式合成
+// SynthesizeWithPreparedText 执行合成，使用主进程已预处理的文本，子进程不再调用 PrepareSynthesisTextEx
+func (wp *WorkerProcess) SynthesizeWithPreparedText(ctx context.Context, preparedText string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, seed *int) (*SynthesisResult, error) {
+	resp, attachment, err := wp.sendRequest(ctx, &worker.Request{
+		Type:                    worker.MsgSynthesize,
+		Text:                    preparedText,
+		Voice:                   voice,
+		PromptAudioPath:         promptAudioPath,
+		OutputAudioPath:         outputAudioPath,
+		PreloadID:               preloadId,
+		PreloadAudioPath:        preloadAudioPath,
+		SampleMode:              sampleMode,
+		DoSample:                doSample,
+		Streaming:               streaming,
+		MaxNewFrames:            maxNewFrames,
+		VoiceCloneMaxTextTokens: voiceCloneMaxTextTokens,
+		PreparedText:            preparedText,
+		Seed:                    seed,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	result := &SynthesisResult{
+		SampleRate:   resp.SampleRate,
+		Channels:     resp.Channels,
+		AudioSamples: resp.AudioSamples,
+		ElapsedSec:   resp.ElapsedSec,
+		AudioPath:    resp.AudioPath,
+		SampleMode:   resp.SampleMode,
+		DoSample:     resp.DoSample,
+		Streaming:    resp.Streaming,
+		TextChunks:   resp.TextChunks,
+	}
+
+	if len(attachment) > 0 {
+		result.Waveform = bytesToFloat32s(attachment)
+		result.AudioData = encodeWAV(result.Waveform, result.Channels, result.SampleRate)
+	}
+
+	return result, nil
+}
+
+// SynthesizeStreamEx 执行流式合成（兼容旧接口，主进程未预处理时使用）
 func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (<-chan StreamChunk, error) {
 	streamCh, err := wp.sendStreamRequest(ctx, &worker.Request{
 		Type:                    worker.MsgSynthesizeStream,
@@ -545,6 +587,56 @@ func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, vo
 		VoiceCloneMaxTextTokens: voiceCloneMaxTextTokens,
 		EnableRobust:            enableRobust,
 		EnableWeText:            enableWeText,
+		Seed:                    seed,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	chunkChan := make(chan StreamChunk, 64)
+	go func() {
+		defer close(chunkChan)
+		for resp := range streamCh {
+			if resp.resp.Type == worker.MsgDone || resp.resp.Type == worker.MsgCancelled {
+				return
+			}
+			if resp.resp.Type == worker.MsgError {
+				log.Printf("[WorkerProcess #%s] 流式错误: %s", wp.Name, resp.resp.Error)
+				return
+			}
+			if resp.resp.Type == worker.MsgChunk {
+				var waveform []float32
+				if len(resp.attachment) > 0 {
+					waveform = bytesToFloat32s(resp.attachment)
+				}
+				chunkChan <- StreamChunk{
+					Waveform:   waveform,
+					SampleRate: resp.resp.SampleRate,
+					Channels:   resp.resp.Channels,
+					ChunkIndex: resp.resp.ChunkIndex,
+					IsPause:    resp.resp.IsPause,
+				}
+			}
+		}
+	}()
+
+	return chunkChan, nil
+}
+
+// SynthesizeStreamWithPreparedText 执行流式合成，使用主进程已预处理的文本，子进程不再调用 PrepareSynthesisTextEx
+func (wp *WorkerProcess) SynthesizeStreamWithPreparedText(ctx context.Context, preparedText string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, seed *int) (<-chan StreamChunk, error) {
+	streamCh, err := wp.sendStreamRequest(ctx, &worker.Request{
+		Type:                    worker.MsgSynthesizeStream,
+		Text:                    preparedText,
+		Voice:                   voice,
+		PromptAudioPath:         promptAudioPath,
+		PreloadID:               preloadId,
+		PreloadAudioPath:        preloadAudioPath,
+		SampleMode:              sampleMode,
+		DoSample:                doSample,
+		MaxNewFrames:            maxNewFrames,
+		VoiceCloneMaxTextTokens: voiceCloneMaxTextTokens,
+		PreparedText:            preparedText,
 		Seed:                    seed,
 	})
 	if err != nil {

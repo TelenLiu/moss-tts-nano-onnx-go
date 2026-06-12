@@ -223,13 +223,24 @@ func workerHandleSynthesize(conn net.Conn, req *worker.Request, rt *ttsruntime.O
 	state.registerTask(req.ID, cancel)
 	defer state.unregisterTask(req.ID)
 
+	// 如果主进程已预处理文本，直接使用，子进程不再调用 PrepareSynthesisTextEx
+	text := req.Text
+	enableRobust := req.EnableRobust
+	enableWeText := req.EnableWeText
+	if req.PreparedText != "" {
+		text = req.PreparedText
+		enableRobust = false
+		enableWeText = false
+		log.Printf("[Worker] 请求 #%d 使用主进程预处理的文本，跳过文本预处理", req.ID)
+	}
+
 	result, err := rt.SynthesizeWithContextEx(
 		ctx,
-		req.Text, req.Voice, req.PromptAudioPath, req.OutputAudioPath,
+		text, req.Voice, req.PromptAudioPath, req.OutputAudioPath,
 		req.PreloadID, req.PreloadAudioPath,
 		req.SampleMode, req.DoSample, req.Streaming,
 		req.MaxNewFrames, req.VoiceCloneMaxTextTokens,
-		req.EnableRobust, req.EnableWeText, req.Seed,
+		enableRobust, enableWeText, req.Seed,
 	)
 	if err != nil {
 		// 检查是否因取消导致
@@ -277,12 +288,23 @@ func workerHandleSynthesizeStream(conn net.Conn, req *worker.Request, rt *ttsrun
 	state.registerTask(req.ID, cancel)
 	defer state.unregisterTask(req.ID)
 
+	// 如果主进程已预处理文本，直接使用，子进程不再调用 PrepareSynthesisTextEx
+	text := req.Text
+	enableRobust := req.EnableRobust
+	enableWeText := req.EnableWeText
+	if req.PreparedText != "" {
+		text = req.PreparedText
+		enableRobust = false
+		enableWeText = false
+		log.Printf("[Worker] 流式请求 #%d 使用主进程预处理的文本，跳过文本预处理", req.ID)
+	}
+
 	chunkChan, err := rt.SynthesizeStreamEx(
-		ctx, req.Text, req.Voice, req.PromptAudioPath,
+		ctx, text, req.Voice, req.PromptAudioPath,
 		req.PreloadID, req.PreloadAudioPath,
 		req.SampleMode, req.DoSample,
 		req.MaxNewFrames, req.VoiceCloneMaxTextTokens,
-		req.EnableRobust, req.EnableWeText, req.Seed,
+		enableRobust, enableWeText, req.Seed,
 	)
 	if err != nil {
 		state.safeWriteResponse(conn, req.ID, &worker.Response{Type: worker.MsgError, Error: err.Error()}, nil)

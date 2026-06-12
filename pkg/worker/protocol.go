@@ -44,6 +44,9 @@ type Request struct {
 	EnableWeText          bool   `json:"enableWeText,omitempty"`
 	Seed                  *int   `json:"seed,omitempty"`
 
+	// PreparedText 主进程已预处理好的文本，子进程直接使用不再调用 PrepareSynthesisTextEx
+	PreparedText         string `json:"preparedText,omitempty"`
+
 	// EncodeText / CountTokens 参数
 	TextContent string `json:"textContent,omitempty"`
 
