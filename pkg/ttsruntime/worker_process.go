@@ -26,6 +26,7 @@ type WorkerProcess struct {
 	conn net.Conn
 	addr string // 子进程实际监听地址
 
+	writeMu    sync.Mutex // 保护 conn 的并发写入
 	mu         sync.Mutex
 	activeReqs atomic.Int64
 	nextReqID  atomic.Int64
@@ -163,8 +164,8 @@ func (wp *WorkerProcess) readLoop() {
 
 		wp.mu.Lock()
 		ch, ok := wp.pending[resp.ID]
-		// 流式请求（MsgChunk）不删除 pending，等 MsgDone/MsgError 时才删除
-		if ok && (resp.Type == worker.MsgDone || resp.Type == worker.MsgError || resp.Type == worker.MsgResult || resp.Type == worker.MsgPong) {
+		// 终结性响应类型：删除 pending
+		if ok && (resp.Type == worker.MsgDone || resp.Type == worker.MsgError || resp.Type == worker.MsgResult || resp.Type == worker.MsgPong || resp.Type == worker.MsgCancelled) {
 			delete(wp.pending, resp.ID)
 		}
 		wp.mu.Unlock()
@@ -175,8 +176,8 @@ func (wp *WorkerProcess) readLoop() {
 	}
 }
 
-// sendRequest 发送请求并等待响应
-func (wp *WorkerProcess) sendRequest(req *worker.Request) (*worker.Response, []byte, error) {
+// sendRequest 发送请求并等待响应，支持 ctx 取消
+func (wp *WorkerProcess) sendRequest(ctx context.Context, req *worker.Request) (*worker.Response, []byte, error) {
 	if wp.isClosed() {
 		return nil, nil, fmt.Errorf("worker进程已关闭")
 	}
@@ -195,7 +196,10 @@ func (wp *WorkerProcess) sendRequest(req *worker.Request) (*worker.Response, []b
 		wp.mu.Unlock()
 	}()
 
-	if err := worker.WriteRequest(wp.conn, req, nil); err != nil {
+	wp.writeMu.Lock()
+	err := worker.WriteRequest(wp.conn, req, nil)
+	wp.writeMu.Unlock()
+	if err != nil {
 		return nil, nil, fmt.Errorf("发送请求失败: %w", err)
 	}
 
@@ -204,14 +208,22 @@ func (wp *WorkerProcess) sendRequest(req *worker.Request) (*worker.Response, []b
 		if result.resp.Type == worker.MsgError {
 			return nil, nil, fmt.Errorf("worker错误: %s", result.resp.Error)
 		}
+		if result.resp.Type == worker.MsgCancelled {
+			return nil, nil, context.Canceled
+		}
 		return result.resp, result.attachment, nil
 	case <-time.After(300 * time.Second):
 		return nil, nil, fmt.Errorf("等待worker响应超时")
+	case <-ctx.Done():
+		// 上下文被取消，通知子进程终止推理
+		log.Printf("[WorkerProcess #%d] 请求 #%d 上下文取消，发送cancel消息", wp.ID, reqID)
+		wp.sendCancel(reqID)
+		return nil, nil, ctx.Err()
 	}
 }
 
-// sendStreamRequest 发送流式请求，返回响应channel
-func (wp *WorkerProcess) sendStreamRequest(req *worker.Request) (<-chan *workerResponse, error) {
+// sendStreamRequest 发送流式请求，返回响应channel，支持 ctx 取消
+func (wp *WorkerProcess) sendStreamRequest(ctx context.Context, req *worker.Request) (<-chan *workerResponse, error) {
 	if wp.isClosed() {
 		return nil, fmt.Errorf("worker进程已关闭")
 	}
@@ -225,7 +237,10 @@ func (wp *WorkerProcess) sendStreamRequest(req *worker.Request) (<-chan *workerR
 	wp.pending[reqID] = streamCh
 	wp.mu.Unlock()
 
-	if err := worker.WriteRequest(wp.conn, req, nil); err != nil {
+	wp.writeMu.Lock()
+	err := worker.WriteRequest(wp.conn, req, nil)
+	wp.writeMu.Unlock()
+	if err != nil {
 		wp.mu.Lock()
 		delete(wp.pending, reqID)
 		wp.mu.Unlock()
@@ -233,22 +248,51 @@ func (wp *WorkerProcess) sendStreamRequest(req *worker.Request) (<-chan *workerR
 		return nil, fmt.Errorf("发送流式请求失败: %w", err)
 	}
 
-	// 包装channel，在收到 Done 后清理
+	// 包装channel，在收到终结性响应或ctx取消后清理
 	outCh := make(chan *workerResponse, 64)
 	go func() {
 		defer close(outCh)
-		for resp := range streamCh {
-			outCh <- resp
-			if resp.resp.Type == worker.MsgDone || resp.resp.Type == worker.MsgError {
-				wp.mu.Lock()
-				delete(wp.pending, reqID)
-				wp.mu.Unlock()
-				return
+
+		// 监听 ctx 取消，发送 cancel 消息
+		ctxDone := ctx.Done()
+		for {
+			select {
+			case resp, ok := <-streamCh:
+				if !ok {
+					return
+				}
+				outCh <- resp
+				if resp.resp.Type == worker.MsgDone || resp.resp.Type == worker.MsgError || resp.resp.Type == worker.MsgCancelled {
+					wp.mu.Lock()
+					delete(wp.pending, reqID)
+					wp.mu.Unlock()
+					return
+				}
+			case <-ctxDone:
+				// 上下文取消，发送 cancel 给子进程
+				log.Printf("[WorkerProcess #%d] 流式请求 #%d 上下文取消，发送cancel消息", wp.ID, reqID)
+				wp.sendCancel(reqID)
+				ctxDone = nil // 避免重复发送
+				// 继续读取子进程的 cancelled 响应
 			}
 		}
 	}()
 
 	return outCh, nil
+}
+
+// sendCancel 发送取消请求给子进程
+func (wp *WorkerProcess) sendCancel(cancelReqID int) {
+	cancelReq := &worker.Request{
+		Type:        worker.MsgCancel,
+		CancelReqID: cancelReqID,
+	}
+	wp.writeMu.Lock()
+	err := worker.WriteRequest(wp.conn, cancelReq, nil)
+	wp.writeMu.Unlock()
+	if err != nil {
+		log.Printf("[WorkerProcess #%d] 发送cancel消息失败: %v", wp.ID, err)
+	}
 }
 
 // Close 关闭子进程
@@ -293,7 +337,7 @@ func (wp *WorkerProcess) closePending(err error) {
 
 // Ping 检查子进程是否存活
 func (wp *WorkerProcess) Ping() bool {
-	resp, _, err := wp.sendRequest(&worker.Request{Type: worker.MsgPing})
+	resp, _, err := wp.sendRequest(context.Background(), &worker.Request{Type: worker.MsgPing})
 	if err != nil {
 		return false
 	}
@@ -302,7 +346,7 @@ func (wp *WorkerProcess) Ping() bool {
 
 // EncodeText 编码文本为 token IDs
 func (wp *WorkerProcess) EncodeText(text string) []int {
-	resp, _, err := wp.sendRequest(&worker.Request{
+	resp, _, err := wp.sendRequest(context.Background(), &worker.Request{
 		Type:        worker.MsgEncodeText,
 		TextContent: text,
 	})
@@ -315,7 +359,7 @@ func (wp *WorkerProcess) EncodeText(text string) []int {
 
 // CountTextTokens 计算 token 数
 func (wp *WorkerProcess) CountTextTokens(text string) int {
-	resp, _, err := wp.sendRequest(&worker.Request{
+	resp, _, err := wp.sendRequest(context.Background(), &worker.Request{
 		Type:        worker.MsgCountTokens,
 		TextContent: text,
 	})
@@ -328,7 +372,7 @@ func (wp *WorkerProcess) CountTextTokens(text string) int {
 
 // ListBuiltinVoices 列出内置音色
 func (wp *WorkerProcess) ListBuiltinVoices() []map[string]interface{} {
-	resp, _, err := wp.sendRequest(&worker.Request{Type: worker.MsgListVoices})
+	resp, _, err := wp.sendRequest(context.Background(), &worker.Request{Type: worker.MsgListVoices})
 	if err != nil {
 		log.Printf("[WorkerProcess #%d] ListBuiltinVoices失败: %v", wp.ID, err)
 		return nil
@@ -338,7 +382,7 @@ func (wp *WorkerProcess) ListBuiltinVoices() []map[string]interface{} {
 
 // PreloadVoice 预加载音色
 func (wp *WorkerProcess) PreloadVoice(preloadID, audioPath, voice string) error {
-	resp, _, err := wp.sendRequest(&worker.Request{
+	resp, _, err := wp.sendRequest(context.Background(), &worker.Request{
 		Type:      worker.MsgPreload,
 		PreloadID: preloadID,
 		AudioPath: audioPath,
@@ -354,7 +398,7 @@ func (wp *WorkerProcess) PreloadVoice(preloadID, audioPath, voice string) error 
 
 // SynthesizeWithContextEx 执行合成
 func (wp *WorkerProcess) SynthesizeWithContextEx(ctx context.Context, text string, voice string, promptAudioPath string, outputAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, streaming bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (*SynthesisResult, error) {
-	resp, attachment, err := wp.sendRequest(&worker.Request{
+	resp, attachment, err := wp.sendRequest(ctx, &worker.Request{
 		Type:                    worker.MsgSynthesize,
 		Text:                    text,
 		Voice:                   voice,
@@ -397,7 +441,7 @@ func (wp *WorkerProcess) SynthesizeWithContextEx(ctx context.Context, text strin
 
 // SynthesizeStreamEx 执行流式合成
 func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, voice string, promptAudioPath string, preloadId string, preloadAudioPath string, sampleMode string, doSample bool, maxNewFrames int, voiceCloneMaxTextTokens int, enableRobust bool, enableWeText bool, seed *int) (<-chan StreamChunk, error) {
-	streamCh, err := wp.sendStreamRequest(&worker.Request{
+	streamCh, err := wp.sendStreamRequest(ctx, &worker.Request{
 		Type:                    worker.MsgSynthesizeStream,
 		Text:                    text,
 		Voice:                   voice,
@@ -420,7 +464,7 @@ func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, vo
 	go func() {
 		defer close(chunkChan)
 		for resp := range streamCh {
-			if resp.resp.Type == worker.MsgDone {
+			if resp.resp.Type == worker.MsgDone || resp.resp.Type == worker.MsgCancelled {
 				return
 			}
 			if resp.resp.Type == worker.MsgError {

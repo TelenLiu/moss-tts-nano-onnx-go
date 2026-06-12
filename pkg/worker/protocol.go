@@ -12,6 +12,7 @@ const (
 	MsgListVoices       MessageType = "list_voices"
 	MsgPreload          MessageType = "preload"
 	MsgPing             MessageType = "ping"
+	MsgCancel           MessageType = "cancel" // 取消正在进行的推理请求
 
 	// 响应类型
 	MsgResult  MessageType = "result"
@@ -19,6 +20,7 @@ const (
 	MsgError   MessageType = "error"
 	MsgPong    MessageType = "pong"
 	MsgDone    MessageType = "done" // 流式结束标记
+	MsgCancelled MessageType = "cancelled" // 请求已被取消
 )
 
 // Request 主进程发给子进程的请求
@@ -47,6 +49,9 @@ type Request struct {
 
 	// Preload 参数
 	AudioPath string `json:"audioPath,omitempty"`
+
+	// Cancel 参数：取消指定 reqID 的推理
+	CancelReqID int `json:"cancelReqId,omitempty"`
 
 	// PromptAudioCodes 二进制数据（通过 attachment 发送）
 	HasPromptAudioCodes bool `json:"hasPromptAudioCodes,omitempty"`
