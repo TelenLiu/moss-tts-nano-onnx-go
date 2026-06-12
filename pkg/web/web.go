@@ -658,6 +658,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		SampleMode:     result.SampleMode,
 		DoSample:       result.DoSample,
 		Format:         actualFormat,
+		SeedUsed:       result.SeedUsed,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -696,6 +697,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		// MP3 模式：收集完整波形后编码返回
 		var allWaveforms [][]float32
 		var sampleRate, channels int
+		var seedUsed int64
 		for chunk := range chunkChan {
 			select {
 			case <-ctx.Done():
@@ -705,6 +707,9 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 			}
 			if len(chunk.Waveform) == 0 {
 				continue
+			}
+			if chunk.SeedUsed != 0 {
+				seedUsed = chunk.SeedUsed
 			}
 			allWaveforms = append(allWaveforms, chunk.Waveform)
 			sampleRate = chunk.SampleRate
@@ -737,6 +742,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		w.Header().Set("X-Audio-Samples", fmt.Sprintf("%d", totalSamples))
 		w.Header().Set("X-Elapsed-Seconds", fmt.Sprintf("%.2f", elapsed))
 		w.Header().Set("X-Audio-Format", "mp3")
+		w.Header().Set("X-Seed-Used", fmt.Sprintf("%d", seedUsed))
 		w.Write(mp3Data)
 		log.Printf("[API synthesize stream] MP3流式合成完成: chunks=%d totalSamples=%d elapsed=%.2fs mp3Size=%d",
 			chunkCount, totalSamples, elapsed, len(mp3Data))
@@ -745,6 +751,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 
 	// PCM 流式模式（默认 wav 格式走此路径）
 	headersSent := false
+	var seedUsed int64
 	for chunk := range chunkChan {
 		select {
 		case <-ctx.Done():
@@ -757,6 +764,10 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 			continue
 		}
 
+		if chunk.SeedUsed != 0 {
+			seedUsed = chunk.SeedUsed
+		}
+
 		if !headersSent {
 			w.Header().Set("Content-Type", "application/octet-stream")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -765,6 +776,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 			w.Header().Set("X-Audio-Codec", "pcm_f32le")
 			w.Header().Set("X-Audio-Sample-Rate", fmt.Sprintf("%d", chunk.SampleRate))
 			w.Header().Set("X-Audio-Channels", fmt.Sprintf("%d", chunk.Channels))
+			w.Header().Set("X-Seed-Used", fmt.Sprintf("%d", seedUsed))
 			w.WriteHeader(http.StatusOK)
 			headersSent = true
 		}
@@ -999,6 +1011,7 @@ type SynthesizeResponse struct {
 	SampleMode     string   `json:"sample_mode"`
 	DoSample       bool     `json:"do_sample"`
 	Format         string   `json:"format"`
+	SeedUsed       int64    `json:"seed_used"`
 }
 
 var _ = audio.WriteWAV
@@ -1136,6 +1149,8 @@ button:disabled{background:#ccc;cursor:not-allowed}
 button.secondary{background:#fff;color:#1a73e8;border:1px solid #1a73e8;padding:6px 16px;font-size:14px;margin-right:8px}
 button.secondary:hover{background:#e8f0fe}
 .result{margin-top:20px;padding:16px;background:white;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.params-info{margin-top:12px;padding:10px 16px;background:#f8f9fa;border-radius:6px;font-size:13px;color:#555;line-height:1.8;word-break:break-all}
+.params-info span{display:inline-block;background:#e8f0fe;color:#1a73e8;padding:1px 8px;border-radius:4px;margin:2px 4px 2px 0;font-family:monospace;font-size:12px}
 audio{width:100%;margin-top:12px}
 .meta{font-size:12px;color:#666;margin-top:4px}
 .error{color:#d93025}
@@ -1253,6 +1268,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
 </div>
 
 <button id="btn" onclick="doSynthesize()">开始合成</button>
+<div id="params-info" class="params-info" style="display:none"></div>
 <div id="result" class="result" style="display:none"></div>
 
 <script>
@@ -1485,7 +1501,7 @@ function getConfig() {
     sample_mode: document.getElementById('sample-mode').value,
     max_new_frames: parseInt(document.getElementById('max-new-frames').value) || 375,
     voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 300,
-    seed: seedVal === 0 ? null : seedVal,
+    seed: seedVal === 0 ? Math.floor(Math.random() * 2147483647) + 1 : seedVal,
     enable_robust: document.getElementById('enable-robust').checked,
     enable_wetext: document.getElementById('enable-wetext').checked,
     output_format: document.getElementById('output-format').value
@@ -1500,6 +1516,7 @@ async function doSynthesize() {
   const result = document.getElementById('result');
   result.style.display = 'block';
   result.innerHTML = '<p>正在合成，请稍候...</p>';
+  const paramsInfo = document.getElementById('params-info');
 
   try {
     const input = document.getElementById('prompt-audio-upload');
@@ -1553,10 +1570,17 @@ async function doSynthesize() {
       format: effectiveFormat
     };
 
+    // 显示请求参数
+    const seedInputVal = parseInt(document.getElementById('seed').value) || 0;
+    const seedDisplay = cfg.seed;
+    const seedLabel = seedInputVal === 0 ? ' (自动随机)' : '';
+    paramsInfo.style.display = 'block';
+    paramsInfo.innerHTML = '音色: <span>' + cfg.voice + '</span> 采样模式: <span>' + cfg.sample_mode + '</span> 种子: <span>' + seedDisplay + seedLabel + '</span> 最大帧数: <span>' + cfg.max_new_frames + '</span> 克隆最大文本Token: <span>' + cfg.voice_clone_max_text_tokens + '</span> 格式: <span>' + effectiveFormat + '</span> 播放模式: <span>' + playMode + '</span>';
+
     if (playMode === 'stream') {
-      await doStreamSynthesize(body, result, btn);
+      await doStreamSynthesize(body, result, btn, paramsInfo);
     } else {
-      await doBufferSynthesize(body, result, btn);
+      await doBufferSynthesize(body, result, btn, paramsInfo);
     }
   } catch (e) {
     result.innerHTML = '<p class="error">请求失败: ' + e.message + '</p>';
@@ -1565,7 +1589,7 @@ async function doSynthesize() {
   }
 }
 
-async function doBufferSynthesize(body, result, btn) {
+async function doBufferSynthesize(body, result, btn, paramsInfo) {
   result.innerHTML = '<p>正在合成语音...</p>';
   const r = await fetch('/api/synthesize', {
     method: 'POST',
@@ -1605,7 +1629,7 @@ async function doBufferSynthesize(body, result, btn) {
   btn.textContent = '开始合成';
 }
 
-async function doStreamSynthesize(body, result, btn) {
+async function doStreamSynthesize(body, result, btn, paramsInfo) {
   result.innerHTML = '<p>正在流式合成语音...</p>';
 
   const controller = new AbortController();
@@ -1627,6 +1651,7 @@ async function doStreamSynthesize(body, result, btn) {
       btn.textContent = '开始合成';
       return;
     }
+
 
     const contentType = r.headers.get('Content-Type') || '';
 

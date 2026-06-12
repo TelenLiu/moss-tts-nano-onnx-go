@@ -291,6 +291,7 @@ func workerHandleSynthesize(conn net.Conn, req *worker.Request, rt *ttsruntime.O
 		DoSample:     result.DoSample,
 		Streaming:    result.Streaming,
 		TextChunks:   result.TextChunks,
+		SeedUsed:     result.SeedUsed,
 		HasAudioData: len(attachment) > 0,
 	}, attachment)
 }
@@ -359,6 +360,7 @@ func workerHandleSynthesizeStream(conn net.Conn, req *worker.Request, rt *ttsrun
 			AudioSamples: len(chunk.Waveform) / chunk.Channels,
 			ChunkIndex:   chunk.ChunkIndex,
 			IsPause:      chunk.IsPause,
+			SeedUsed:     chunk.SeedUsed,
 			HasAudioData: len(attachment) > 0,
 		}, attachment)
 	}

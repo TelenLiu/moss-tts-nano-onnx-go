@@ -108,6 +108,9 @@ type Response struct {
 	// 流式 chunk 的 ChunkIndex
 	ChunkIndex int  `json:"chunkIndex,omitempty"`
 	IsPause    bool `json:"isPause,omitempty"`
+
+	// 实际使用的随机种子
+	SeedUsed int64 `json:"seedUsed,omitempty"`
 }
 
 // InitRequest 子进程启动时的初始化参数（通过命令行参数或 stdin 传入）

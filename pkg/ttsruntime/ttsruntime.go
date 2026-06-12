@@ -46,6 +46,7 @@ type SynthesisResult struct {
 	DoSample     bool
 	Streaming    bool
 	ElapsedSec   float64
+	SeedUsed     int64
 }
 
 type StreamChunk struct {
@@ -54,6 +55,7 @@ type StreamChunk struct {
 	Channels   int
 	ChunkIndex int
 	IsPause    bool
+	SeedUsed   int64
 }
 
 type OnnxTtsRuntime struct {
@@ -743,6 +745,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		DoSample:     doSample,
 		Streaming:    streaming,
 		ElapsedSec:   elapsed,
+		SeedUsed:     rngSeed,
 	}, nil
 }
 
@@ -922,6 +925,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		DoSample:     doSample,
 		Streaming:    streaming,
 		ElapsedSec:   elapsed,
+		SeedUsed:     rngSeed,
 	}, nil
 }
 
@@ -949,6 +953,15 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 
 		if seed != nil {
 			t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
+		}
+
+		// 记录实际使用的种子
+		var rngSeedUsed int64
+		if seed != nil {
+			rngSeedUsed = int64(*seed)
+		} else {
+			rngSeedUsed = time.Now().UnixNano()
+			t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeedUsed))
 		}
 
 		// 构建采样参数覆盖
@@ -1035,6 +1048,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 				emittedSamplesTotal += audioLength
 
 				merged := audio.MergeAudioChannels(channelArrays)
+				isFirstChunk := chunkIndex == 0 && !hasEmittedAudio
 				select {
 				case <-ctx.Done():
 					return
@@ -1044,6 +1058,12 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 					Channels:   channels,
 					ChunkIndex: chunkIndex,
 					IsPause:    false,
+					SeedUsed: func() int64 {
+						if isFirstChunk {
+							return rngSeedUsed
+						}
+						return 0
+					}(),
 				}:
 				}
 			}

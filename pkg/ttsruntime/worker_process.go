@@ -522,6 +522,7 @@ func (wp *WorkerProcess) SynthesizeWithContextEx(ctx context.Context, text strin
 		DoSample:     resp.DoSample,
 		Streaming:    resp.Streaming,
 		TextChunks:   resp.TextChunks,
+		SeedUsed:     resp.SeedUsed,
 	}
 
 	if len(attachment) > 0 {
@@ -573,6 +574,7 @@ func (wp *WorkerProcess) SynthesizeWithPreparedText(ctx context.Context, prepare
 		DoSample:     resp.DoSample,
 		Streaming:    resp.Streaming,
 		TextChunks:   resp.TextChunks,
+		SeedUsed:     resp.SeedUsed,
 	}
 
 	if len(attachment) > 0 {
@@ -625,6 +627,7 @@ func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, vo
 					Channels:   resp.resp.Channels,
 					ChunkIndex: resp.resp.ChunkIndex,
 					IsPause:    resp.resp.IsPause,
+					SeedUsed:   resp.resp.SeedUsed,
 				}
 			}
 		}
@@ -685,6 +688,7 @@ func (wp *WorkerProcess) SynthesizeStreamWithPreparedText(ctx context.Context, p
 					Channels:   resp.resp.Channels,
 					ChunkIndex: resp.resp.ChunkIndex,
 					IsPause:    resp.resp.IsPause,
+					SeedUsed:   resp.resp.SeedUsed,
 				}
 			}
 		}
