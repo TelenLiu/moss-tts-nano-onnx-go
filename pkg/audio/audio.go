@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 )
@@ -99,6 +100,7 @@ func detectMP3Encoder(ffmpegBin string) string {
 }
 
 // EncodeMP3 将 float32 波形编码为 MP3 格式，使用 ffmpeg 子进程
+// 直接 pipe float32 PCM 到 ffmpeg，跳过中间 WAV 编码
 // 如果 ffmpeg 不可用或无 MP3 编码器，回退到 WAV 格式
 func EncodeMP3(waveform []float32, channels, sampleRate int, cfg MP3EncodeConfig) ([]byte, error) {
 	ffmpegBin := GetFFmpegPath()
@@ -108,17 +110,13 @@ func EncodeMP3(waveform []float32, channels, sampleRate int, cfg MP3EncodeConfig
 		return EncodeWAV(waveform, channels, sampleRate)
 	}
 
-	// 先编码为 WAV 作为中间格式
-	wavData, err := EncodeWAV(waveform, channels, sampleRate)
-	if err != nil {
-		return nil, fmt.Errorf("编码 WAV 中间格式失败: %w", err)
-	}
-
-	// 构建 ffmpeg 命令：WAV -> MP3
+	// 直接 pipe float32 PCM 到 ffmpeg，无需中间 WAV 编码
 	args := []string{
 		"-y",
 		"-v", "fatal",
-		"-f", "wav",
+		"-f", "f32le",
+		"-ac", fmt.Sprintf("%d", channels),
+		"-ar", fmt.Sprintf("%d", sampleRate),
 		"-i", "pipe:0",
 		"-c:a", encoder,
 		"-ar", fmt.Sprintf("%d", cfg.SampleRate),
@@ -131,7 +129,11 @@ func EncodeMP3(waveform []float32, channels, sampleRate int, cfg MP3EncodeConfig
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, ffmpegBin, args...)
-	cmd.Stdin = bytes.NewReader(wavData)
+
+	// 将 float32 波形直接作为 PCM bytes 传给 ffmpeg stdin
+	pcmData := unsafe.Slice((*byte)(unsafe.Pointer(&waveform[0])), len(waveform)*4)
+	cmd.Stdin = bytes.NewReader(pcmData)
+
 	var outBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
 	cmd.Stdout = &outBuf
@@ -175,41 +177,51 @@ func EncodeWAV(waveform []float32, channels, sampleRate int) ([]byte, error) {
 	}
 	dataSize := numSamples * channels * 2
 
-	var buf bytes.Buffer
-	writeLE := func(data interface{}) {
-		binary.Write(&buf, binary.LittleEndian, data)
+	// normalizeVolume: 防止削波，保证 WAV 格式合规
+	// 仅在 maxAbs > 1.0 时归一化，避免不必要的内存分配
+	maxAbs := float32(0)
+	for _, s := range waveform {
+		if s < 0 {
+			s = -s
+		}
+		if s > maxAbs {
+			maxAbs = s
+		}
+	}
+	normFactor := float32(1.0)
+	if maxAbs > 1.0 {
+		normFactor = float32(0.95) / maxAbs
 	}
 
-	writeLE([]byte("RIFF"))
-	writeLE(uint32(36 + dataSize))
-	writeLE([]byte("WAVE"))
-	writeLE([]byte("fmt "))
-	writeLE(uint32(16))
-	writeLE(uint16(1))
-	writeLE(uint16(channels))
-	writeLE(uint32(sampleRate))
-	writeLE(uint32(sampleRate * channels * 2))
-	writeLE(uint16(channels * 2))
-	writeLE(uint16(16))
-	writeLE([]byte("data"))
-	writeLE(uint32(dataSize))
+	buf := make([]byte, 44+dataSize)
+	// RIFF header
+	copy(buf[0:4], []byte("RIFF"))
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(36+dataSize))
+	copy(buf[8:12], []byte("WAVE"))
+	copy(buf[12:16], []byte("fmt "))
+	binary.LittleEndian.PutUint32(buf[16:20], 16)
+	binary.LittleEndian.PutUint16(buf[20:22], 1)
+	binary.LittleEndian.PutUint16(buf[22:24], uint16(channels))
+	binary.LittleEndian.PutUint32(buf[24:28], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(buf[28:32], uint32(sampleRate*channels*2))
+	binary.LittleEndian.PutUint16(buf[32:34], uint16(channels*2))
+	binary.LittleEndian.PutUint16(buf[34:36], uint16(16))
+	copy(buf[36:40], []byte("data"))
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataSize))
 
-	samples := waveform
-	if channels > 1 && len(waveform)%channels != 0 {
-		samples = waveform[:numSamples*channels]
+	// PCM 数据编码，直接操作 []byte 避免反射开销
+	for i, s := range waveform {
+		s *= normFactor
+		if s > 1.0 {
+			s = 1.0
+		} else if s < -1.0 {
+			s = -1.0
+		}
+		val := int16(s * 32767)
+		binary.LittleEndian.PutUint16(buf[44+i*2:], uint16(val))
 	}
 
-	normSamples := normalizeVolume(samples)
-
-	pcmBuf := make([]byte, len(normSamples)*2)
-	for i, s := range normSamples {
-		clamped := math.Max(-1.0, math.Min(1.0, float64(s)))
-		pcm16 := int16(math.Round(clamped * 32767.0))
-		pcmBuf[i*2] = byte(pcm16)
-		pcmBuf[i*2+1] = byte(pcm16 >> 8)
-	}
-	buf.Write(pcmBuf)
-	return buf.Bytes(), nil
+	return buf, nil
 }
 
 func normalizeVolume(waveform []float32) []float32 {

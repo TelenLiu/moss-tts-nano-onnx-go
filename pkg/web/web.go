@@ -4,11 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -16,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
@@ -626,14 +625,14 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		mp3Data, err := audio.EncodeMP3(result.Waveform, result.Channels, result.SampleRate, mp3Cfg)
 		if err != nil {
 			log.Printf("[API synthesize] MP3 编码失败，回退 WAV: %v", err)
-			audioData = result.AudioData
+			audioData, _ = audio.EncodeWAV(result.Waveform, result.Channels, result.SampleRate)
 			actualFormat = "wav"
 		} else {
 			audioData = mp3Data
 			actualFormat = "mp3"
 		}
 	} else {
-		audioData = result.AudioData
+		audioData, _ = audio.EncodeWAV(result.Waveform, result.Channels, result.SampleRate)
 		actualFormat = "wav"
 	}
 
@@ -759,11 +758,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 			headersSent = true
 		}
 
-		pcmData := make([]byte, len(chunk.Waveform)*4)
-		for i, sample := range chunk.Waveform {
-			bits := math.Float32bits(sample)
-			binary.LittleEndian.PutUint32(pcmData[i*4:], bits)
-		}
+		pcmData := unsafe.Slice((*byte)(unsafe.Pointer(&chunk.Waveform[0])), len(chunk.Waveform)*4)
 
 		if _, err := w.Write(pcmData); err != nil {
 			log.Printf("[API synthesize stream] 写入流失败: %v", err)

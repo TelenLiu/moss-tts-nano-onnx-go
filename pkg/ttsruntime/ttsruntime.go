@@ -607,6 +607,14 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
 	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
 
+	// 确保推理 sessions 存在（可能被 ForceResetSessions 销毁后尚未重建）
+	if t.OrtRuntime.Onnx.Inference == nil || t.OrtRuntime.Onnx.Inference.CodecDecodeStep == nil {
+		log.Printf("[Synthesize] 推理 sessions 不存在，重新创建...")
+		if err := t.OrtRuntime.CreateSessions(); err != nil {
+			return nil, fmt.Errorf("重建推理 sessions 失败: %w", err)
+		}
+	}
+
 	// 使用流式 codec 解码，避免一次性分配大 tensor 导致内存峰值过高
 	// 注意：长文本多 chunk 时，chunk 间会 ForceResetSessions 重建 session，
 	// 所以不能用 defer 重置 streamingCodecSession，需手动管理
@@ -692,17 +700,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	}
 	waveform := audio.ConcatWaveforms(allWaveforms)
 
-	var audioData []byte
+	// AudioData 延迟编码：子进程通过 attachment 传 Waveform bytes，AudioData 由调用方按需编码
 	var resolvedOutputPath string
 	if outputAudioPath != "" {
 		resolvedOutputPath = outputAudioPath
 		if err := audio.WriteWAV(resolvedOutputPath, waveform, channels, sampleRate); err != nil {
 			return nil, fmt.Errorf("写入 WAV 文件失败: %w", err)
 		}
-	}
-	audioData, err := audio.EncodeWAV(waveform, channels, sampleRate)
-	if err != nil {
-		return nil, fmt.Errorf("编码 WAV 失败: %w", err)
 	}
 
 	// 释放中间数据，帮助 GC 回收大块内存
@@ -712,7 +716,6 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	audioSamples := len(waveform) / channels
 	return &SynthesisResult{
 		AudioPath:    resolvedOutputPath,
-		AudioData:    audioData,
 		SampleRate:   sampleRate,
 		AudioSamples: audioSamples,
 		Waveform:     waveform,
@@ -780,6 +783,14 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
 	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
 
+	// 确保推理 sessions 存在（可能被 ForceResetSessions 销毁后尚未重建）
+	if t.OrtRuntime.Onnx.Inference == nil || t.OrtRuntime.Onnx.Inference.CodecDecodeStep == nil {
+		log.Printf("[Synthesize] 推理 sessions 不存在，重新创建...")
+		if err := t.OrtRuntime.CreateSessions(); err != nil {
+			return nil, fmt.Errorf("重建推理 sessions 失败: %w", err)
+		}
+	}
+
 	// 使用流式 codec 解码，避免一次性分配大 tensor 导致内存峰值过高
 	// 注意：长文本多 chunk 时，chunk 间会 ForceResetSessions 重建 session，
 	// 所以不能用 defer 重置 streamingCodecSession，需手动管理
@@ -865,17 +876,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	}
 	waveform := audio.ConcatWaveforms(allWaveforms)
 
-	var audioData []byte
+	// AudioData 延迟编码：子进程通过 attachment 传 Waveform bytes，AudioData 由调用方按需编码
 	var resolvedOutputPath string
 	if outputAudioPath != "" {
 		resolvedOutputPath = outputAudioPath
 		if err := audio.WriteWAV(resolvedOutputPath, waveform, channels, sampleRate); err != nil {
 			return nil, fmt.Errorf("写入 WAV 文件失败: %w", err)
 		}
-	}
-	audioData, err := audio.EncodeWAV(waveform, channels, sampleRate)
-	if err != nil {
-		return nil, fmt.Errorf("编码 WAV 失败: %w", err)
 	}
 
 	// 释放中间数据，帮助 GC 回收大块内存
@@ -885,7 +892,6 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	audioSamples := len(waveform) / channels
 	return &SynthesisResult{
 		AudioPath:    resolvedOutputPath,
-		AudioData:    audioData,
 		SampleRate:   sampleRate,
 		AudioSamples: audioSamples,
 		Waveform:     waveform,
@@ -936,6 +942,16 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 		codecMeta := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
 		sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 		channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
+
+		// 确保推理 sessions 存在（可能被 ForceResetSessions 销毁后尚未重建）
+		if t.OrtRuntime.Onnx.Inference == nil || t.OrtRuntime.Onnx.Inference.CodecDecodeStep == nil {
+			log.Printf("[SynthesizeStream] 推理 sessions 不存在，重新创建...")
+			if err := t.OrtRuntime.CreateSessions(); err != nil {
+				log.Printf("[SynthesizeStream] 重建推理 sessions 失败: %v", err)
+				close(chunkChan)
+				return
+			}
+		}
 
 		// 注意：长文本多 chunk 时，chunk 间会 ForceResetSessions 重建 session，
 		// 所以不能用 defer 重置 streamingSession，需手动管理

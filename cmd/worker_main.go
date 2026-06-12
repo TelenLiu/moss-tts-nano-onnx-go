@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -16,7 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
+	"unsafe"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
@@ -341,11 +339,8 @@ func workerFloat32sToBytes(data []float32) []byte {
 	if len(data) == 0 {
 		return nil
 	}
-	buf := make([]byte, len(data)*4)
-	for i, v := range data {
-		binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(v))
-	}
-	return buf
+	// 零拷贝：float32 和 uint32 内存布局相同，直接将底层字节切片作为 []byte
+	return unsafe.Slice((*byte)(unsafe.Pointer(&data[0])), len(data)*4)
 }
 
 // 保留 unused import 引用
@@ -353,5 +348,4 @@ var (
 	_ = rand.New
 	_ = runtime.GC
 	_ = debug.FreeOSMemory
-	_ = time.Now
 )

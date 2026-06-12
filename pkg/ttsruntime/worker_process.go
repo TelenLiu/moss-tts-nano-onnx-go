@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/worker"
 )
@@ -524,7 +525,6 @@ func (wp *WorkerProcess) SynthesizeWithContextEx(ctx context.Context, text strin
 
 	if len(attachment) > 0 {
 		result.Waveform = bytesToFloat32s(attachment)
-		result.AudioData = encodeWAV(result.Waveform, result.Channels, result.SampleRate)
 	}
 
 	return result, nil
@@ -566,7 +566,6 @@ func (wp *WorkerProcess) SynthesizeWithPreparedText(ctx context.Context, prepare
 
 	if len(attachment) > 0 {
 		result.Waveform = bytesToFloat32s(attachment)
-		result.AudioData = encodeWAV(result.Waveform, result.Channels, result.SampleRate)
 	}
 
 	return result, nil
@@ -679,18 +678,39 @@ func bytesToFloat32s(data []byte) []float32 {
 	if len(data) == 0 {
 		return nil
 	}
-	count := len(data) / 4
-	result := make([]float32, count)
-	for i := range result {
-		result[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4:]))
+	if len(data)%4 != 0 {
+		// 非对齐数据回退到逐元素转换
+		count := len(data) / 4
+		result := make([]float32, count)
+		for i := range result {
+			result[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4:]))
+		}
+		return result
 	}
-	return result
+	// 零拷贝：直接将 []byte 底层内存解释为 []float32
+	count := len(data) / 4
+	return unsafe.Slice((*float32)(unsafe.Pointer(&data[0])), count)
 }
 
 func encodeWAV(waveform []float32, channels, sampleRate int) []byte {
 	numSamples := len(waveform)
 	bytesPerSample := 2
 	dataSize := numSamples * bytesPerSample
+
+	// normalizeVolume: 防止削波，保证 WAV 格式合规
+	maxAbs := float32(0)
+	for _, s := range waveform {
+		if s < 0 {
+			s = -s
+		}
+		if s > maxAbs {
+			maxAbs = s
+		}
+	}
+	normFactor := float32(1.0)
+	if maxAbs > 1.0 {
+		normFactor = 1.0 / maxAbs
+	}
 
 	buf := make([]byte, 44+dataSize)
 	copy(buf[0:4], []byte("RIFF"))
@@ -708,13 +728,13 @@ func encodeWAV(waveform []float32, channels, sampleRate int) []byte {
 	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataSize))
 
 	for i, s := range waveform {
+		s *= normFactor
+		if s > 1.0 {
+			s = 1.0
+		} else if s < -1.0 {
+			s = -1.0
+		}
 		val := int16(s * 32767)
-		if val > 32767 {
-			val = 32767
-		}
-		if val < -32768 {
-			val = -32768
-		}
 		binary.LittleEndian.PutUint16(buf[44+i*2:], uint16(val))
 	}
 
