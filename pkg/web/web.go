@@ -1567,9 +1567,11 @@ async function doBufferSynthesize(body, result, btn) {
     return;
   }
   const durationSec = data.sample_rate > 0 ? (data.audio_samples / data.sample_rate).toFixed(2) : '0.00';
+  const elapsedSecVal = data.elapsed_seconds || 0;
+  const efficiency = elapsedSecVal > 0 ? (parseFloat(durationSec) / elapsedSecVal).toFixed(2) : '0.00';
   const fmt = data.format || 'wav';
   const fmtLabel = fmt === 'mp3' ? 'MP3' : 'WAV';
-  result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + data.elapsed_seconds.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 格式: ' + fmtLabel + '</p><p>音色: ' + data.voice + ' | 采样模式: ' + data.sample_mode + ' | 分块数: ' + (data.text_chunks ? data.text_chunks.length : 0) + '</p>';
+  result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + elapsedSecVal.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 效率: ' + efficiency + 'x 格式: ' + fmtLabel + '</p><p>音色: ' + data.voice + ' | 采样模式: ' + data.sample_mode + ' | 分块数: ' + (data.text_chunks ? data.text_chunks.length : 0) + '</p>';
 
   if (data.audio_data_b64) {
     const byteCharacters = atob(data.audio_data_b64);
@@ -1628,8 +1630,9 @@ async function doStreamSynthesize(body, result, btn) {
       const audioSamples = parseInt(r.headers.get('X-Audio-Samples') || '0');
       const sampleRate = parseInt(r.headers.get('X-Audio-Sample-Rate') || '0');
       const durationSec = sampleRate > 0 ? (audioSamples / sampleRate).toFixed(2) : '0.00';
+      const efficiency = elapsedSec > 0 ? (parseFloat(durationSec) / elapsedSec).toFixed(2) : '0.00';
 
-      result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + elapsedSec.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 格式: MP3</p>';
+      result.innerHTML = '<p><strong>合成完成!</strong> 耗时: ' + elapsedSec.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 效率: ' + efficiency + 'x 格式: MP3</p>';
       result.appendChild(audioEl);
       btn.disabled = false;
       btn.textContent = '开始合成';
@@ -1695,8 +1698,9 @@ async function doStreamSynthesize(body, result, btn) {
     }
 
     const durationSec = sampleRate > 0 ? (totalSamplesReceived / sampleRate).toFixed(2) : '0.00';
-    const elapsedSec = ((performance.now() - streamStartTime) / 1000).toFixed(2);
-    result.querySelector('p').innerHTML = '<strong>流式合成完成!</strong> 耗时: ' + elapsedSec + '秒 音频时长: ' + durationSec + '秒 格式: WAV (共 ' + chunkCount + ' 个音频块)';
+    const elapsedSec = (performance.now() - streamStartTime) / 1000;
+    const efficiency = elapsedSec > 0 ? (parseFloat(durationSec) / elapsedSec).toFixed(2) : '0.00';
+    result.querySelector('p').innerHTML = '<strong>流式合成完成!</strong> 耗时: ' + elapsedSec.toFixed(2) + '秒 音频时长: ' + durationSec + '秒 效率: ' + efficiency + 'x 格式: WAV (共 ' + chunkCount + ' 个音频块)';
   } catch (e) {
     if (e.name === 'AbortError') {
       result.innerHTML = '<p class="error">请求超时</p>';
