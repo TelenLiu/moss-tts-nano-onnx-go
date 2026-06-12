@@ -10,9 +10,10 @@ import (
 
 // Config 表示 conf/onnx.json 的内容。
 type Config struct {
-	WorkCores int `json:"workCores"` // 最大同时启动的推理单元数（默认1，至少1）
-	CoreCPUs  int `json:"coreCPUs"`  // 每个推理单元最大允许的CPU内核数（默认4，至少1）
-	CoreMemMB int `json:"coreMemMB"` // 每个推理单元的内存阈值MB（默认800,单元内存峰值控制在3.2GB），超过时触发Session重置
+	WorkCores        int `json:"workCores"`        // 常驻内存的推理单元数（默认1，至少1），进程命名从1开始
+	ReserveWorkCores int `json:"reserveWorkCores"` // 预留备用推理单元数（默认0），闲置1分钟自动销毁，进程命名从r1开始
+	CoreCPUs         int `json:"coreCPUs"`         // 每个推理单元最大允许的CPU内核数（默认4，至少1）
+	CoreMemMB        int `json:"coreMemMB"`        // 每个推理单元的内存阈值MB（默认800,单元内存峰值控制在3.2GB），超过时触发Session重置
 }
 
 // DefaultConfigPath 返回默认配置文件路径。
@@ -24,9 +25,10 @@ func DefaultConfigPath() string {
 // DefaultConfig 返回默认配置。
 func DefaultConfig() *Config {
 	return &Config{
-		WorkCores: 1,
-		CoreCPUs:  4,
-		CoreMemMB: 800,
+		WorkCores:        1,
+		ReserveWorkCores: 0,
+		CoreCPUs:         4,
+		CoreMemMB:        800,
 	}
 }
 
@@ -60,17 +62,21 @@ func normalize(cfg *Config) *Config {
 	if cfg.WorkCores < 1 {
 		cfg.WorkCores = 1
 	}
+	if cfg.ReserveWorkCores < 0 {
+		cfg.ReserveWorkCores = 0
+	}
 	if cfg.CoreCPUs < 1 {
 		cfg.CoreCPUs = 1
 	}
 	if cfg.CoreMemMB < 100 {
 		cfg.CoreMemMB = 800
 	}
-	// 约束：workCores * coreCPUs 不超过 CPU 核心数
+	// 约束：(workCores + reserveWorkCores) * coreCPUs 不超过 CPU 核心数
 	totalCores := runtime.NumCPU()
-	if cfg.WorkCores*cfg.CoreCPUs > totalCores {
+	maxCores := cfg.WorkCores + cfg.ReserveWorkCores
+	if maxCores*cfg.CoreCPUs > totalCores {
 		// 优先保证 workCores，缩减 coreCPUs
-		cfg.CoreCPUs = totalCores / cfg.WorkCores
+		cfg.CoreCPUs = totalCores / maxCores
 		if cfg.CoreCPUs < 1 {
 			cfg.CoreCPUs = 1
 		}

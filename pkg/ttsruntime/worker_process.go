@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,10 +22,12 @@ import (
 
 // WorkerProcess 管理一个子进程推理单元
 type WorkerProcess struct {
-	ID   int
+	Name string // 进程命名：workCore从1开始，reserveCore从r1开始
 	cmd  *exec.Cmd
 	conn net.Conn
 	addr string // 子进程实际监听地址
+
+	workerExePath string // 子进程可执行文件路径（硬链接/副本），Close 时需清理
 
 	writeMu    sync.Mutex // 保护 conn 的并发写入
 	mu         sync.Mutex
@@ -39,10 +42,83 @@ type workerResponse struct {
 	attachment []byte
 }
 
+// workerExeDir 存放子进程可执行文件副本的子目录名
+const workerExeDir = ".workers"
+
+// createWorkerExe 为子进程创建一个带序号的可执行文件副本，
+// 使子进程在活动监视器/ps中显示独立的进程名（如 moss-tts-worker-1、moss-tts-worker-r1）。
+// 优先使用符号链接（symlink），不占用磁盘空间；失败时回退到文件复制。
+// 文件存放在 .workers 子目录中，Close 时清理。
+func createWorkerExe(exePath, name string) string {
+	exeDir := filepath.Dir(exePath)
+	workersDir := filepath.Join(exeDir, workerExeDir)
+
+	// 确保 .workers 目录存在
+	if err := os.MkdirAll(workersDir, 0755); err != nil {
+		log.Printf("[WorkerProcess] 创建worker目录失败: %v, 使用原始路径", err)
+		return exePath
+	}
+
+	target := filepath.Join(workersDir, "moss-tts-worker-"+name)
+
+	// 检查目标文件是否已存在
+	fi2, err2 := os.Lstat(target)
+	if err2 == nil {
+		// 目标已存在，检查是否是符号链接指向正确的源文件
+		if fi2.Mode()&os.ModeSymlink != 0 {
+			linkTarget, err := os.Readlink(target)
+			if err == nil && linkTarget == exePath {
+				log.Printf("[WorkerProcess] 复用已有的 worker 符号链接: %s", target)
+				return target
+			}
+		} else if fi2.Mode().IsRegular() {
+			// 是普通文件（副本），检查是否与源文件相同
+			fi1, err1 := os.Stat(exePath)
+			if err1 == nil && !os.SameFile(fi1, fi2) && fi1.Size() == fi2.Size() {
+				log.Printf("[WorkerProcess] 复用已有的 worker 副本: %s", target)
+				return target
+			}
+		}
+		// 文件存在但不匹配，删除重建
+		os.Remove(target)
+	}
+
+	// 优先尝试符号链接（不占用磁盘空间）
+	if err := os.Symlink(exePath, target); err == nil {
+		log.Printf("[WorkerProcess] 创建 worker 符号链接: %s -> %s", target, exePath)
+		return target
+	}
+
+	// 符号链接失败，回退到文件复制
+	src, err := os.Open(exePath)
+	if err != nil {
+		log.Printf("[WorkerProcess] 无法打开源文件创建worker副本: %v, 使用原始路径", err)
+		return exePath
+	}
+	defer src.Close()
+
+	dst, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		log.Printf("[WorkerProcess] 无法创建worker副本文件: %v, 使用原始路径", err)
+		return exePath
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		os.Remove(target)
+		log.Printf("[WorkerProcess] 复制worker可执行文件失败: %v, 使用原始路径", err)
+		return exePath
+	}
+
+	log.Printf("[WorkerProcess] 创建 worker 副本: %s", target)
+	return target
+}
+
 // NewWorkerProcess 启动一个子进程推理单元
-func NewWorkerProcess(id int, modelDir string, threadCount int, coreMemMB int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*WorkerProcess, error) {
+// name: 进程命名标识，如 "1","2" 或 "r1","r2"
+func NewWorkerProcess(name string, modelDir string, threadCount int, coreMemMB int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*WorkerProcess, error) {
 	wp := &WorkerProcess{
-		ID:      id,
+		Name:    name,
 		pending: make(map[int]chan *workerResponse),
 	}
 
@@ -51,6 +127,10 @@ func NewWorkerProcess(id int, modelDir string, threadCount int, coreMemMB int, m
 	if err != nil {
 		return nil, fmt.Errorf("获取可执行文件路径失败: %w", err)
 	}
+
+	// 为子进程创建带序号的可执行文件副本，以便活动监视器显示独立进程名
+	workerPath := createWorkerExe(exePath, name)
+	wp.workerExePath = workerPath
 
 	// 准备初始化参数
 	maxFrames := 375
@@ -70,8 +150,8 @@ func NewWorkerProcess(id int, modelDir string, threadCount int, coreMemMB int, m
 
 	initJSON := marshalJSON(initReq)
 
-	// 启动子进程
-	cmd := exec.Command(exePath, "worker")
+	// 启动子进程（使用 worker 副本路径，使进程名显示为 moss-tts-worker）
+	cmd := exec.Command(workerPath, "worker")
 	cmd.Stderr = os.Stderr
 
 	// 通过 stdin 传递初始化参数
@@ -134,7 +214,7 @@ func NewWorkerProcess(id int, modelDir string, threadCount int, coreMemMB int, m
 
 	wp.cmd = cmd
 	wp.addr = addr
-	log.Printf("[WorkerProcess #%d] 子进程已启动, addr=%s, pid=%d", id, addr, cmd.Process.Pid)
+	log.Printf("[WorkerProcess #%s] 子进程已启动, addr=%s, pid=%d", name, addr, cmd.Process.Pid)
 
 	// 连接到子进程
 	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
@@ -156,7 +236,7 @@ func (wp *WorkerProcess) readLoop() {
 		resp, attachment, err := worker.ReadResponse(wp.conn)
 		if err != nil {
 			if !wp.isClosed() {
-				log.Printf("[WorkerProcess #%d] 读取响应失败: %v", wp.ID, err)
+				log.Printf("[WorkerProcess #%s] 读取响应失败: %v", wp.Name, err)
 			}
 			wp.closePending(fmt.Errorf("连接断开: %w", err))
 			return
@@ -216,7 +296,7 @@ func (wp *WorkerProcess) sendRequest(ctx context.Context, req *worker.Request) (
 		return nil, nil, fmt.Errorf("等待worker响应超时")
 	case <-ctx.Done():
 		// 上下文被取消，通知子进程终止推理
-		log.Printf("[WorkerProcess #%d] 请求 #%d 上下文取消，发送cancel消息", wp.ID, reqID)
+		log.Printf("[WorkerProcess #%s] 请求 #%d 上下文取消，发送cancel消息", wp.Name, reqID)
 		wp.sendCancel(reqID)
 		return nil, nil, ctx.Err()
 	}
@@ -270,7 +350,7 @@ func (wp *WorkerProcess) sendStreamRequest(ctx context.Context, req *worker.Requ
 				}
 			case <-ctxDone:
 				// 上下文取消，发送 cancel 给子进程
-				log.Printf("[WorkerProcess #%d] 流式请求 #%d 上下文取消，发送cancel消息", wp.ID, reqID)
+				log.Printf("[WorkerProcess #%s] 流式请求 #%d 上下文取消，发送cancel消息", wp.Name, reqID)
 				wp.sendCancel(reqID)
 				ctxDone = nil // 避免重复发送
 				// 继续读取子进程的 cancelled 响应
@@ -291,7 +371,7 @@ func (wp *WorkerProcess) sendCancel(cancelReqID int) {
 	err := worker.WriteRequest(wp.conn, cancelReq, nil)
 	wp.writeMu.Unlock()
 	if err != nil {
-		log.Printf("[WorkerProcess #%d] 发送cancel消息失败: %v", wp.ID, err)
+		log.Printf("[WorkerProcess #%s] 发送cancel消息失败: %v", wp.Name, err)
 	}
 }
 
@@ -314,6 +394,17 @@ func (wp *WorkerProcess) Close() {
 		case <-done:
 		case <-time.After(5 * time.Second):
 			wp.cmd.Process.Kill()
+		}
+	}
+
+	// 清理子进程可执行文件副本，不影响主进程
+	if wp.workerExePath != "" {
+		exePath, _ := os.Executable()
+		if wp.workerExePath != exePath {
+			os.Remove(wp.workerExePath)
+			// 尝试清理 .workers 目录（目录为空时删除）
+			workersDir := filepath.Join(filepath.Dir(exePath), workerExeDir)
+			os.Remove(workersDir) // 仅在目录为空时成功
 		}
 	}
 }
@@ -351,7 +442,7 @@ func (wp *WorkerProcess) EncodeText(text string) []int {
 		TextContent: text,
 	})
 	if err != nil {
-		log.Printf("[WorkerProcess #%d] EncodeText失败: %v", wp.ID, err)
+		log.Printf("[WorkerProcess #%s] EncodeText失败: %v", wp.Name, err)
 		return nil
 	}
 	return resp.TokenIDs
@@ -364,7 +455,7 @@ func (wp *WorkerProcess) CountTextTokens(text string) int {
 		TextContent: text,
 	})
 	if err != nil {
-		log.Printf("[WorkerProcess #%d] CountTextTokens失败: %v", wp.ID, err)
+		log.Printf("[WorkerProcess #%s] CountTextTokens失败: %v", wp.Name, err)
 		return 0
 	}
 	return resp.TokenCount
@@ -374,7 +465,7 @@ func (wp *WorkerProcess) CountTextTokens(text string) int {
 func (wp *WorkerProcess) ListBuiltinVoices() []map[string]interface{} {
 	resp, _, err := wp.sendRequest(context.Background(), &worker.Request{Type: worker.MsgListVoices})
 	if err != nil {
-		log.Printf("[WorkerProcess #%d] ListBuiltinVoices失败: %v", wp.ID, err)
+		log.Printf("[WorkerProcess #%s] ListBuiltinVoices失败: %v", wp.Name, err)
 		return nil
 	}
 	return resp.Voices
@@ -468,7 +559,7 @@ func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, vo
 				return
 			}
 			if resp.resp.Type == worker.MsgError {
-				log.Printf("[WorkerProcess #%d] 流式错误: %s", wp.ID, resp.resp.Error)
+				log.Printf("[WorkerProcess #%s] 流式错误: %s", wp.Name, resp.resp.Error)
 				return
 			}
 			if resp.resp.Type == worker.MsgChunk {

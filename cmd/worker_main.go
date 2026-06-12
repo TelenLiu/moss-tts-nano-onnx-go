@@ -71,11 +71,6 @@ func (s *workerConnState) safeWriteResponse(conn net.Conn, id int, resp *worker.
 }
 
 func workerMain() {
-	// 设置进程标题，便于在活动监视器中区分主进程和子进程
-	if len(os.Args) > 0 {
-		os.Args[0] = "moss-tts-worker"
-	}
-
 	// 从 stdin 读取初始化参数
 	var initReq worker.InitRequest
 	if err := json.NewDecoder(os.Stdin).Decode(&initReq); err != nil {

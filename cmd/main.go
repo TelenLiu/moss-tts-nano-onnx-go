@@ -149,7 +149,7 @@ func runInfer(args []string) {
 	}
 
 	log.Printf("初始化 TTS 运行时 (model_dir=%s threads=%d mode=%s)...", cfg.ModelDir, *cpuThreads, *executionMode)
-	wp, err := ttsruntime.NewWorkerProcess(0, cfg.ModelDir, *cpuThreads, 0, &maxFrames, &doSampleBool, sampleMode, *executionMode)
+	wp, err := ttsruntime.NewWorkerProcess("0", cfg.ModelDir, *cpuThreads, 0, &maxFrames, &doSampleBool, sampleMode, *executionMode)
 	if err != nil {
 		log.Fatalf("初始化 TTS 运行时失败: %v", err)
 	}

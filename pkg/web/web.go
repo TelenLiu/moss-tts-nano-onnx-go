@@ -90,7 +90,7 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, ho
 		log.Printf("[Server] 加载 onnx 配置失败，使用默认值: %v", err)
 		onnxCfg = onnxconfig.DefaultConfig()
 	}
-	log.Printf("[Server] ONNX 配置: workCores=%d coreCPUs=%d", onnxCfg.WorkCores, onnxCfg.CoreCPUs)
+	log.Printf("[Server] ONNX 配置: workCores=%d reserveWorkCores=%d coreCPUs=%d", onnxCfg.WorkCores, onnxCfg.ReserveWorkCores, onnxCfg.CoreCPUs)
 
 	s := &Server{
 		Cfg:             cfg,
@@ -303,7 +303,7 @@ func (s *Server) backgroundInit() {
 
 	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("设备检测完成: CPU %d核, GPU %v", deviceInfo.CPUInfo.NumCores, deviceInfo.HasGPU), Percent: 74})
 
-	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("正在加载 TTS 模型 (workCores=%d coreCPUs=%d)...", s.OnnxConfig.WorkCores, s.OnnxConfig.CoreCPUs), Percent: 75})
+	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("正在加载 TTS 模型 (workCores=%d reserveWorkCores=%d coreCPUs=%d)...", s.OnnxConfig.WorkCores, s.OnnxConfig.ReserveWorkCores, s.OnnxConfig.CoreCPUs), Percent: 75})
 	pool, err := ttsruntime.NewPoolFromConfig(
 		s.Cfg.ModelDir, s.OnnxConfig,
 		&s.MaxNewFrames, nil, nil, s.ExecutionMode,
@@ -312,7 +312,7 @@ func (s *Server) backgroundInit() {
 		s.emit(ProgressEvent{Phase: "error", Message: fmt.Sprintf("TTS 运行时初始化失败: %v", err), Error: fmt.Sprintf("TTS 运行时初始化失败: %v", err)})
 		return
 	}
-	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("TTS 模型加载完成 (%d 个推理单元)", pool.WorkCoreCount()), Percent: 95})
+	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("TTS 模型加载完成 (常驻核心=%d, 最大预留=%d)", pool.WorkCoreCount(), s.OnnxConfig.ReserveWorkCores), Percent: 95})
 
 	s.mu.Lock()
 	s.Pool = pool
@@ -462,8 +462,10 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 	if pool != nil {
 		response["onnx_pool"] = map[string]interface{}{
-			"work_cores": pool.WorkCoreCount(),
-			"cores":      pool.Status(),
+			"work_cores":        pool.WorkCoreCount(),
+			"reserve_cores":     pool.ReserveCoreCount(),
+			"pending_requests":  pool.PendingCount(),
+			"cores":             pool.Status(),
 		}
 	}
 
