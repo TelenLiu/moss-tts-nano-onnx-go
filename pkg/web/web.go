@@ -314,6 +314,15 @@ func (s *Server) backgroundInit() {
 	}
 	s.emit(ProgressEvent{Phase: "load", Message: fmt.Sprintf("TTS 模型加载完成 (常驻核心=%d, 最大预留=%d)", pool.WorkCoreCount(), s.OnnxConfig.ReserveWorkCores), Percent: 95})
 
+	// 启动音频克隆缓存定时清理（主进程负责，子进程共享同一目录）
+	audioCloneCacheDir := filepath.Join(filepath.Dir(s.Cfg.ModelDir), "cache", "audio_clone_gob")
+	audioCloneCache := ttsruntime.NewAudioCloneCache(audioCloneCacheDir)
+	expHours := s.OnnxConfig.AudioCloneGobExpHour
+	if expHours <= 0 {
+		expHours = 24
+	}
+	audioCloneCache.StartCleanupLoop(expHours, 1*time.Hour)
+
 	s.mu.Lock()
 	s.Pool = pool
 	s.mu.Unlock()

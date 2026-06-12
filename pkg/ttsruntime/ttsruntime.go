@@ -57,7 +57,8 @@ type OnnxTtsRuntime struct {
 	OrtRuntime        *ortruntime.OrtCpuRuntime
 	SPModel           *tokenizer.Processor
 	PreloadCache      *PreloadCache
-	MemoryThresholdMB int // 长文本多 chunk 推理时，单 chunk 处理后的内存上限MB，超过此阈值触发 ForceResetSessions
+	AudioCloneCache   *AudioCloneCache // 音频克隆编码的文件缓存（hash key + gob，跨进程共享）
+	MemoryThresholdMB int              // 长文本多 chunk 推理时，单 chunk 处理后的内存上限MB，超过此阈值触发 ForceResetSessions
 }
 
 func NewOnnxTtsRuntime(modelDir string, threadCount int, coreMemMB int, maxNewFrames *int, doSample *bool, sampleMode *string, executionMode string) (*OnnxTtsRuntime, error) {
@@ -89,6 +90,9 @@ func NewOnnxTtsRuntime(modelDir string, threadCount int, coreMemMB int, maxNewFr
 		SPModel:           sp,
 		MemoryThresholdMB: coreMemMB,
 	}
+	// 使用 cache/audio_clone_gob 作为音频克隆编码缓存目录（跨进程共享）
+	audioCloneCacheDir := filepath.Join(filepath.Dir(modelDir), "lib", "cache", "audio_clone_gob")
+	ttsRuntime.AudioCloneCache = NewAudioCloneCache(audioCloneCacheDir)
 	// 使用 lib/cache/assets_preload 作为缓存目录
 	cacheDir := filepath.Join(filepath.Dir(modelDir), "lib", "cache", "assets_preload")
 	ttsRuntime.PreloadCache = NewPreloadCache(cacheDir, 2, ttsRuntime)
@@ -393,7 +397,25 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 }
 
 func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
+	// 计算音频文件 hash，用于文件缓存 key
+	hashKey, err := t.AudioCloneCache.HashAudioFile(audioPath)
+	if err != nil {
+		log.Printf("[EncodeReferenceAudio] 计算音频hash失败: %v, 跳过缓存", err)
+	} else {
+		// 先查文件缓存，命中则直接返回，跳过阶段1
+		if cached := t.AudioCloneCache.Get(hashKey); cached != nil {
+			return cached
+		}
+	}
+
 	log.Printf("[EncodeReferenceAudio] 开始编码参考音频: %s", audioPath)
+
+	// ========== 阶段1：音频编码 ==========
+	// 先销毁阶段2的推理 session，确保只有 CodecEncode 在内存中，避免峰值叠加
+	log.Printf("[EncodeReferenceAudio] [阶段1] 销毁推理 sessions，切换到音频编码阶段...")
+	t.OrtRuntime.DestroyAllSessions()
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	codecConfig := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
 	targetSampleRate := int(ortruntime.ToFloat64(codecConfig["sample_rate"]))
@@ -404,6 +426,8 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	waveform, channels, sampleRate, err := audio.LoadReferenceAudio(audioPath, targetSampleRate, targetChannels)
 	if err != nil {
 		log.Printf("[EncodeReferenceAudio] 加载参考音频失败: %v, 使用内置音色", err)
+		// 加载失败，直接进入阶段2
+		t.OrtRuntime.CreateSessions()
 		return nil
 	}
 	log.Printf("[EncodeReferenceAudio] 加载完成: 原始采样率=%d 通道数=%d 总样本数=%d", sampleRate, channels, len(waveform))
@@ -427,13 +451,25 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	inputs := []ort.Value{waveformTensor, inputLengthsTensor}
 	outputs := make([]ort.Value, 2)
 
-	log.Printf("[EncodeReferenceAudio] 调用 codec_encode...")
+	log.Printf("[EncodeReferenceAudio] [阶段1] 创建 CodecEncode session 并编码...")
+
+	// 懒加载 CodecEncode session（此时推理 session 已销毁，不会内存叠加）
+	if err := t.OrtRuntime.EnsureCodecEncodeSession(); err != nil {
+		log.Printf("[EncodeReferenceAudio] CodecEncode session 创建失败: %v, 使用内置音色", err)
+		t.OrtRuntime.CreateSessions()
+		return nil
+	}
+
 	err = t.OrtRuntime.RunSession(t.OrtRuntime.Onnx.CodecEncode.Session, inputs, outputs)
 	waveformTensor.Destroy()
 	inputLengthsTensor.Destroy()
 
 	if err != nil {
 		log.Printf("[EncodeReferenceAudio] codec_encode 失败: %v, 使用内置音色", err)
+		t.OrtRuntime.DestroyCodecEncodeSession()
+		runtime.GC()
+		debug.FreeOSMemory()
+		t.OrtRuntime.CreateSessions()
 		return nil
 	}
 
@@ -480,6 +516,26 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	} else {
 		log.Printf("[EncodeReferenceAudio] 参考音频编码完成: 0 帧")
 	}
+
+	// 缓存编码结果到文件，后续相同音频无需再调用 CodecEncode
+	if hashKey != "" {
+		if err := t.AudioCloneCache.Put(hashKey, promptAudioCodes); err != nil {
+			log.Printf("[EncodeReferenceAudio] 写入缓存失败: %v", err)
+		}
+	}
+
+	// ========== 阶段1结束 → 阶段2准备 ==========
+	// 销毁 CodecEncode session，释放阶段1内存，然后重建推理 session
+	log.Printf("[EncodeReferenceAudio] [阶段1→阶段2] 销毁 CodecEncode，重建推理 sessions...")
+	t.OrtRuntime.DestroyCodecEncodeSession()
+	runtime.GC()
+	debug.FreeOSMemory()
+
+	// 重建推理 sessions（阶段2）
+	if err := t.OrtRuntime.CreateSessions(); err != nil {
+		log.Printf("[EncodeReferenceAudio] 重建推理 sessions 失败: %v", err)
+	}
+
 	return promptAudioCodes
 }
 
@@ -496,12 +552,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 
 	t.OrtRuntime.AcquireSession()
 	defer t.OrtRuntime.ReleaseSession()
-	// 跟踪是否被中断，中断时需要强制重置 Session 释放 ONNX 内存池
+	// 推理结束后（无论正常完成还是中断），执行内存清理
 	interrupted := false
 	defer func() {
+		runtime.GC()
+		debug.FreeOSMemory()
 		if interrupted {
-			runtime.GC()
-			debug.FreeOSMemory()
+			// 中断时强制重置 Session，释放 ONNX 内存池
 			t.OrtRuntime.ForceResetSessions()
 			log.Printf("[Synthesize] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
 		}
@@ -509,6 +566,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 
 	t.OrtRuntime.CheckAndReleaseIdleSessions()
 
+	log.Printf("[Synthesize] ========== 阶段1：音频编码 ==========")
 	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q preloadId=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, preloadId, sampleMode, doSample, maxNewFrames)
 
 	var rngSeed int64 = 1234
@@ -532,6 +590,10 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		promptAudioCodes = truncatePromptAudioCodes(promptAudioCodes, defaultMaxPromptAudioFrames)
 		log.Printf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
 	}
+
+	// ========== 阶段2：TTS 推理 ==========
+	// 此时阶段1的 CodecEncode session 已销毁，只有推理 session 在内存中
+	log.Printf("[Synthesize] ========== 阶段2：TTS 推理 ==========")
 	textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
 	log.Printf("[Synthesize] 文本分块: %d 块", len(textChunks))
 	for i, chunk := range textChunks {
@@ -545,7 +607,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	// 使用流式 codec 解码，避免一次性分配大 tensor 导致内存峰值过高
 	// 注意：长文本多 chunk 时，chunk 间会 ForceResetSessions 重建 session，
 	// 所以不能用 defer 重置 streamingCodecSession，需手动管理
-	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
+	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.Inference.CodecDecodeStep.Session, t.OrtRuntime)
 
 	var allWaveforms [][]float32
 	for chunkIndex, chunkText := range textChunks {
@@ -665,12 +727,13 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 
 	t.OrtRuntime.AcquireSession()
 	defer t.OrtRuntime.ReleaseSession()
-	// 跟踪是否被中断，中断时需要强制重置 Session 释放 ONNX 内存池
+	// 推理结束后（无论正常完成还是中断），执行内存清理
 	interrupted := false
 	defer func() {
+		runtime.GC()
+		debug.FreeOSMemory()
 		if interrupted {
-			runtime.GC()
-			debug.FreeOSMemory()
+			// 中断时强制重置 Session，释放 ONNX 内存池
 			t.OrtRuntime.ForceResetSessions()
 			log.Printf("[Synthesize] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
 		}
@@ -717,7 +780,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	// 使用流式 codec 解码，避免一次性分配大 tensor 导致内存峰值过高
 	// 注意：长文本多 chunk 时，chunk 间会 ForceResetSessions 重建 session，
 	// 所以不能用 defer 重置 streamingCodecSession，需手动管理
-	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
+	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.Inference.CodecDecodeStep.Session, t.OrtRuntime)
 
 	var allWaveforms [][]float32
 	for chunkIndex, chunkText := range textChunks {
@@ -842,12 +905,13 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 		t.OrtRuntime.AcquireSession()
 		defer t.OrtRuntime.ReleaseSession()
 
-		// 跟踪是否被中断，中断时需要强制重置 Session 释放 ONNX 内存池
+		// 推理结束后（无论正常完成还是中断），执行内存清理
 		interrupted := false
 		defer func() {
+			runtime.GC()
+			debug.FreeOSMemory()
 			if interrupted {
-				runtime.GC()
-				debug.FreeOSMemory()
+				// 中断时强制重置 Session，释放 ONNX 内存池
 				t.OrtRuntime.ForceResetSessions()
 				log.Printf("[SynthesizeStream] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
 			}
@@ -872,7 +936,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 
 		// 注意：长文本多 chunk 时，chunk 间会 ForceResetSessions 重建 session，
 		// 所以不能用 defer 重置 streamingSession，需手动管理
-		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
+		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.Inference.CodecDecodeStep.Session, t.OrtRuntime)
 		if streamingSession == nil {
 			log.Printf("[SynthesizeStream] 错误: 无法创建流式解码会话")
 			return
@@ -1194,7 +1258,7 @@ func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortrun
 		return streamingCodecSession, false
 	}
 	// 4. 用新 Session 重建 codec streaming session
-	newSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.CodecDecodeStep.Session, t.OrtRuntime)
+	newSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.Inference.CodecDecodeStep.Session, t.OrtRuntime)
 	logMemoryStats(chunkLabel + " ForceResetSessions后")
 	return newSession, true
 }
