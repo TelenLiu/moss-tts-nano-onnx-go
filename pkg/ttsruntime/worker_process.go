@@ -722,21 +722,6 @@ func encodeWAV(waveform []float32, channels, sampleRate int) []byte {
 	bytesPerSample := 2
 	dataSize := numSamples * bytesPerSample
 
-	// normalizeVolume: 防止削波，保证 WAV 格式合规
-	maxAbs := float32(0)
-	for _, s := range waveform {
-		if s < 0 {
-			s = -s
-		}
-		if s > maxAbs {
-			maxAbs = s
-		}
-	}
-	normFactor := float32(1.0)
-	if maxAbs > 1.0 {
-		normFactor = 1.0 / maxAbs
-	}
-
 	buf := make([]byte, 44+dataSize)
 	copy(buf[0:4], []byte("RIFF"))
 	binary.LittleEndian.PutUint32(buf[4:8], uint32(36+dataSize))
@@ -752,14 +737,14 @@ func encodeWAV(waveform []float32, channels, sampleRate int) []byte {
 	copy(buf[36:40], []byte("data"))
 	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataSize))
 
+	// 与 Python 一致：使用硬削波（clip）+ 四舍五入，不做整体归一化
 	for i, s := range waveform {
-		s *= normFactor
 		if s > 1.0 {
 			s = 1.0
 		} else if s < -1.0 {
 			s = -1.0
 		}
-		val := int16(s * 32767)
+		val := int16(math.Round(float64(s) * 32767.0))
 		binary.LittleEndian.PutUint16(buf[44+i*2:], uint16(val))
 	}
 

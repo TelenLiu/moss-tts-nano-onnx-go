@@ -28,6 +28,9 @@ import (
 const (
 	DefaultInterChunkPauseShortSec = 0.40
 	DefaultInterChunkPauseLongSec  = 0.24
+	// ChunkContextFrames 每个 chunk 从前一个 chunk 继承的音频帧数，用于提供声学上下文
+	// 减少chunk衔接处的音色突变和杂音
+	ChunkContextFrames = 8
 )
 
 var SentenceEndPunctuation = map[rune]bool{'.': true, '!': true, '?': true, '。': true, '！': true, '？': true, '；': true, ';': true}
@@ -641,6 +644,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.Inference.CodecDecodeStep.Session, t.OrtRuntime)
 
 	var allWaveforms [][]float32
+	var prevChunkTailFrames [][]int // 前一个 chunk 的最后几帧，作为下一个 chunk 的声学上下文
 	for chunkIndex, chunkText := range textChunks {
 		select {
 		case <-ctx.Done():
@@ -655,9 +659,22 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
+		// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
+		t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+
 		textTokenIDs := t.EncodeText(chunkText)
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
-		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
+
+		// 将前一个 chunk 的尾部帧作为声学上下文追加到参考音频后面
+		chunkPromptCodes := promptAudioCodes
+		if chunkIndex > 0 && len(prevChunkTailFrames) > 0 {
+			chunkPromptCodes = make([][]int, len(promptAudioCodes), len(promptAudioCodes)+len(prevChunkTailFrames))
+			copy(chunkPromptCodes, promptAudioCodes)
+			chunkPromptCodes = append(chunkPromptCodes, prevChunkTailFrames...)
+			log.Printf("[Synthesize]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
+		}
+
+		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
 
 		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
@@ -672,6 +689,15 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 			return nil, ctx.Err()
 		}
 		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d effective=%d)", len(generatedFrames), maxNewFrames, effectiveMaxFrames)
+
+		// 保存当前 chunk 的最后几帧，作为下一个 chunk 的声学上下文
+		if len(generatedFrames) >= ChunkContextFrames {
+			prevChunkTailFrames = make([][]int, ChunkContextFrames)
+			copy(prevChunkTailFrames, generatedFrames[len(generatedFrames)-ChunkContextFrames:])
+		} else if len(generatedFrames) > 0 {
+			prevChunkTailFrames = make([][]int, len(generatedFrames))
+			copy(prevChunkTailFrames, generatedFrames)
+		}
 
 		// 使用流式 codec 解码替代一次性全量解码，降低内存峰值
 		var channelArrays [][]float32
@@ -821,6 +847,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	streamingCodecSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.Inference.CodecDecodeStep.Session, t.OrtRuntime)
 
 	var allWaveforms [][]float32
+	var prevChunkTailFrames [][]int // 前一个 chunk 的最后几帧，作为下一个 chunk 的声学上下文
 	for chunkIndex, chunkText := range textChunks {
 		select {
 		case <-ctx.Done():
@@ -835,9 +862,22 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
+		// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
+		t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+
 		textTokenIDs := t.EncodeText(chunkText)
 		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
-		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
+
+		// 将前一个 chunk 的尾部帧作为声学上下文追加到参考音频后面
+		chunkPromptCodes := promptAudioCodes
+		if chunkIndex > 0 && len(prevChunkTailFrames) > 0 {
+			chunkPromptCodes = make([][]int, len(promptAudioCodes), len(promptAudioCodes)+len(prevChunkTailFrames))
+			copy(chunkPromptCodes, promptAudioCodes)
+			chunkPromptCodes = append(chunkPromptCodes, prevChunkTailFrames...)
+			log.Printf("[Synthesize]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
+		}
+
+		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
 
 		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
@@ -852,6 +892,15 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 			return nil, ctx.Err()
 		}
 		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d effective=%d)", len(generatedFrames), maxNewFrames, effectiveMaxFrames)
+
+		// 保存当前 chunk 的最后几帧，作为下一个 chunk 的声学上下文
+		if len(generatedFrames) >= ChunkContextFrames {
+			prevChunkTailFrames = make([][]int, ChunkContextFrames)
+			copy(prevChunkTailFrames, generatedFrames[len(generatedFrames)-ChunkContextFrames:])
+		} else if len(generatedFrames) > 0 {
+			prevChunkTailFrames = make([][]int, len(generatedFrames))
+			copy(prevChunkTailFrames, generatedFrames)
+		}
 
 		// 使用流式 codec 解码替代一次性全量解码，降低内存峰值
 		var channelArrays [][]float32
@@ -998,6 +1047,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 			return
 		}
 
+		var prevChunkTailFrames [][]int // 前一个 chunk 的最后几帧，作为下一个 chunk 的声学上下文
 		for chunkIndex, chunkText := range textChunks {
 			select {
 			case <-ctx.Done():
@@ -1009,8 +1059,21 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 			default:
 			}
 
+			// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
+			t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeedUsed))
+
 			textTokenIDs := t.EncodeText(chunkText)
-			requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(promptAudioCodes, textTokenIDs)
+
+			// 将前一个 chunk 的尾部帧作为声学上下文追加到参考音频后面
+			chunkPromptCodes := promptAudioCodes
+			if chunkIndex > 0 && len(prevChunkTailFrames) > 0 {
+				chunkPromptCodes = make([][]int, len(promptAudioCodes), len(promptAudioCodes)+len(prevChunkTailFrames))
+				copy(chunkPromptCodes, promptAudioCodes)
+				chunkPromptCodes = append(chunkPromptCodes, prevChunkTailFrames...)
+				log.Printf("[SynthesizeStream]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
+			}
+
+			requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
 			log.Printf("[SynthesizeStream] 处理 chunk %d/%d: maxNewFrames=%d", chunkIndex+1, len(textChunks), maxNewFrames)
 			logMemoryStats(fmt.Sprintf("stream chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
@@ -1068,9 +1131,17 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 				}
 			}
 
-			onFrame := func(_ [][]int, _ int, frame []int) {
+			onFrame := func(generatedFrames [][]int, _ int, frame []int) {
 				pendingDecodeFrames = append(pendingDecodeFrames, frame)
 				decodePending(false)
+				// 保存当前 chunk 的最后几帧，作为下一个 chunk 的声学上下文
+				if len(generatedFrames) >= ChunkContextFrames {
+					prevChunkTailFrames = make([][]int, ChunkContextFrames)
+					copy(prevChunkTailFrames, generatedFrames[len(generatedFrames)-ChunkContextFrames:])
+				} else if len(generatedFrames) > 0 {
+					prevChunkTailFrames = make([][]int, len(generatedFrames))
+					copy(prevChunkTailFrames, generatedFrames)
+				}
 			}
 
 			// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
@@ -1247,10 +1318,27 @@ func decodeFramesStreaming(session *ortruntime.CodecStreamingDecodeSession, fram
 	if len(frames) == 0 {
 		return nil, 0
 	}
-	const batchSize = 16
-	var allChannels [][]float32
-	totalSamples := 0
-	for i := 0; i < len(frames); i += batchSize {
+	// 与 Python 实现一致：使用 8 帧一批进行流式解码
+	// 批次过大会导致流式解码的注意力缓存不一致，影响音质
+	const batchSize = 8
+
+	// 先用第一批获取通道数
+	firstBatch := frames[:min(batchSize, len(frames))]
+	firstChannels, firstLength := session.RunFrames(firstBatch)
+	if firstLength <= 0 || len(firstChannels) == 0 {
+		return nil, 0
+	}
+	numChannels := len(firstChannels)
+
+	// 按通道收集所有波形
+	perChannelWaveforms := make([][][]float32, numChannels) // perChannelWaveforms[ch] = list of waveforms for channel ch
+	for ch, chData := range firstChannels {
+		perChannelWaveforms[ch] = [][]float32{chData}
+	}
+	totalSamples := firstLength
+
+	// 处理剩余批次
+	for i := batchSize; i < len(frames); i += batchSize {
 		end := i + batchSize
 		if end > len(frames) {
 			end = len(frames)
@@ -1258,17 +1346,19 @@ func decodeFramesStreaming(session *ortruntime.CodecStreamingDecodeSession, fram
 		batch := frames[i:end]
 		channelArrays, audioLength := session.RunFrames(batch)
 		if audioLength > 0 && len(channelArrays) > 0 {
-			merged := audio.MergeAudioChannels(channelArrays)
-			allChannels = append(allChannels, merged)
+			for ch := 0; ch < numChannels && ch < len(channelArrays); ch++ {
+				perChannelWaveforms[ch] = append(perChannelWaveforms[ch], channelArrays[ch])
+			}
 			totalSamples += audioLength
 		}
 	}
-	if len(allChannels) == 0 {
-		return nil, 0
+
+	// 合并每个通道的波形
+	result := make([][]float32, numChannels)
+	for ch := 0; ch < numChannels; ch++ {
+		result[ch] = audio.ConcatWaveforms(perChannelWaveforms[ch])
 	}
-	// 合并所有批次的波形
-	waveform := audio.ConcatWaveforms(allChannels)
-	return [][]float32{waveform}, totalSamples
+	return result, totalSamples
 }
 
 // estimateMaxNewFrames 根据文本 token 数估算合理的最大生成帧数
@@ -1382,8 +1472,9 @@ func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortrun
 }
 
 // truncatePromptAudioCodes 截断过长的参考音频帧，只保留前 maxFrames 帧
-// 参考音频只需提供音色特征，不需要完整音频
-const defaultMaxPromptAudioFrames = 20
+// 与 Python 端对齐：Python 不做主动截断，仅在 ResolvePromptAudioCodes 中有 300 帧 OOM 保护
+// 保留此函数作为安全上限，但默认值从 20 提高到 300（与 ResolvePromptAudioCodes 一致）
+const defaultMaxPromptAudioFrames = 300
 
 func truncatePromptAudioCodes(codes [][]int, maxFrames int) [][]int {
 	if maxFrames <= 0 {

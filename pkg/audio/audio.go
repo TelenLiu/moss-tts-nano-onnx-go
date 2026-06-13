@@ -177,22 +177,6 @@ func EncodeWAV(waveform []float32, channels, sampleRate int) ([]byte, error) {
 	}
 	dataSize := numSamples * channels * 2
 
-	// normalizeVolume: 防止削波，保证 WAV 格式合规
-	// 仅在 maxAbs > 1.0 时归一化，避免不必要的内存分配
-	maxAbs := float32(0)
-	for _, s := range waveform {
-		if s < 0 {
-			s = -s
-		}
-		if s > maxAbs {
-			maxAbs = s
-		}
-	}
-	normFactor := float32(1.0)
-	if maxAbs > 1.0 {
-		normFactor = float32(0.95) / maxAbs
-	}
-
 	buf := make([]byte, 44+dataSize)
 	// RIFF header
 	copy(buf[0:4], []byte("RIFF"))
@@ -210,14 +194,14 @@ func EncodeWAV(waveform []float32, channels, sampleRate int) ([]byte, error) {
 	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataSize))
 
 	// PCM 数据编码，直接操作 []byte 避免反射开销
+	// 与 Python 一致：使用硬削波（clip）+ 四舍五入，不做整体归一化
 	for i, s := range waveform {
-		s *= normFactor
 		if s > 1.0 {
 			s = 1.0
 		} else if s < -1.0 {
 			s = -1.0
 		}
-		val := int16(s * 32767)
+		val := int16(math.Round(float64(s) * 32767.0))
 		binary.LittleEndian.PutUint16(buf[44+i*2:], uint16(val))
 	}
 
@@ -424,11 +408,158 @@ func MakeSilence(durationSamples, channels int) []float32 {
 	return make([]float32, durationSamples*channels)
 }
 
+// loadWithFFmpegResampled 使用 ffmpeg 加载音频并完成重采样和通道转换
+// 优先使用 soxr 重采样器（质量接近 torchaudio），不可用时回退到 ffmpeg 默认 swr 重采样器
+func loadWithFFmpegResampled(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("无法获取绝对路径: %w", err)
+	}
+
+	resolvedPath := absPath
+	if info, err := os.Stat(absPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if rl, err := filepath.EvalSymlinks(absPath); err == nil {
+			resolvedPath = rl
+		}
+	}
+
+	ffmpegPath := GetFFmpegPath()
+	if ffmpegPath == "" {
+		return nil, 0, 0, fmt.Errorf("ffmpeg 不可用")
+	}
+
+	tmpDir := filepath.Dir(resolvedPath)
+	tmpFile := filepath.Join(tmpDir, fmt.Sprintf(".tmp_resample_%d.wav", time.Now().UnixNano()))
+	defer os.Remove(tmpFile)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 尝试使用 ffmpeg 的 soxr 重采样器（质量接近 torchaudio）
+	// 注意：soxr 引擎需要 ffmpeg 编译时启用 libsoxr 支持，并非所有 ffmpeg 都可用
+	soxrCmd := exec.CommandContext(ctx, ffmpegPath, "-y",
+		"-v", "fatal",
+		"-i", resolvedPath,
+		"-t", fmt.Sprintf("%d", MaxReferenceAudioDurationSec),
+		"-af", "aresample=resampler=soxr:precision=28",
+		"-ar", fmt.Sprintf("%d", targetSampleRate),
+		"-ac", fmt.Sprintf("%d", targetChannels),
+		"-f", "wav",
+		"-acodec", "pcm_s16le",
+		tmpFile,
+	)
+
+	if err := soxrCmd.Run(); err == nil {
+		waveform, channels, sampleRate, err := readRIFFWAV(tmpFile)
+		if err == nil {
+			// 不裁剪ffmpeg滤波器延迟静音：裁剪会导致codec_encode编码结果与Python不一致
+			return waveform, channels, sampleRate, nil
+		}
+	}
+
+	// soxr 不可用，回退到 ffmpeg 默认的 swr 重采样器
+	// swr 质量仍远好于 Go 端的线性插值
+	os.Remove(tmpFile)
+	swrCmd := exec.CommandContext(ctx, ffmpegPath, "-y",
+		"-v", "fatal",
+		"-i", resolvedPath,
+		"-t", fmt.Sprintf("%d", MaxReferenceAudioDurationSec),
+		"-ar", fmt.Sprintf("%d", targetSampleRate),
+		"-ac", fmt.Sprintf("%d", targetChannels),
+		"-f", "wav",
+		"-acodec", "pcm_s16le",
+		tmpFile,
+	)
+
+	if err := swrCmd.Run(); err != nil {
+		return nil, 0, 0, fmt.Errorf("ffmpeg重采样失败: %w", err)
+	}
+
+	waveform, channels, sampleRate, err := readRIFFWAV(tmpFile)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	// 不裁剪ffmpeg滤波器延迟静音：裁剪会导致codec_encode编码结果与Python不一致
+	return waveform, channels, sampleRate, nil
+}
+
+// trimLeadingSilence 裁剪波形开头的静音段
+// ffmpeg 重采样会在开头插入滤波器延迟（约100-200ms静音），需要裁剪掉
+// 否则 codec_encode 会将静音段编码为静音帧，干扰音色克隆
+func trimLeadingSilence(waveform []float32, channels int) []float32 {
+	if channels <= 0 {
+		return waveform
+	}
+	// 查找第一个非静音帧的位置
+	// 使用帧级别检测（每帧 = channels 个样本）
+	silenceThreshold := float32(1e-4) // 非常低的阈值，只裁剪真正的静音
+	firstNonSilentFrame := 0
+	numFrames := len(waveform) / channels
+	for i := 0; i < numFrames; i++ {
+		frameMax := float32(0)
+		for ch := 0; ch < channels; ch++ {
+			absVal := waveform[i*channels+ch]
+			if absVal < 0 {
+				absVal = -absVal
+			}
+			if absVal > frameMax {
+				frameMax = absVal
+			}
+		}
+		if frameMax > silenceThreshold {
+			firstNonSilentFrame = i
+			break
+		}
+		if i == numFrames-1 {
+			// 全部静音，返回原始波形
+			return waveform
+		}
+	}
+
+	if firstNonSilentFrame == 0 {
+		return waveform
+	}
+
+	// 保留一点前置静音（约5ms），避免裁剪掉语音起始的过渡段
+	// 假设采样率约48000，5ms ≈ 240个样本 ≈ 240/channels 个帧
+	padFrames := 240 / channels
+	if padFrames < 1 {
+		padFrames = 1
+	}
+	startFrame := firstNonSilentFrame - padFrames
+	if startFrame < 0 {
+		startFrame = 0
+	}
+
+	trimmed := waveform[startFrame*channels:]
+	if len(trimmed) < len(waveform)/2 {
+		// 裁剪掉超过一半，可能有问题，返回原始波形
+		return waveform
+	}
+	return trimmed
+}
+
 // MaxReferenceAudioDurationSec 参考音频最大时长（秒），超过此时长将被截断以避免 OOM
 const MaxReferenceAudioDurationSec = 15
 
 func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {
-	waveform, channels, sampleRate, err := ReadWAV(path)
+	// 使用 ffmpeg 完成重采样和通道转换，避免 Go 端低质量线性插值
+	// ffmpeg 默认 swr 重采样器质量远好于 Go 端线性插值
+	waveform, channels, sampleRate, err := loadWithFFmpegResampled(path, targetSampleRate, targetChannels)
+	if err == nil {
+		// 截断过长的参考音频
+		maxSamples := MaxReferenceAudioDurationSec * targetSampleRate * targetChannels
+		if len(waveform) > maxSamples {
+			log.Printf("[LoadReferenceAudio] 参考音频过长(%d样本, 约%.1f秒)，截断至%d秒",
+				len(waveform), float64(len(waveform))/float64(targetSampleRate*targetChannels), float64(MaxReferenceAudioDurationSec))
+			waveform = waveform[:maxSamples]
+		}
+		return waveform, targetChannels, targetSampleRate, nil
+	}
+
+	// ffmpeg 不可用时回退到原有逻辑
+	log.Printf("[LoadReferenceAudio] ffmpeg重采样失败(%v)，回退到内置重采样", err)
+	waveform, channels, sampleRate, err = ReadWAV(path)
 	if err != nil {
 		return nil, 0, 0, err
 	}

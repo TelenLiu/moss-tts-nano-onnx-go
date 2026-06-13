@@ -11,8 +11,12 @@ import (
 	"time"
 )
 
+// audioCloneEncodeVersion 编码版本号
+// 修改音频预处理/编码逻辑后递增此版本号，使旧缓存自动失效
+const audioCloneEncodeVersion = 2
+
 // AudioCloneCache 基于文件的音频克隆编码缓存
-// 使用音频数据的 SHA-256 hash 作为 key，gob 序列化存储到 cache/audio_clone_gob/ 目录
+// 使用音频数据的 SHA-256 hash + 编码版本号作为 key，gob 序列化存储到 cache/audio_clone_gob/ 目录
 // 支持跨进程共享，主进程定时清理过期文件
 type AudioCloneCache struct {
 	cacheDir string
@@ -30,19 +34,19 @@ func NewAudioCloneCache(cacheDir string) *AudioCloneCache {
 	return &AudioCloneCache{cacheDir: cacheDir}
 }
 
-// HashAudioFile 计算音频文件的 SHA-256 hash
+// HashAudioFile 计算音频文件的 SHA-256 hash（包含编码版本号）
 func (c *AudioCloneCache) HashAudioFile(audioPath string) (string, error) {
 	data, err := os.ReadFile(audioPath)
 	if err != nil {
 		return "", fmt.Errorf("读取音频文件失败: %w", err)
 	}
-	hash := sha256.Sum256(data)
-	return fmt.Sprintf("%x", hash[:]), nil
+	return c.HashAudioData(data), nil
 }
 
-// HashAudioData 计算音频二进制数据的 SHA-256 hash
+// HashAudioData 计算音频二进制数据的 SHA-256 hash（包含编码版本号）
 func (c *AudioCloneCache) HashAudioData(data []byte) string {
-	hash := sha256.Sum256(data)
+	versionedData := append([]byte(fmt.Sprintf("v%d:", audioCloneEncodeVersion)), data...)
+	hash := sha256.Sum256(versionedData)
 	return fmt.Sprintf("%x", hash[:])
 }
 

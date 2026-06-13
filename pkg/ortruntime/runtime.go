@@ -301,6 +301,18 @@ type OrtCpuRuntime struct {
 	SessionMutex       sync.Mutex    // 保护 sessions 的并发访问
 	SessionRunMutex    sync.Mutex    // 保护所有 Session.Run 调用（ONNX Session 非线程安全）
 	ActiveRequests     atomic.Int64  // 当前活跃请求数，用于防止在请求期间销毁 session
+
+	// local_cached_step 缓存的元数据，避免每帧17次重复查找
+	cachedStepMeta cachedStepMetadata
+}
+
+// cachedStepMetadata 缓存 local_cached_step 推理所需的元数据
+type cachedStepMetadata struct {
+	localHeads  int64
+	localHeadDim int64
+	inputNames  []string
+	outputNames []string
+	initialized bool
 }
 
 // AcquireSession 标记有活跃请求正在使用 session，防止 session 被销毁。
@@ -1350,11 +1362,27 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 
 func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevTokens [][]int, prevTokenSets []map[int]bool, nvq, audioCodebookSize int, gd map[string]interface{}, localPast map[string][]float32, localPVL int) (bool, []int, map[string][]float32, int) {
 	ttsConfig := rt.Manifest["tts_config"].(map[string]interface{})
-	onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
 	audioAssistSlotID := int(toFloat64(ttsConfig["audio_assistant_slot_token_id"]))
 	audioEndTokenID := int(toFloat64(ttsConfig["audio_end_token_id"]))
-	inputNames := toStrSlice(onnxInfo["local_cached_input_names"])
-	outputNames := toStrSlice(onnxInfo["local_cached_output_names"])
+
+	// 使用缓存的元数据，避免每帧17次重复查找
+	meta := &rt.cachedStepMeta
+	if !meta.initialized {
+		onnxInfo := rt.TTSMeta["onnx"].(map[string]interface{})
+		meta.inputNames = toStrSlice(onnxInfo["local_cached_input_names"])
+		meta.outputNames = toStrSlice(onnxInfo["local_cached_output_names"])
+		meta.localHeads = int64(8)
+		meta.localHeadDim = int64(64)
+		if mc, ok := rt.TTSMeta["model_config"].(map[string]interface{}); ok {
+			if lh, exists := mc["local_heads"]; exists {
+				meta.localHeads = int64(toFloat64(lh))
+			}
+			if lhd, exists := mc["local_head_dim"]; exists {
+				meta.localHeadDim = int64(toFloat64(lhd))
+			}
+		}
+		meta.initialized = true
+	}
 
 	doSample := true
 	if ds, ok := gd["do_sample"]; ok {
@@ -1395,25 +1423,75 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 		audioRepetitionPenalty = float32(toFloat64(rp))
 	}
 
+	// 使用优化的 runCachedStepOpt，直接传递 ort.Value KV cache 避免数据拷贝
 	ghShape := []int64{1, int64(len(globalHidden))}
+	// 创建 globalHidden tensor 一次，所有17步复用
+	ghTensor, _ := ort.NewTensor(ghShape, globalHidden)
+	defer ghTensor.Destroy()
 
-	textLogits, _, _, localPastData := rt.runCachedStep(globalHidden, ghShape, 0, 0, 0, 0, localPVL, localPast, inputNames, outputNames)
+	// 将 map[string][]float32 转换为 map[string]ort.Value
+	localPastValues := make(map[string]ort.Value)
+	for k, v := range localPast {
+		if len(v) == 0 {
+			pastShape := []int64{1, 0, meta.localHeads, meta.localHeadDim}
+			t, _ := ort.NewTensor(pastShape, make([]float32, 0))
+			localPastValues[k] = t
+		} else {
+			seqLen := int64(len(v)) / (meta.localHeads * meta.localHeadDim)
+			pastShape := []int64{1, seqLen, meta.localHeads, meta.localHeadDim}
+			t, _ := ort.NewTensor(pastShape, v)
+			localPastValues[k] = t
+		}
+	}
+
+	textLogits, _, _, localPastValuesNew := rt.runCachedStepOpt(ghTensor, 0, 0, 0, 0, localPVL, localPastValues, meta)
 	localPVL++
 
+	// 销毁旧的 past values
+	for _, v := range localPastValues {
+		if v != nil {
+			v.Destroy()
+		}
+	}
+
 	if textLogits == nil {
-		return false, nil, localPastData, localPVL
+		// 销毁新创建的 past values
+		for _, v := range localPastValuesNew {
+			if v != nil {
+				v.Destroy()
+			}
+		}
+		return false, nil, localPast, localPVL
 	}
 
 	nextTextToken := sampler.SampleAssistantTextToken(textLogits, audioAssistSlotID, audioEndTokenID, doSample, textTemperature, textTopK, textTopP, rt.RNG)
 	if nextTextToken != audioAssistSlotID {
-		return false, nil, localPastData, localPVL
+		// 销毁新创建的 past values
+		for _, v := range localPastValuesNew {
+			if v != nil {
+				v.Destroy()
+			}
+		}
+		return false, nil, localPast, localPVL
 	}
 
-	_, audioLogits, audioLogitsShape, localPastData := rt.runCachedStep(globalHidden, ghShape, nextTextToken, 0, 0, 1, localPVL, localPastData, inputNames, outputNames)
+	_, audioLogits, audioLogitsShape, localPastValuesNew2 := rt.runCachedStepOpt(ghTensor, nextTextToken, 0, 0, 1, localPVL, localPastValuesNew, meta)
 	localPVL++
 
+	// 销毁上一轮的 past values
+	for _, v := range localPastValuesNew {
+		if v != nil {
+			v.Destroy()
+		}
+	}
+
 	if audioLogits == nil {
-		return false, nil, localPastData, localPVL
+		for _, v := range localPastValuesNew2 {
+			if v != nil {
+				v.Destroy()
+			}
+		}
+		return false, nil, localPast, localPVL
 	}
 
 	perChannel := int(audioLogitsShape[len(audioLogitsShape)-1])
@@ -1424,15 +1502,30 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 	frame := []int{sampledToken}
 	previousToken := sampledToken
 
+	currentPastValues := localPastValuesNew2
 	for ci := 1; ci < nvq; ci++ {
-		_, audioLogits2, audioLogitsShape2, localPastData2 := rt.runCachedStep(globalHidden, ghShape, 0, previousToken, ci-1, 2, localPVL, localPastData, inputNames, outputNames)
+		_, audioLogits2, audioLogitsShape2, nextPastValues := rt.runCachedStepOpt(ghTensor, 0, previousToken, ci-1, 2, localPVL, currentPastValues, meta)
 		localPVL++
 
 		if audioLogits2 == nil {
+			// 销毁剩余的 past values
+			for _, v := range currentPastValues {
+				if v != nil {
+					v.Destroy()
+				}
+			}
 			break
 		}
 
-		localPastData = localPastData2
+		// 销毁上一轮的 past values（currentPastValues 中的值已被 runCachedStepOpt 内部使用完毕）
+		// 注意：runCachedStepOpt 不销毁输入的 past values，需要我们手动销毁
+		for _, v := range currentPastValues {
+			if v != nil {
+				v.Destroy()
+			}
+		}
+		currentPastValues = nextPastValues
+
 		perChannel2 := int(audioLogitsShape2[len(audioLogitsShape2)-1])
 		startOff := ci * perChannel2
 		endOff := minInt(startOff+perChannel2, len(audioLogits2))
@@ -1446,105 +1539,112 @@ func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevToke
 		previousToken = sampledToken2
 	}
 
-	return true, frame, localPastData, localPVL
+	// 销毁最后一轮的 past values
+	for _, v := range currentPastValues {
+		if v != nil {
+			v.Destroy()
+		}
+	}
+
+	return true, frame, localPast, localPVL
 }
 
-func (rt *OrtCpuRuntime) runCachedStep(globalHidden []float32, ghShape []int64, textTokenID, audioTokenID, channelIndex, stepType, pastValidLength int, localPast map[string][]float32, inputNames, outputNames []string) ([]float32, []float32, []int64, map[string][]float32) {
-	ghTensor, _ := ort.NewTensor(ghShape, globalHidden)
+// runCachedStepOpt 是 runCachedStep 的优化版本，直接使用 ort.Value 传递 KV cache，避免数据拷贝
+func (rt *OrtCpuRuntime) runCachedStepOpt(ghTensor ort.Value, textTokenID, audioTokenID, channelIndex, stepType, pastValidLength int, localPastValues map[string]ort.Value, meta *cachedStepMetadata) ([]float32, []float32, []int64, map[string]ort.Value) {
 	ttTensor, _ := ort.NewTensor([]int64{1}, []int32{int32(textTokenID)})
 	atTensor, _ := ort.NewTensor([]int64{1}, []int32{int32(audioTokenID)})
 	ciTensor, _ := ort.NewTensor([]int64{1}, []int32{int32(channelIndex)})
 	stTensor, _ := ort.NewTensor([]int64{1}, []int32{int32(stepType)})
 	pvlTensor, _ := ort.NewTensor([]int64{1}, []int32{int32(pastValidLength)})
 
-	inputs := make([]ort.Value, len(inputNames))
+	inputs := make([]ort.Value, len(meta.inputNames))
 	inputs[0] = ghTensor
 	inputs[1] = ttTensor
 	inputs[2] = atTensor
 	inputs[3] = ciTensor
 	inputs[4] = stTensor
 	inputs[5] = pvlTensor
-	localHeads := int64(8)
-	localHeadDim := int64(64)
-	if mc, ok := rt.TTSMeta["model_config"].(map[string]interface{}); ok {
-		if lh, exists := mc["local_heads"]; exists {
-			localHeads = int64(toFloat64(lh))
-		}
-		if lhd, exists := mc["local_head_dim"]; exists {
-			localHeadDim = int64(toFloat64(lhd))
-		}
-	}
-	for i := 6; i < len(inputNames); i++ {
-		pastData, ok := localPast[inputNames[i]]
-		if !ok || len(pastData) == 0 {
-			pastShape := []int64{1, 0, localHeads, localHeadDim}
+	for i := 6; i < len(meta.inputNames); i++ {
+		if v, ok := localPastValues[meta.inputNames[i]]; ok && v != nil {
+			inputs[i] = v
+		} else {
+			pastShape := []int64{1, 0, meta.localHeads, meta.localHeadDim}
 			t, _ := ort.NewTensor(pastShape, make([]float32, 0))
 			inputs[i] = t
-		} else {
-			seqLen := int64(len(pastData)) / (localHeads * localHeadDim)
-			pastShape := []int64{1, seqLen, localHeads, localHeadDim}
-			t, _ := ort.NewTensor(pastShape, pastData)
-			inputs[i] = t
 		}
 	}
 
-	outputs := make([]ort.Value, len(outputNames))
+	outputs := make([]ort.Value, len(meta.outputNames))
 	err := rt.RunSession(rt.Onnx.Inference.LocalCachedStep.Session, inputs, outputs)
 
-	ghTensor.Destroy()
 	ttTensor.Destroy()
 	atTensor.Destroy()
 	ciTensor.Destroy()
 	stTensor.Destroy()
 	pvlTensor.Destroy()
-	for i := 6; i < len(inputs); i++ {
-		if inputs[i] != nil {
-			inputs[i].Destroy()
+	// 销毁临时创建的空 past tensor（不是 localPastValues 中的）
+	for i := 6; i < len(meta.inputNames); i++ {
+		if v, ok := localPastValues[meta.inputNames[i]]; !ok || v == nil {
+			if inputs[i] != nil {
+				inputs[i].Destroy()
+			}
 		}
 	}
 
 	if err != nil {
 		log.Printf("  local_cached_step 失败：%v", err)
+		// 销毁 outputs
+		for _, v := range outputs {
+			if v != nil {
+				v.Destroy()
+			}
+		}
 		return nil, nil, nil, nil
 	}
 	// 更新 Session 使用时间
 	rt.UpdateSessionTime(rt.Onnx.Inference.LocalCachedStep)
 
-	namedOut := make(map[string]ort.Value)
-	for i, name := range outputNames {
-		namedOut[name] = outputs[i]
-	}
-
 	var textLogits []float32
-	if tl, ok := namedOut["text_logits"]; ok && tl != nil {
-		textLogits = getFloat32Data(tl)
-	}
-
 	var audioLogits []float32
 	var audioLogitsShape []int64
-	if al, ok := namedOut["audio_logits"]; ok && al != nil {
-		audioLogits = getFloat32Data(al)
-		audioLogitsShape = al.GetShape()
-	}
 
-	nextLocalPast := make(map[string][]float32)
-	for i := 2; i < len(outputNames); i++ {
-		pastName := strings.Replace(outputNames[i], "local_present_", "local_past_", 1)
-		if v, ok := namedOut[outputNames[i]]; ok && v != nil {
-			data := getFloat32Data(v)
-			copied := make([]float32, len(data))
-			copy(copied, data)
-			nextLocalPast[pastName] = copied
+	for i, name := range meta.outputNames {
+		v := outputs[i]
+		if v == nil {
+			continue
+		}
+		if name == "text_logits" {
+			textLogits = getFloat32Data(v)
+			v.Destroy()
+			outputs[i] = nil
+		} else if name == "audio_logits" {
+			audioLogits = getFloat32Data(v)
+			audioLogitsShape = v.GetShape()
+			v.Destroy()
+			outputs[i] = nil
 		}
 	}
 
+	// 保存 present_ 输出为下一轮的 past 输入，直接传递 ort.Value 避免数据拷贝
+	nextLocalPastValues := make(map[string]ort.Value)
+	for i, name := range meta.outputNames {
+		if strings.HasPrefix(name, "local_present_") {
+			pastName := strings.Replace(name, "local_present_", "local_past_", 1)
+			if outputs[i] != nil {
+				nextLocalPastValues[pastName] = outputs[i]
+				outputs[i] = nil // 防止下面被销毁
+			}
+		}
+	}
+
+	// 销毁剩余未处理的 outputs
 	for _, v := range outputs {
 		if v != nil {
 			v.Destroy()
 		}
 	}
 
-	return textLogits, audioLogits, audioLogitsShape, nextLocalPast
+	return textLogits, audioLogits, audioLogitsShape, nextLocalPastValues
 }
 
 func (rt *OrtCpuRuntime) DecodeFullAudio(generatedFrames [][]int) ([][]float32, int) {
@@ -1642,7 +1742,7 @@ func (rt *OrtCpuRuntime) DecodeFullAudioWithContext(ctx context.Context, generat
 		copy(channels[ch], audioData[startOff:endOff])
 	}
 
-	log.Printf("  解码音频: frames=%d channels=%d samples=%d audioShape=%v", frameCount, numChannels, audioLength, audioShape)
+	log.Printf("  解码音频: frames=%d channels=%d samples=%d audioShape=%v audioDataLen=%d", frameCount, numChannels, audioLength, audioShape, len(audioData))
 	return channels, int(audioLength)
 }
 

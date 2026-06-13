@@ -10,6 +10,7 @@ const (
 	SampleModeGreedy = "greedy"
 	SampleModeFixed  = "fixed"
 	SampleModeFull   = "full"
+	SampleModeHybrid = "hybrid" // 混合模式：前N帧用full保证音色克隆质量，后续帧用fixed加速
 )
 
 func Argmax(values []float32) int {
@@ -125,17 +126,19 @@ func SampleFromScores(values []float32, doSample bool, temperature float64, topK
 		probs := Softmax(sortedScores)
 		removeMask := make([]bool, len(indexed))
 		var cumulative float64
-		removedStart := len(probs)
 		for i, p := range probs {
+			cumulative += p
 			if cumulative > topP {
 				removeMask[i] = true
-				if removedStart == len(probs) {
-					removedStart = i
-				}
-			} else {
-				cumulative += p
 			}
 		}
+		// 与 Python 实现一致：右移 removeMask 一位，确保概率最高的 token 永远不被移除
+		// Python: for index in range(len(remove_mask) - 1, 0, -1): remove_mask[index] = remove_mask[index - 1]
+		// Python: remove_mask[0] = False
+		for i := len(removeMask) - 1; i > 0; i-- {
+			removeMask[i] = removeMask[i-1]
+		}
+		removeMask[0] = false
 		for i, mask := range removeMask {
 			if mask {
 				scores[indexed[i].idx] = math.Inf(-1)

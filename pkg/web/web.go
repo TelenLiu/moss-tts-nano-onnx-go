@@ -1500,7 +1500,7 @@ function getConfig() {
     demo_id: demoId,
     sample_mode: document.getElementById('sample-mode').value,
     max_new_frames: parseInt(document.getElementById('max-new-frames').value) || 375,
-    voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 300,
+    voice_clone_max_text_tokens: parseInt(document.getElementById('voice-clone-max-text-tokens').value) || 75,
     seed: seedVal === 0 ? Math.floor(Math.random() * 2147483647) + 1 : seedVal,
     enable_robust: document.getElementById('enable-robust').checked,
     enable_wetext: document.getElementById('enable-wetext').checked,
