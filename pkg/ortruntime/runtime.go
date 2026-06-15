@@ -954,20 +954,32 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 		shouldContinue := true
 
 		if rt.Onnx.Inference.LocalGreedyFrame != nil && !doSample {
+			if stepIndex == 0 {
+				log.Printf("  使用 local_greedy_frame 路径 (doSample=%v)", doSample)
+			}
 			shouldContinue, frame = rt.runLocalGreedyFrame(
 				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize, audioRepetitionPenalty)
-		} else if rt.Onnx.Inference.LocalFixedSampledFrame != nil && (sampleMode == sampler.SampleModeFixed || (!doSample && rt.Onnx.Inference.LocalGreedyFrame == nil)) {
-			// greedy 模式且无 local_greedy_frame 时，也使用 local_fixed_sampled_frame
-			// 因为 argmax 采样会产生静音帧，回退到与 fixed 模式相同的概率采样
+		} else if rt.Onnx.Inference.LocalFixedSampledFrame != nil && sampleMode == sampler.SampleModeFixed {
+			if stepIndex == 0 {
+				log.Printf("  使用 local_fixed_sampled_frame 路径 (sampleMode=%s)", sampleMode)
+			}
+			// 仅在 sample_mode == "fixed" 时使用 local_fixed_sampled_frame
+			// 与 Python 端条件判断一致
 			shouldContinue, frame = rt.runLocalFixedSampledFrame(
 				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize)
 		} else if rt.Onnx.Inference.LocalCachedStep != nil {
+			if stepIndex == 0 {
+				log.Printf("  使用 local_cached_step 路径 (doSample=%v sampleMode=%s)", doSample, sampleMode)
+			}
 			// local_past 每帧重置，与 Python 行为一致
 			localPast := make(map[string][]float32)
 			localPVL := 0
 			shouldContinue, frame, _, _ = rt.runLocalCachedStepFull(
 				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd, localPast, localPVL)
 		} else if rt.Onnx.Inference.LocalDecoder != nil {
+			if stepIndex == 0 {
+				log.Printf("  使用 local_decoder 路径 (doSample=%v sampleMode=%s)", doSample, sampleMode)
+			}
 			// local_decoder 兜底路径：无 KV cache 的原始解码器
 			shouldContinue, frame = rt.runLocalDecoderFull(
 				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd)

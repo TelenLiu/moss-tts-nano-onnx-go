@@ -420,6 +420,12 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 }
 
 func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
+	return t.EncodeReferenceAudioWithOptions(audioPath, false)
+}
+
+// EncodeReferenceAudioWithOptions 编码参考音频
+// skipAudioCloneCacheWrite=true 时跳过写入 AudioCloneCache（用于 PreloadCache，因其自身已有永久存储，避免重复写入）
+func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipAudioCloneCacheWrite bool) [][]int {
 	// 计算音频文件 hash，用于文件缓存 key
 	hashKey, err := t.AudioCloneCache.HashAudioFile(audioPath)
 	if err != nil {
@@ -501,6 +507,10 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	audioCodeLengthsData := getInt32Data(outputs[1])
 	log.Printf("[EncodeReferenceAudio] codec_encode 成功: audioCodes形状=%v audioCodeLengths=%v 数据长度=%d",
 		audioCodesShape, audioCodeLengthsData, len(audioCodesData))
+	// 调试：打印前32个原始数据
+	if len(audioCodesData) >= 32 {
+		log.Printf("[EncodeReferenceAudio] audioCodesData[:32]=%v", audioCodesData[:32])
+	}
 
 	for _, v := range outputs {
 		if v != nil {
@@ -541,7 +551,8 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudio(audioPath string) [][]int {
 	}
 
 	// 缓存编码结果到文件，后续相同音频无需再调用 CodecEncode
-	if hashKey != "" {
+	// skipAudioCloneCacheWrite 时跳过写入（PreloadCache 自身已有永久存储，避免重复）
+	if hashKey != "" && !skipAudioCloneCacheWrite {
 		if err := t.AudioCloneCache.Put(hashKey, promptAudioCodes); err != nil {
 			log.Printf("[EncodeReferenceAudio] 写入缓存失败: %v", err)
 		}

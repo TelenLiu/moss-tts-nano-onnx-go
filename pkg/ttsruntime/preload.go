@@ -99,7 +99,7 @@ func (pc *PreloadCache) Preload(id string, audioPath string, text string) error 
 
 	// 编码音频
 	log.Printf("[PreloadCache] 预加载音频: %s -> %s", id, audioPath)
-	audioCodes := pc.rt.EncodeReferenceAudio(audioPath)
+	audioCodes := pc.rt.EncodeReferenceAudioWithOptions(audioPath, true)
 	if audioCodes == nil {
 		return fmt.Errorf("音频编码失败: %s", audioPath)
 	}

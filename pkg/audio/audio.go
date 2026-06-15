@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	resample "github.com/gunter-q12/resample"
 )
 
 // MP3EncodeConfig MP3 编码配置
@@ -542,10 +543,122 @@ func trimLeadingSilence(waveform []float32, channels int) []float32 {
 // MaxReferenceAudioDurationSec 参考音频最大时长（秒），超过此时长将被截断以避免 OOM
 const MaxReferenceAudioDurationSec = 15
 
+// loadWithHighQualityResample 使用 Go 内置高质量重采样加载参考音频
+// 基于 bandlimited interpolation（Kaiser 窗 sinc 插值），与 Python torchaudio.functional.resample 算法一致
+// 这确保 codec_encode 的输入波形与 Python 端一致，避免音色偏差
+func loadWithHighQualityResample(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {
+	// 1. 先用 ffmpeg 解码为原始 PCM（不做重采样）
+	ffmpegPath := GetFFmpegPath()
+	if ffmpegPath == "" {
+		return nil, 0, 0, fmt.Errorf("ffmpeg 不可用")
+	}
+
+	tmpDir := filepath.Dir(path)
+	tmpFile := filepath.Join(tmpDir, fmt.Sprintf(".tmp_pcm_%d.wav", time.Now().UnixNano()))
+	defer os.Remove(tmpFile)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 用 ffmpeg 解码为 WAV（保持原始采样率，仅做格式转换和通道转换）
+	cmd := exec.CommandContext(ctx, ffmpegPath, "-y",
+		"-v", "fatal",
+		"-i", path,
+		"-t", fmt.Sprintf("%d", MaxReferenceAudioDurationSec),
+		"-ac", fmt.Sprintf("%d", targetChannels),
+		"-f", "wav",
+		"-acodec", "pcm_s16le",
+		tmpFile,
+	)
+	if err := cmd.Run(); err != nil {
+		return nil, 0, 0, fmt.Errorf("ffmpeg 解码失败: %w", err)
+	}
+
+	// 2. 读取 WAV 文件获取原始采样率和波形
+	waveform, channels, sampleRate, err := readRIFFWAV(tmpFile)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("读取 WAV 失败: %w", err)
+	}
+
+	// 3. 如果采样率已经是目标采样率，直接返回
+	if sampleRate == targetSampleRate {
+		return waveform, channels, sampleRate, nil
+	}
+
+	// 4. 使用 bandlimited interpolation 进行高质量重采样
+	// gunter-q12/resample 库基于与 torchaudio 相同的 sinc 插值算法
+	// 使用 KaiserBest 滤波器获得最高质量
+	resampled, err := resampleWaveform(waveform, channels, sampleRate, targetSampleRate)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("重采样失败: %w", err)
+	}
+
+	return resampled, channels, targetSampleRate, nil
+}
+
+// resampleWaveform 使用 bandlimited interpolation 重采样
+func resampleWaveform(waveform []float32, channels, inRate, outRate int) ([]float32, error) {
+	if inRate == outRate {
+		return waveform, nil
+	}
+
+	// 将交错格式的 float32 样本转换为 bytes
+	inputBytes := make([]byte, len(waveform)*4)
+	for i, v := range waveform {
+		bits := math.Float32bits(v)
+		binary.LittleEndian.PutUint32(inputBytes[i*4:], bits)
+	}
+
+	// 创建输出缓冲区
+	var outBuf bytes.Buffer
+
+	// 创建重采样器：输出写入 outBuf
+	r, err := resample.New(&outBuf, resample.FormatFloat32, inRate, outRate, channels, resample.WithKaiserBestFilter())
+	if err != nil {
+		return nil, fmt.Errorf("创建重采样器失败: %w", err)
+	}
+
+	// 执行重采样
+	n, err := r.Write(inputBytes)
+	if err != nil {
+		return nil, fmt.Errorf("重采样写入失败: %w", err)
+	}
+	if n != len(inputBytes) {
+		log.Printf("[resampleWaveform] 警告: 写入 %d 字节，期望 %d 字节", n, len(inputBytes))
+	}
+
+	// 使用 ReadFrom 刷新重采样器内部缓冲区
+	// 传入空的 reader 以确保所有数据都被处理
+	if _, err := r.ReadFrom(bytes.NewReader([]byte{})); err != nil {
+		log.Printf("[resampleWaveform] 刷新重采样器失败: %v", err)
+	}
+
+	// 从 outBuf 读取重采样后的 bytes 并转换为 float32
+	outputBytes := outBuf.Bytes()
+	if len(outputBytes)%4 != 0 {
+		return nil, fmt.Errorf("重采样输出字节数不是4的倍数: %d", len(outputBytes))
+	}
+
+	result := make([]float32, len(outputBytes)/4)
+	for i := range result {
+		bits := binary.LittleEndian.Uint32(outputBytes[i*4:])
+		result[i] = math.Float32frombits(bits)
+	}
+
+	return result, nil
+}
+
 func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {
-	// 使用 ffmpeg 完成重采样和通道转换，避免 Go 端低质量线性插值
-	// ffmpeg 默认 swr 重采样器质量远好于 Go 端线性插值
-	waveform, channels, sampleRate, err := loadWithFFmpegResampled(path, targetSampleRate, targetChannels)
+	// 优先使用 Go 内置的高质量重采样（基于 bandlimited interpolation，与 torchaudio 算法一致）
+	// 这比 ffmpeg 的 swr 重采样器质量更高，能确保 codec_encode 结果与 Python 端一致
+	waveform, channels, sampleRate, err := loadWithHighQualityResample(path, targetSampleRate, targetChannels)
+	if err == nil {
+		return waveform, channels, sampleRate, nil
+	}
+
+	// 高质量重采样失败，回退到 ffmpeg
+	log.Printf("[LoadReferenceAudio] 高质量重采样失败(%v)，回退到 ffmpeg", err)
+	waveform, channels, sampleRate, err = loadWithFFmpegResampled(path, targetSampleRate, targetChannels)
 	if err == nil {
 		// 截断过长的参考音频
 		maxSamples := MaxReferenceAudioDurationSec * targetSampleRate * targetChannels

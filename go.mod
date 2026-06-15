@@ -8,4 +8,9 @@ require (
 	golang.org/x/net v0.43.0
 )
 
+require (
+	github.com/gunter-q12/resample v1.0.0 // indirect
+	golang.org/x/exp v0.0.0-20250106191152-7588d65b2ba8 // indirect
+)
+
 //replace github.com/TelenLiu/WeTextProcessing-go => ../WeTextProcessing-go
