@@ -688,9 +688,9 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
 
-		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
-		effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContextAndOverrides(ctx, requestRows, effectiveMaxFrames, overrides)
+		// 直接使用 maxNewFrames，不再用 estimateMaxNewFrames 缩减
+		// 缩减帧数会导致某些随机种子下模型语速较慢时音频末尾被截断
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContextAndOverrides(ctx, requestRows, maxNewFrames, overrides)
 		if ctx.Err() != nil {
 			interrupted = true
 			if streamingCodecSession != nil {
@@ -699,7 +699,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d effective=%d)", len(generatedFrames), maxNewFrames, effectiveMaxFrames)
+		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d)", len(generatedFrames), maxNewFrames)
 
 		// 保存当前 chunk 的最后几帧，作为下一个 chunk 的声学上下文
 		if len(generatedFrames) >= ChunkContextFrames {
@@ -710,7 +710,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 			copy(prevChunkTailFrames, generatedFrames)
 		}
 
-		// 使用流式 codec 解码替代一次性全量解码，降低内存峰值
+		// 使用流式 codec 解码，降低内存峰值
 		var channelArrays [][]float32
 		var audioLength int
 		if streamingCodecSession != nil {
@@ -891,9 +891,9 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
 		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
 
-		// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
-		effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
-		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContextAndOverrides(ctx, requestRows, effectiveMaxFrames, overrides)
+		// 直接使用 maxNewFrames，不再用 estimateMaxNewFrames 缩减
+		// 缩减帧数会导致某些随机种子下模型语速较慢时音频末尾被截断
+		generatedFrames := t.OrtRuntime.GenerateAudioFramesWithContextAndOverrides(ctx, requestRows, maxNewFrames, overrides)
 		if ctx.Err() != nil {
 			interrupted = true
 			if streamingCodecSession != nil {
@@ -902,7 +902,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 			log.Printf("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d effective=%d)", len(generatedFrames), maxNewFrames, effectiveMaxFrames)
+		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d)", len(generatedFrames), maxNewFrames)
 
 		// 保存当前 chunk 的最后几帧，作为下一个 chunk 的声学上下文
 		if len(generatedFrames) >= ChunkContextFrames {
@@ -1155,9 +1155,9 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 				}
 			}
 
-			// 根据文本 token 数估算最大帧数，避免无效 decode 步骤
-			effectiveMaxFrames := estimateMaxNewFrames(len(textTokenIDs), maxNewFrames)
-			_ = t.OrtRuntime.GenerateAudioFramesWithCallbackAndOverrides(ctx, requestRows, effectiveMaxFrames, onFrame, overrides)
+			// 直接使用 maxNewFrames，不再用 estimateMaxNewFrames 缩减
+			// 缩减帧数会导致某些随机种子下模型语速较慢时音频末尾被截断
+			_ = t.OrtRuntime.GenerateAudioFramesWithCallbackAndOverrides(ctx, requestRows, maxNewFrames, onFrame, overrides)
 			// 如果推理被中断，标记并退出
 			select {
 			case <-ctx.Done():
@@ -1370,19 +1370,6 @@ func decodeFramesStreaming(session *ortruntime.CodecStreamingDecodeSession, fram
 		result[ch] = audio.ConcatWaveforms(perChannelWaveforms[ch])
 	}
 	return result, totalSamples
-}
-
-// estimateMaxNewFrames 根据文本 token 数估算合理的最大生成帧数
-// 经验值：每个 token 约生成 3-5 帧，下限 50 帧，上限为用户指定的 maxNewFrames
-func estimateMaxNewFrames(tokenCount int, maxNewFrames int) int {
-	estimated := tokenCount * 5
-	if estimated < 50 {
-		estimated = 50
-	}
-	if estimated > maxNewFrames {
-		estimated = maxNewFrames
-	}
-	return estimated
 }
 
 // getProcessRSSMB 获取当前进程的实际物理内存占用（RSS），单位 MB

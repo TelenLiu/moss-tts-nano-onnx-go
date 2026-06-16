@@ -175,11 +175,10 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	doSample := sampleMode != "greedy"
 	maxNewFrames := req.MaxNewFrames
 	if maxNewFrames <= 0 {
-		// 根据文本长度动态调整 max_new_frames
-		// 经验值：中文文本每字约需 3-4 帧
-		estimatedFrames := len(req.Text) * 4
-		maxNewFrames = min(estimatedFrames+100, 2000) // 上限 2000 帧
-		log.Printf("[API] 动态计算 maxNewFrames: textLen=%d estimated=%d final=%d", len(req.Text), estimatedFrames, maxNewFrames)
+		// 与 Python 源码保持一致：默认 375 帧
+		// 不同随机种子会影响模型语速，帧数不足会导致音频末尾被截断
+		maxNewFrames = 375
+		log.Printf("[API] 使用默认 maxNewFrames: %d", maxNewFrames)
 	}
 	voiceCloneMaxTokens := req.VoiceCloneMaxTextTokens
 	if voiceCloneMaxTokens <= 0 {
