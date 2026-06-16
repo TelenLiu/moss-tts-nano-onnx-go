@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -15,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/sampler"
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -178,7 +178,7 @@ func (s *CodecStreamingDecodeSession) RunFrames(frameRows [][]int) ([][]float32,
 	audioCodeLengthsTensor.Destroy()
 
 	if err != nil {
-		log.Printf("  codec_decode_step 失败: %v", err)
+		log.Errorf("  codec_decode_step 失败: %v", err)
 		for _, v := range outputs {
 			if v != nil {
 				v.Destroy()
@@ -413,20 +413,20 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 		defer sessionOptions.Destroy()
 		// 使用 EXTENDED 级别替代 ALL(99)，减少内存预分配开销，推理速度差异极小
 		if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableExtended); err != nil {
-			log.Printf("  警告: 设置图优化级别失败: %v", err)
+			log.Errorf("  警告: 设置图优化级别失败: %v", err)
 		}
 		// 禁用内存模式优化，减少 ONNX Runtime 内存池预留空间
 		if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_pattern", "0"); err != nil {
-			log.Printf("  警告: 设置 enable_mem_pattern 失败: %v", err)
+			log.Errorf("  警告: 设置 enable_mem_pattern 失败: %v", err)
 		}
 		// 启用内存复用，允许释放的 tensor 内存被后续分配复用
 		if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_reuse", "1"); err != nil {
-			log.Printf("  警告: 设置 enable_mem_reuse 失败: %v", err)
+			log.Errorf("  警告: 设置 enable_mem_reuse 失败: %v", err)
 		}
 		// 禁用 arena 分配器，避免 ONNX Runtime 使用 jemalloc 等内存池导致内存不释放
 		// arena 分配器会缓存已释放的内存块供后续复用，但不会归还给操作系统
 		if err := sessionOptions.AddSessionConfigEntry("session.use_arena", "0"); err != nil {
-			log.Printf("  警告: 设置 use_arena 失败: %v", err)
+			log.Errorf("  警告: 设置 use_arena 失败: %v", err)
 		}
 
 		// 根据是否使用GPU配置SessionOptions
@@ -441,7 +441,7 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 					"device_id": "0",
 				})
 				if err := sessionOptions.AppendExecutionProviderCUDA(cudaOptions); err == nil {
-					log.Printf("  使用CUDA执行提供程序")
+					log.Debugf("  使用CUDA执行提供程序")
 					gpuSuccess = true
 				}
 			}
@@ -451,11 +451,11 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 				// 检查模型是否有外部数据文件，CoreML不支持外部数据
 				hasExternalData := hasExternalDataFiles(ttsDir, ttsFiles, codecDir, codecFiles)
 				if hasExternalData {
-					log.Printf("  模型使用外部数据文件，CoreML不支持此格式，跳过CoreML")
+					log.Warnf("  模型使用外部数据文件，CoreML不支持此格式，跳过CoreML")
 				} else {
 					coremlFlags := uint32(0)
 					if err := sessionOptions.AppendExecutionProviderCoreML(coremlFlags); err == nil {
-						log.Printf("  使用CoreML执行提供程序 (Apple M1/M2)")
+						log.Debugf("  使用CoreML执行提供程序 (Apple M1/M2)")
 						gpuSuccess = true
 					}
 				}
@@ -467,23 +467,23 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 					threads = threads - 1
 				}
 				if err := sessionOptions.SetIntraOpNumThreads(threads); err != nil {
-					log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+					log.Errorf("  警告: 设置 IntraOp 线程数失败: %v", err)
 				}
 			} else {
-				log.Printf("  GPU不可用，使用CPU模式")
+				log.Warnf("  GPU不可用，使用CPU模式")
 				if err := sessionOptions.SetIntraOpNumThreads(rt.ThreadCount); err != nil {
-					log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+					log.Errorf("  警告: 设置 IntraOp 线程数失败: %v", err)
 				}
 			}
 		} else {
-			log.Printf("  使用CPU执行提供程序")
+			log.Debugf("  使用CPU执行提供程序")
 			if err := sessionOptions.SetIntraOpNumThreads(rt.ThreadCount); err != nil {
-				log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+				log.Errorf("  警告: 设置 IntraOp 线程数失败: %v", err)
 			}
 		}
 
 		if err := sessionOptions.SetInterOpNumThreads(1); err != nil {
-			log.Printf("  警告: 设置 InterOp 线程数失败: %v", err)
+			log.Errorf("  警告: 设置 InterOp 线程数失败: %v", err)
 		}
 
 		// 加载模型
@@ -492,7 +492,7 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 				return nil
 			}
 			onnxPath := filepath.Join(dir, fmt.Sprintf("%v", filename))
-			log.Printf("  加载 ONNX session: %s (inputs=%d outputs=%d threads=%d)", name, len(inputNames), len(outputNames), rt.ThreadCount)
+			log.Infof("  加载 ONNX session: %s (inputs=%d outputs=%d threads=%d)", name, len(inputNames), len(outputNames), rt.ThreadCount)
 			sess, err := ort.NewDynamicAdvancedSession(onnxPath, inputNames, outputNames, sessionOptions)
 			if err != nil {
 				return fmt.Errorf("创建 ONNX session 失败 (%s): %w", name, err)
@@ -512,7 +512,7 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 				infSessions.LocalFixedSampledFrame = &TimedSession{Session: sess, LastUsed: time.Now()}
 			case "codec_encode":
 				// codec_encode 属于阶段1，不在阶段2创建
-				log.Printf("  跳过 codec_encode session（属于阶段1，懒加载按需创建）")
+				log.Warnf("  跳过 codec_encode session（属于阶段1，懒加载按需创建）")
 				sess.Destroy()
 			case "codec_decode":
 				infSessions.CodecDecode = &TimedSession{Session: sess, LastUsed: time.Now()}
@@ -554,7 +554,7 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 
 		// codec_encode 属于阶段1（音频编码），不在阶段2创建
 		// 首次调用 EncodeReferenceAudio 时通过 EnsureCodecEncodeSession 按需创建
-		log.Printf("  跳过 codec_encode session（属于阶段1，懒加载按需创建）")
+		log.Warnf("  跳过 codec_encode session（属于阶段1，懒加载按需创建）")
 
 		if err := load("codec_decode", codecDir, codecFiles["decode_full"], []string{"audio_codes", "audio_code_lengths"}, []string{"audio", "audio_lengths"}); err != nil {
 			return err
@@ -574,13 +574,13 @@ func (rt *OrtCpuRuntime) CreateSessions() error {
 
 	// 如果是GPU模式或混合模式，先尝试GPU
 	if useGPU {
-		log.Printf("  尝试使用GPU加载模型...")
+		log.Debugf("  尝试使用GPU加载模型...")
 		err := tryCreateSessions(true)
 		if err != nil {
-			log.Printf("  GPU加载失败: %v", err)
+			log.Errorf("  GPU加载失败: %v", err)
 			// 如果是混合模式，回退到CPU
 			if rt.ExecutionMode == "hybrid" {
-				log.Printf("  回退到CPU模式...")
+				log.Warnf("  回退到CPU模式...")
 				rt.ExecutionMode = "cpu"
 				err = tryCreateSessions(false)
 				if err != nil {
@@ -622,7 +622,7 @@ func hasExternalDataFiles(ttsDir string, ttsFiles map[string]interface{}, codecD
 			for _, candidate := range candidates {
 				dataPath := filepath.Join(dir, candidate)
 				if _, err := os.Stat(dataPath); err == nil {
-					log.Printf("  [hasExternalDataFiles] 发现外部数据文件: %s", dataPath)
+					log.Debugf("  [hasExternalDataFiles] 发现外部数据文件: %s", dataPath)
 					return true
 				}
 			}
@@ -666,7 +666,7 @@ func InitializeORT(libDir string) error {
 	if err := ort.InitializeEnvironment(); err != nil {
 		return fmt.Errorf("初始化 ONNX Runtime 环境失败: %w", err)
 	}
-	log.Printf("ONNX Runtime 环境初始化成功 (lib=%s)", libPath)
+	log.Infof("ONNX Runtime 环境初始化成功 (lib=%s)", libPath)
 	return nil
 }
 
@@ -746,7 +746,7 @@ func (rt *OrtCpuRuntime) BuildVoiceCloneRequestRows(promptAudioCodes [][]int, te
 	allRows = append(allRows, prefixRows...)
 	allRows = append(allRows, audioRows...)
 	allRows = append(allRows, suffixRows...)
-	log.Printf("[BuildVoiceCloneRequestRows] prefixRows=%d audioRows=%d suffixRows=%d total=%d textTokens=%d audioFrames=%d",
+	log.Debugf("[BuildVoiceCloneRequestRows] prefixRows=%d audioRows=%d suffixRows=%d total=%d textTokens=%d audioFrames=%d",
 		len(prefixRows), len(audioRows), len(suffixRows), len(allRows), len(textTokenIDs), len(promptAudioCodes))
 	mask := make([][]int32, 1)
 	mask[0] = make([]int32, len(allRows))
@@ -854,9 +854,9 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 	prefillOutputNames := toStrSlice(onnxInfo["prefill_output_names"])
 	prefillOutputs := make([]ort.Value, len(prefillOutputNames))
 
-	log.Printf("  运行 prefill (输入长度=%d)...", len(requestRows["inputIds"]))
+	log.Debugf("  运行 prefill (输入长度=%d)...", len(requestRows["inputIds"]))
 	if err := rt.RunSession(rt.Onnx.Inference.Prefill.Session, prefillInputs, prefillOutputs); err != nil {
-		log.Printf("  prefill 失败：%v", err)
+		log.Errorf("  prefill 失败：%v", err)
 		inputIDsTensor.Destroy()
 		attentionMaskTensor.Destroy()
 		return nil
@@ -921,7 +921,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 	for stepIndex := 0; stepIndex < maxNewFrames; stepIndex++ {
 		select {
 		case <-ctx.Done():
-			log.Printf("  生成被取消")
+			log.Infof("  生成被取消")
 			// 先销毁 pastByName，然后将 prefillOutputs 中对应的值设为 nil 避免 double-free
 			for _, v := range pastByName {
 				if v != nil {
@@ -955,13 +955,13 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 
 		if rt.Onnx.Inference.LocalGreedyFrame != nil && !doSample {
 			if stepIndex == 0 {
-				log.Printf("  使用 local_greedy_frame 路径 (doSample=%v)", doSample)
+				log.Debugf("  使用 local_greedy_frame 路径 (doSample=%v)", doSample)
 			}
 			shouldContinue, frame = rt.runLocalGreedyFrame(
 				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize, audioRepetitionPenalty)
 		} else if rt.Onnx.Inference.LocalFixedSampledFrame != nil && sampleMode == sampler.SampleModeFixed {
 			if stepIndex == 0 {
-				log.Printf("  使用 local_fixed_sampled_frame 路径 (sampleMode=%s)", sampleMode)
+				log.Debugf("  使用 local_fixed_sampled_frame 路径 (sampleMode=%s)", sampleMode)
 			}
 			// 仅在 sample_mode == "fixed" 时使用 local_fixed_sampled_frame
 			// 与 Python 端条件判断一致
@@ -969,7 +969,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize)
 		} else if rt.Onnx.Inference.LocalCachedStep != nil {
 			if stepIndex == 0 {
-				log.Printf("  使用 local_cached_step 路径 (doSample=%v sampleMode=%s)", doSample, sampleMode)
+				log.Debugf("  使用 local_cached_step 路径 (doSample=%v sampleMode=%s)", doSample, sampleMode)
 			}
 			// local_past 每帧重置，与 Python 行为一致
 			localPast := make(map[string][]float32)
@@ -978,19 +978,19 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd, localPast, localPVL)
 		} else if rt.Onnx.Inference.LocalDecoder != nil {
 			if stepIndex == 0 {
-				log.Printf("  使用 local_decoder 路径 (doSample=%v sampleMode=%s)", doSample, sampleMode)
+				log.Debugf("  使用 local_decoder 路径 (doSample=%v sampleMode=%s)", doSample, sampleMode)
 			}
 			// local_decoder 兜底路径：无 KV cache 的原始解码器
 			shouldContinue, frame = rt.runLocalDecoderFull(
 				globalHidden, prevTokensByChannel, prevTokenSetsByChannel, nvq, audioCodebookSize, gd)
 		} else {
-			log.Printf("  step %d: 无可用的 local 模型", stepIndex)
+			log.Debugf("  step %d: 无可用的 local 模型", stepIndex)
 			break
 		}
 
 		// 按照 Python 源码的顺序：先检查停止信号，如果停止则不添加帧
 		if !shouldContinue {
-			log.Printf("  step %d: 停止信号 (frame=nil=%v)", stepIndex, frame == nil)
+			log.Debugf("  step %d: 停止信号 (frame=nil=%v)", stepIndex, frame == nil)
 			break
 		}
 
@@ -1034,7 +1034,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 
 		decodeOutputs := make([]ort.Value, len(decodeOutputNames))
 		if err := rt.RunSession(rt.Onnx.Inference.Decode.Session, decodeInputs, decodeOutputs); err != nil {
-			log.Printf("  decode_step 失败：%v", err)
+			log.Errorf("  decode_step 失败：%v", err)
 			nextRowTensor.Destroy()
 			pvlTensor.Destroy()
 			break
@@ -1089,7 +1089,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 		pastByName = newPastByName
 
 		if (stepIndex+1)%10 == 0 {
-			log.Printf("  已生成 %d/%d 帧", stepIndex+1, maxNewFrames)
+			log.Debugf("  已生成 %d/%d 帧", stepIndex+1, maxNewFrames)
 		}
 	}
 
@@ -1117,7 +1117,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 		}
 	}
 
-	log.Printf("  生成完成: %d 帧", len(generatedFrames))
+	log.Debugf("  生成完成: %d 帧", len(generatedFrames))
 	return generatedFrames
 }
 
@@ -1186,7 +1186,7 @@ func (rt *OrtCpuRuntime) runLocalDecoder(globalHidden []float32, textTokenID int
 	apTensor.Destroy()
 
 	if err != nil {
-		log.Printf("  local_decoder 失败: %v", err)
+		log.Errorf("  local_decoder 失败: %v", err)
 		return nil, nil
 	}
 	rt.UpdateSessionTime(rt.Onnx.Inference.LocalDecoder)
@@ -1293,7 +1293,7 @@ func (rt *OrtCpuRuntime) runLocalGreedyFrame(globalHidden []float32, prevTokenSe
 	repPenaltyTensor.Destroy()
 
 	if err != nil {
-		log.Printf("  local_greedy_frame 失败: %v", err)
+		log.Errorf("  local_greedy_frame 失败: %v", err)
 		return false, nil
 	}
 	rt.UpdateSessionTime(rt.Onnx.Inference.LocalGreedyFrame)
@@ -1349,7 +1349,7 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 	audioRUTensor.Destroy()
 
 	if err != nil {
-		log.Printf("  local_fixed_sampled_frame 失败: %v", err)
+		log.Errorf("  local_fixed_sampled_frame 失败: %v", err)
 		return false, nil
 	}
 	// 更新 Session 使用时间
@@ -1604,7 +1604,7 @@ func (rt *OrtCpuRuntime) runCachedStepOpt(ghTensor ort.Value, textTokenID, audio
 	}
 
 	if err != nil {
-		log.Printf("  local_cached_step 失败：%v", err)
+		log.Errorf("  local_cached_step 失败：%v", err)
 		// 销毁 outputs
 		for _, v := range outputs {
 			if v != nil {
@@ -1702,7 +1702,7 @@ func (rt *OrtCpuRuntime) DecodeFullAudioWithContext(ctx context.Context, generat
 	audioCodeLengthsTensor.Destroy()
 
 	if err != nil {
-		log.Printf("  codec_decode_full 失败：%v", err)
+		log.Errorf("  codec_decode_full 失败：%v", err)
 		return nil, 0
 	}
 	// 更新 Session 使用时间
@@ -1754,7 +1754,7 @@ func (rt *OrtCpuRuntime) DecodeFullAudioWithContext(ctx context.Context, generat
 		copy(channels[ch], audioData[startOff:endOff])
 	}
 
-	log.Printf("  解码音频: frames=%d channels=%d samples=%d audioShape=%v audioDataLen=%d", frameCount, numChannels, audioLength, audioShape, len(audioData))
+	log.Debugf("  解码音频: frames=%d channels=%d samples=%d audioShape=%v audioDataLen=%d", frameCount, numChannels, audioLength, audioShape, len(audioData))
 	return channels, int(audioLength)
 }
 
@@ -1828,13 +1828,13 @@ func (rt *OrtCpuRuntime) CheckAndReleaseIdleSessions() {
 
 	// 有活跃请求时不执行重置，避免销毁正在使用的 session
 	if rt.ActiveRequests.Load() > 0 {
-		log.Printf("[ORT] 跳过空闲 Session 检查：当前有 %d 个活跃请求", rt.ActiveRequests.Load())
+		log.Warnf("[ORT] 跳过空闲 Session 检查：当前有 %d 个活跃请求", rt.ActiveRequests.Load())
 		return
 	}
 
 	now := time.Now()
 	count := 0
-	log.Printf("[ORT] 开始检查空闲 Session (超时阈值：%v)...", rt.SessionIdleTimeout)
+	log.Infof("[ORT] 开始检查空闲 Session (超时阈值：%v)...", rt.SessionIdleTimeout)
 
 	// 检查每个 Session
 	count += rt.checkAndReleaseOne("prefill", rt.Onnx.Inference.Prefill, now)
@@ -1848,12 +1848,12 @@ func (rt *OrtCpuRuntime) CheckAndReleaseIdleSessions() {
 	count += rt.checkAndReleaseOne("codec_decode_step", rt.Onnx.Inference.CodecDecodeStep, now)
 
 	if count > 0 {
-		log.Printf("[ORT] 发现 %d 个空闲 Session (超时：%v)，执行重置...", count, rt.SessionIdleTimeout)
+		log.Infof("[ORT] 发现 %d 个空闲 Session (超时：%v)，执行重置...", count, rt.SessionIdleTimeout)
 		// 调用 ResetSessions 来销毁并重新创建所有 Session
 		if err := rt.ResetSessions(); err != nil {
-			log.Printf("[ORT] 重置 Session 失败：%v", err)
+			log.Errorf("[ORT] 重置 Session 失败：%v", err)
 		} else {
-			log.Printf("[ORT] 重置完成，已释放 %d 个空闲 Session", count)
+			log.Infof("[ORT] 重置完成，已释放 %d 个空闲 Session", count)
 		}
 	}
 }
@@ -1862,13 +1862,13 @@ func (rt *OrtCpuRuntime) CheckAndReleaseIdleSessions() {
 func (rt *OrtCpuRuntime) checkAndReleaseOne(name string, timed *TimedSession, now time.Time) int {
 	if timed != nil && timed.Session != nil {
 		idleTime := now.Sub(timed.LastUsed)
-		log.Printf("[ORT]   Session '%s': 空闲 %v (阈值：%v)", name, idleTime, rt.SessionIdleTimeout)
+		log.Debugf("[ORT]   Session '%s': 空闲 %v (阈值：%v)", name, idleTime, rt.SessionIdleTimeout)
 		if idleTime > rt.SessionIdleTimeout {
-			log.Printf("[ORT] Session '%s' 空闲超时 (%v > %v)，标记需要重置", name, idleTime, rt.SessionIdleTimeout)
+			log.Debugf("[ORT] Session '%s' 空闲超时 (%v > %v)，标记需要重置", name, idleTime, rt.SessionIdleTimeout)
 			return 1
 		}
 	} else {
-		log.Printf("[ORT]   Session '%s': 未加载", name)
+		log.Infof("[ORT]   Session '%s': 未加载", name)
 	}
 	return 0
 }
@@ -1895,11 +1895,11 @@ func (rt *OrtCpuRuntime) ForceResetSessions() error {
 func (rt *OrtCpuRuntime) resetSessionsInternal(force bool) error {
 	// 有活跃请求时不执行重置，避免销毁正在使用的 session（除非强制）
 	if !force && rt.ActiveRequests.Load() > 0 {
-		log.Printf("[ORT] 跳过 Session 重置：当前有 %d 个活跃请求", rt.ActiveRequests.Load())
+		log.Warnf("[ORT] 跳过 Session 重置：当前有 %d 个活跃请求", rt.ActiveRequests.Load())
 		return nil
 	}
 
-	log.Printf("[ORT] 销毁旧 sessions...")
+	log.Debugf("[ORT] 销毁旧 sessions...")
 
 	rt.SessionMutex.Lock()
 	rt.destroyInferenceSessions()
@@ -1907,7 +1907,7 @@ func (rt *OrtCpuRuntime) resetSessionsInternal(force bool) error {
 	rt.SessionMutex.Unlock()
 
 	// 重新创建推理 sessions（阶段2）
-	log.Printf("[ORT] 重新创建推理 sessions...")
+	log.Debugf("[ORT] 重新创建推理 sessions...")
 	return rt.CreateSessions()
 }
 
@@ -1917,10 +1917,10 @@ func (rt *OrtCpuRuntime) DestroyAllSessions() {
 	rt.SessionMutex.Lock()
 	defer rt.SessionMutex.Unlock()
 
-	log.Printf("[ORT] 销毁所有 sessions（阶段1+阶段2）...")
+	log.Debugf("[ORT] 销毁所有 sessions（阶段1+阶段2）...")
 	rt.destroyInferenceSessions()
 	rt.destroyCodecEncodeSession()
-	log.Printf("[ORT] 所有 sessions 已销毁")
+	log.Debugf("[ORT] 所有 sessions 已销毁")
 }
 
 // DestroyCodecEncodeSession 销毁阶段1（音频编码）的 CodecEncode session
@@ -1929,7 +1929,7 @@ func (rt *OrtCpuRuntime) DestroyCodecEncodeSession() {
 	rt.SessionMutex.Lock()
 	defer rt.SessionMutex.Unlock()
 
-	log.Printf("[ORT] 销毁 CodecEncode session（阶段1）...")
+	log.Debugf("[ORT] 销毁 CodecEncode session（阶段1）...")
 	rt.destroyCodecEncodeSession()
 }
 
@@ -1946,7 +1946,7 @@ func (rt *OrtCpuRuntime) EnsureCodecEncodeSession() error {
 		return nil // 已存在，无需创建
 	}
 
-	log.Printf("[ORT] 懒加载创建 CodecEncode session...")
+	log.Debugf("[ORT] 懒加载创建 CodecEncode session...")
 	codecDir := filepath.Dir(rt.CodecMetaPath)
 	codecFiles := rt.CodecMeta["files"].(map[string]interface{})
 
@@ -1957,22 +1957,22 @@ func (rt *OrtCpuRuntime) EnsureCodecEncodeSession() error {
 	defer sessionOptions.Destroy()
 
 	if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableExtended); err != nil {
-		log.Printf("  警告: 设置图优化级别失败: %v", err)
+		log.Errorf("  警告: 设置图优化级别失败: %v", err)
 	}
 	if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_pattern", "0"); err != nil {
-		log.Printf("  警告: 设置 enable_mem_pattern 失败: %v", err)
+		log.Errorf("  警告: 设置 enable_mem_pattern 失败: %v", err)
 	}
 	if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_reuse", "1"); err != nil {
-		log.Printf("  警告: 设置 enable_mem_reuse 失败: %v", err)
+		log.Errorf("  警告: 设置 enable_mem_reuse 失败: %v", err)
 	}
 	if err := sessionOptions.AddSessionConfigEntry("session.use_arena", "0"); err != nil {
-		log.Printf("  警告: 设置 use_arena 失败: %v", err)
+		log.Errorf("  警告: 设置 use_arena 失败: %v", err)
 	}
 	if err := sessionOptions.SetIntraOpNumThreads(rt.ThreadCount); err != nil {
-		log.Printf("  警告: 设置 IntraOp 线程数失败: %v", err)
+		log.Errorf("  警告: 设置 IntraOp 线程数失败: %v", err)
 	}
 	if err := sessionOptions.SetInterOpNumThreads(1); err != nil {
-		log.Printf("  警告: 设置 InterOp 线程数失败: %v", err)
+		log.Errorf("  警告: 设置 InterOp 线程数失败: %v", err)
 	}
 
 	onnxPath := filepath.Join(codecDir, fmt.Sprintf("%v", codecFiles["encode"]))
@@ -1984,7 +1984,7 @@ func (rt *OrtCpuRuntime) EnsureCodecEncodeSession() error {
 		return fmt.Errorf("创建 CodecEncode session 失败: %w", err)
 	}
 	s.CodecEncode = &TimedSession{Session: sess, LastUsed: time.Now()}
-	log.Printf("[ORT] CodecEncode session 懒加载创建完成")
+	log.Debugf("[ORT] CodecEncode session 懒加载创建完成")
 	return nil
 }
 

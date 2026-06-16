@@ -2,7 +2,6 @@ package normalizer
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	chinese "github.com/TelenLiu/WeTextProcessing-go/tn/chinese"
 	english "github.com/TelenLiu/WeTextProcessing-go/tn/english"
 	tn "github.com/TelenLiu/WeTextProcessing-go/tn"
@@ -207,31 +207,31 @@ func BuildCache() error {
 	enCacheOK := verifyCacheFiles(enCacheDir, "en_tn") == nil
 
 	if zhCacheOK && enCacheOK {
-		log.Printf("[normalizer] FST 缓存文件已存在，跳过构建直接加载")
+		log.Debugf("[normalizer] FST 缓存文件已存在，跳过构建直接加载")
 		// 用 rebuild=false 初始化，从磁盘加载缓存
 		initZh(nil)
 		initEn(nil)
 		return nil
 	}
 
-	log.Printf("[normalizer] 开始构建 FST 缓存 (中文TN + 英文TN)")
+	log.Infof("[normalizer] 开始构建 FST 缓存 (中文TN + 英文TN)")
 
 	buildLang := func(name, cacheDir, prefix string, cacheExists bool, fn func(func(string, int, int))) error {
 		if cacheExists {
-			log.Printf("[normalizer] %s: 缓存已存在，跳过构建", name)
+			log.Debugf("[normalizer] %s: 缓存已存在，跳过构建", name)
 			return nil
 		}
-		log.Printf("[normalizer] %s: 开始构建", name)
+		log.Infof("[normalizer] %s: 开始构建", name)
 		t0 := time.Now()
 		fn(func(stage string, current, total int) {
-			log.Printf("[normalizer] %s: %s (%d/%d)", name, stage, current, total)
+			log.Debugf("[normalizer] %s: %s (%d/%d)", name, stage, current, total)
 		})
 		elapsed := time.Since(t0).Round(time.Second)
 		if err := verifyCacheFiles(cacheDir, prefix); err != nil {
-			log.Printf("[normalizer] %s: 完成但缓存文件验证失败: %v", name, err)
+			log.Warnf("[normalizer] %s: 完成但缓存文件验证失败: %v", name, err)
 			return fmt.Errorf("%s 缓存文件不完整: %v", name, err)
 		}
-		log.Printf("[normalizer] %s: 完成 (%v), 缓存文件已就绪", name, elapsed)
+		log.Infof("[normalizer] %s: 完成 (%v), 缓存文件已就绪", name, elapsed)
 		return nil
 	}
 
@@ -256,7 +256,7 @@ func BuildCache() error {
 		return fmt.Errorf("英文TN归一化缓存构建失败: %v", err)
 	}
 
-	log.Println("[normalizer] FST 缓存构建完成")
+	log.Infoln("[normalizer] FST 缓存构建完成")
 	return nil
 }
 

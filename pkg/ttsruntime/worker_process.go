@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/worker"
 )
@@ -57,7 +57,7 @@ func createWorkerExe(exePath, name string) string {
 
 	// 确保 .workers 目录存在
 	if err := os.MkdirAll(workersDir, 0755); err != nil {
-		log.Printf("[WorkerProcess] 创建worker目录失败: %v, 使用原始路径", err)
+		log.Warnf("[WorkerProcess] 创建worker目录失败: %v, 使用原始路径", err)
 		return exePath
 	}
 
@@ -70,14 +70,14 @@ func createWorkerExe(exePath, name string) string {
 		if fi2.Mode()&os.ModeSymlink != 0 {
 			linkTarget, err := os.Readlink(target)
 			if err == nil && linkTarget == exePath {
-				log.Printf("[WorkerProcess] 复用已有的 worker 符号链接: %s", target)
+				log.Debugf("[WorkerProcess] 复用已有的 worker 符号链接: %s", target)
 				return target
 			}
 		} else if fi2.Mode().IsRegular() {
 			// 是普通文件（副本），检查是否与源文件相同
 			fi1, err1 := os.Stat(exePath)
 			if err1 == nil && !os.SameFile(fi1, fi2) && fi1.Size() == fi2.Size() {
-				log.Printf("[WorkerProcess] 复用已有的 worker 副本: %s", target)
+				log.Debugf("[WorkerProcess] 复用已有的 worker 副本: %s", target)
 				return target
 			}
 		}
@@ -613,7 +613,7 @@ func (wp *WorkerProcess) SynthesizeStreamEx(ctx context.Context, text string, vo
 				return
 			}
 			if resp.resp.Type == worker.MsgError {
-				log.Printf("[WorkerProcess #%s] 流式错误: %s", wp.Name, resp.resp.Error)
+				log.Warnf("[WorkerProcess #%s] 流式错误: %s", wp.Name, resp.resp.Error)
 				return
 			}
 			if resp.resp.Type == worker.MsgChunk {
@@ -674,7 +674,7 @@ func (wp *WorkerProcess) SynthesizeStreamWithPreparedText(ctx context.Context, p
 				return
 			}
 			if resp.resp.Type == worker.MsgError {
-				log.Printf("[WorkerProcess #%s] 流式错误: %s", wp.Name, resp.resp.Error)
+				log.Warnf("[WorkerProcess #%s] 流式错误: %s", wp.Name, resp.resp.Error)
 				return
 			}
 			if resp.resp.Type == worker.MsgChunk {

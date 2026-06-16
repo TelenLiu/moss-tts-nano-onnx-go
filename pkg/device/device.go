@@ -2,9 +2,9 @@ package device
 
 import (
 	"fmt"
-	"log"
 	"runtime"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
@@ -79,9 +79,9 @@ func GetDeviceInfo() *DeviceInfo {
 			info.GPUInfo.Available = true
 			info.GPUInfo.Name = "CUDA"
 			info.GPUInfo.Vendor = "NVIDIA"
-			log.Printf("[GetDeviceInfo] CUDA设备可用")
+			log.Debugf("[GetDeviceInfo] CUDA设备可用")
 		} else {
-			log.Printf("[GetDeviceInfo] CUDA不可用: %v", err)
+			log.Debugf("[GetDeviceInfo] CUDA不可用: %v", err)
 		}
 
 		// 尝试创建CoreML选项来检测CoreML是否可用（Apple M1/M2 GPU）
@@ -96,12 +96,12 @@ func GetDeviceInfo() *DeviceInfo {
 				info.GPUInfo.Available = true
 				info.GPUInfo.Name = "CoreML"
 				info.GPUInfo.Vendor = "Apple"
-				log.Printf("[GetDeviceInfo] CoreML设备可用 (Apple M1/M2 GPU)")
+				log.Debugf("[GetDeviceInfo] CoreML设备可用 (Apple M1/M2 GPU)")
 			} else {
-				log.Printf("[GetDeviceInfo] CoreML不可用: %v", err)
+				log.Debugf("[GetDeviceInfo] CoreML不可用: %v", err)
 			}
 		} else {
-			log.Printf("[GetDeviceInfo] 创建SessionOptions失败: %v", err)
+			log.Debugf("[GetDeviceInfo] 创建SessionOptions失败: %v", err)
 		}
 	}
 
@@ -111,18 +111,18 @@ func GetDeviceInfo() *DeviceInfo {
 // DetectGPU 检测GPU可用性（需要在ONNX Runtime初始化后调用）
 func DetectGPU() bool {
 	if !ort.IsInitialized() {
-		log.Printf("[DetectGPU] ONNX Runtime 未初始化，无法检测GPU")
+		log.Debugf("[DetectGPU] ONNX Runtime 未初始化，无法检测GPU")
 		return false
 	}
 
 	// 尝试创建CUDA选项来检测CUDA是否可用
 	cudaOptions, err := ort.NewCUDAProviderOptions()
 	if err != nil {
-		log.Printf("[DetectGPU] 创建CUDA选项失败: %v", err)
+		log.Debugf("[DetectGPU] 创建CUDA选项失败: %v", err)
 		return false
 	}
 	cudaOptions.Destroy()
-	log.Printf("[DetectGPU] 检测到CUDA设备")
+	log.Debugf("[DetectGPU] 检测到CUDA设备")
 	return true
 }
 

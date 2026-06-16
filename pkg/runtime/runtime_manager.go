@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 )
@@ -59,7 +59,7 @@ func (m *RuntimeManager) emitProgress(phase, message string, percent int, err er
 	m.progress = append(m.progress, evt)
 	m.mu.Unlock()
 
-	log.Printf("[%s] %s (%d%%)", phase, message, percent)
+	log.Infof("[%s] %s (%d%%)", phase, message, percent)
 }
 
 func (m *RuntimeManager) Initialize(ctx context.Context, progressCb ProgressCallback) error {

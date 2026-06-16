@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math/rand"
 	"net"
 	"os"
@@ -17,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/worker"
@@ -64,7 +64,7 @@ func (s *workerConnState) safeWriteResponse(conn net.Conn, id int, resp *worker.
 	defer s.writeMu.Unlock()
 	resp.ID = id
 	if err := worker.WriteResponse(conn, resp, attachment); err != nil {
-		log.Printf("[Worker] 写响应失败: %v", err)
+		log.Errorf("[Worker] 写响应失败: %v", err)
 	}
 }
 
@@ -75,7 +75,7 @@ func workerMain() {
 		log.Fatalf("[Worker] 读取初始化参数失败: %v", err)
 	}
 
-	log.Printf("[Worker] 初始化参数: modelDir=%s threads=%d coreMemMB=%d listenAddr=%s",
+	log.Infof("[Worker] 初始化参数: modelDir=%s threads=%d coreMemMB=%d listenAddr=%s",
 		initReq.ModelDir, initReq.ThreadCount, initReq.CoreMemMB, initReq.ListenAddr)
 
 	// 初始化依赖
@@ -105,14 +105,14 @@ func workerMain() {
 	addr := listener.Addr().String()
 	fmt.Printf("LISTEN:%s\n", addr)
 
-	log.Printf("[Worker] 开始监听: %s", addr)
+	log.Infof("[Worker] 开始监听: %s", addr)
 
 	// 信号处理：主进程退出时子进程也退出
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigCh
-		log.Println("[Worker] 收到退出信号")
+		log.Infoln("[Worker] 收到退出信号")
 		listener.Close()
 		os.Exit(0)
 	}()
@@ -125,7 +125,7 @@ func workerMain() {
 	defer conn.Close()
 	listener.Close() // 不再接受新连接
 
-	log.Printf("[Worker] 主进程已连接: %s", conn.RemoteAddr())
+	log.Infof("[Worker] 主进程已连接: %s", conn.RemoteAddr())
 
 	// 处理请求
 	state := newWorkerConnState()
@@ -137,10 +137,10 @@ func workerHandleConnection(conn net.Conn, rt *ttsruntime.OnnxTtsRuntime, state 
 		req, _, err := worker.ReadRequest(conn)
 		if err != nil {
 			if strings.Contains(err.Error(), "closed") || strings.Contains(err.Error(), "EOF") || strings.Contains(err.Error(), "reset") {
-				log.Printf("[Worker] 连接关闭")
+				log.Infof("[Worker] 连接关闭")
 				return
 			}
-			log.Printf("[Worker] 读取请求失败: %v", err)
+			log.Errorf("[Worker] 读取请求失败: %v", err)
 			return
 		}
 
@@ -198,10 +198,10 @@ func workerHandleConnection(conn net.Conn, rt *ttsruntime.OnnxTtsRuntime, state 
 			}
 			cancelled := state.cancelTask(cancelReqID)
 			if cancelled {
-				log.Printf("[Worker] 已取消请求 #%d 的推理", cancelReqID)
+				log.Infof("[Worker] 已取消请求 #%d 的推理", cancelReqID)
 				state.safeWriteResponse(conn, req.ID, &worker.Response{Type: worker.MsgCancelled}, nil)
 			} else {
-				log.Printf("[Worker] 未找到请求 #%d，无法取消", cancelReqID)
+				log.Warnf("[Worker] 未找到请求 #%d，无法取消", cancelReqID)
 				state.safeWriteResponse(conn, req.ID, &worker.Response{Type: worker.MsgError, Error: "未找到请求"}, nil)
 			}
 
@@ -229,7 +229,7 @@ func workerHandleSynthesize(conn net.Conn, req *worker.Request, rt *ttsruntime.O
 		text = req.PreparedText
 		enableRobust = false
 		enableWeText = false
-		log.Printf("[Worker] 请求 #%d 使用主进程预处理的文本，跳过文本预处理", req.ID)
+		log.Debugf("[Worker] 请求 #%d 使用主进程预处理的文本，跳过文本预处理", req.ID)
 	}
 
 	// 应用请求中的采样参数覆盖
@@ -260,7 +260,7 @@ func workerHandleSynthesize(conn net.Conn, req *worker.Request, rt *ttsruntime.O
 		// 检查是否因取消导致
 		select {
 		case <-ctx.Done():
-			log.Printf("[Worker] 请求 #%d 已被取消", req.ID)
+			log.Infof("[Worker] 请求 #%d 已被取消", req.ID)
 			state.safeWriteResponse(conn, req.ID, &worker.Response{Type: worker.MsgCancelled}, nil)
 			return
 		default:
@@ -272,7 +272,7 @@ func workerHandleSynthesize(conn net.Conn, req *worker.Request, rt *ttsruntime.O
 	// 检查是否在推理完成后被取消
 	select {
 	case <-ctx.Done():
-		log.Printf("[Worker] 请求 #%d 推理完成但已被取消，丢弃结果", req.ID)
+		log.Infof("[Worker] 请求 #%d 推理完成但已被取消，丢弃结果", req.ID)
 		return
 	default:
 	}

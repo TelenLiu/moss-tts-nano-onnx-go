@@ -4,11 +4,12 @@ import (
 	"crypto/sha256"
 	"encoding/gob"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 )
 
 // audioCloneEncodeVersion 编码版本号
@@ -63,12 +64,12 @@ func (c *AudioCloneCache) Get(hashKey string) [][]int {
 
 	var entry audioCloneGobEntry
 	if err := gobDecode(data, &entry); err != nil {
-		log.Printf("[AudioCloneCache] 解码缓存文件失败 %s: %v，删除损坏文件", filePath, err)
+		log.Warnf("[AudioCloneCache] 解码缓存文件失败 %s: %v，删除损坏文件", filePath, err)
 		os.Remove(filePath)
 		return nil
 	}
 
-	log.Printf("[AudioCloneCache] 命中文件缓存: %s (frames=%d, created=%s)", hashKey[:12], len(entry.Codes), entry.CreatedAt.Format("2006-01-02 15:04:05"))
+	log.Debugf("[AudioCloneCache] 命中文件缓存: %s (frames=%d, created=%s)", hashKey[:12], len(entry.Codes), entry.CreatedAt.Format("2006-01-02 15:04:05"))
 	return entry.Codes
 }
 
@@ -102,7 +103,7 @@ func (c *AudioCloneCache) Put(hashKey string, codes [][]int) error {
 		return fmt.Errorf("重命名缓存文件失败: %w", err)
 	}
 
-	log.Printf("[AudioCloneCache] 写入文件缓存: %s (frames=%d)", hashKey[:12], len(codes))
+	log.Debugf("[AudioCloneCache] 写入文件缓存: %s (frames=%d)", hashKey[:12], len(codes))
 	return nil
 }
 
@@ -118,7 +119,7 @@ func (c *AudioCloneCache) CleanExpired(expHours int) {
 	entries, err := os.ReadDir(c.cacheDir)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			log.Printf("[AudioCloneCache] 读取缓存目录失败: %v", err)
+			log.Warnf("[AudioCloneCache] 读取缓存目录失败: %v", err)
 		}
 		return
 	}
@@ -140,7 +141,7 @@ func (c *AudioCloneCache) CleanExpired(expHours int) {
 		if info.ModTime().Before(threshold) {
 			filePath := filepath.Join(c.cacheDir, entry.Name())
 			if err := os.Remove(filePath); err != nil {
-				log.Printf("[AudioCloneCache] 删除过期缓存失败 %s: %v", entry.Name(), err)
+				log.Warnf("[AudioCloneCache] 删除过期缓存失败 %s: %v", entry.Name(), err)
 			} else {
 				cleaned++
 			}
@@ -148,7 +149,7 @@ func (c *AudioCloneCache) CleanExpired(expHours int) {
 	}
 
 	if cleaned > 0 {
-		log.Printf("[AudioCloneCache] 清理过期缓存: 删除 %d 个文件 (阈值=%d小时)", cleaned, expHours)
+		log.Debugf("[AudioCloneCache] 清理过期缓存: 删除 %d 个文件 (阈值=%d小时)", cleaned, expHours)
 	}
 }
 
@@ -165,7 +166,7 @@ func (c *AudioCloneCache) StartCleanupLoop(expHours int, interval time.Duration)
 			c.CleanExpired(expHours)
 		}
 	}()
-	log.Printf("[AudioCloneCache] 启动定时清理: 间隔=%v 过期阈值=%d小时", interval, expHours)
+	log.Debugf("[AudioCloneCache] 启动定时清理: 间隔=%v 过期阈值=%d小时", interval, expHours)
 }
 
 func (c *AudioCloneCache) gobPath(hashKey string) string {

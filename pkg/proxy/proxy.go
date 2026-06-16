@@ -9,7 +9,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -19,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"golang.org/x/net/proxy"
 )
 
@@ -69,7 +69,7 @@ func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Printf("[Proxy] 配置文件不存在, 跳过代理设置: %s", path)
+			log.Debugf("[Proxy] 配置文件不存在, 跳过代理设置: %s", path)
 			return nil, nil
 		}
 		return nil, fmt.Errorf("读取代理配置失败: %w", err)
@@ -82,7 +82,7 @@ func Load(path string) (*Config, error) {
 
 	cfg = normalize(cfg)
 	if cfg == nil {
-		log.Printf("[Proxy] 配置文件内容为空, 不启用代理: %s", path)
+		log.Debugf("[Proxy] 配置文件内容为空, 不启用代理: %s", path)
 		return nil, nil
 	}
 
@@ -91,7 +91,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	SetGlobal(cfg)
-	log.Printf("[Proxy] 已加载代理配置: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
+	log.Infof("[Proxy] 已加载代理配置: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
 	return cfg, nil
 }
 

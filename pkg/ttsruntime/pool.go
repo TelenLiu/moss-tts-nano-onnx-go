@@ -3,11 +3,11 @@ package ttsruntime
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
@@ -102,12 +102,12 @@ func NewPool(modelDir string, workCores, reserveWorkCores, coreCPUs, coreMemMB i
 		stopCh:          make(chan struct{}),
 	}
 
-	log.Printf("[Pool] 初始化推理单元池: workCores=%d reserveWorkCores=%d coreCPUs=%d coreMemMB=%d", workCores, reserveWorkCores, coreCPUs, coreMemMB)
+	log.Infof("[Pool] 初始化推理单元池: workCores=%d reserveWorkCores=%d coreCPUs=%d coreMemMB=%d", workCores, reserveWorkCores, coreCPUs, coreMemMB)
 
 	// 启动常驻核心，命名从1开始
 	for i := 0; i < workCores; i++ {
 		name := fmt.Sprintf("%d", i+1)
-		log.Printf("[Pool] 启动常驻推理子进程 #%s (threads=%d, memMB=%d)...", name, coreCPUs, coreMemMB)
+		log.Infof("[Pool] 启动常驻推理子进程 #%s (threads=%d, memMB=%d)...", name, coreCPUs, coreMemMB)
 		wp, err := NewWorkerProcess(name, modelDir, coreCPUs, coreMemMB, maxNewFrames, doSample, sampleMode, executionMode)
 		if err != nil {
 			// 清理已创建的子进程
@@ -123,7 +123,7 @@ func NewPool(modelDir string, workCores, reserveWorkCores, coreCPUs, coreMemMB i
 			Type: CoreTypeWork,
 			Worker: wp,
 		}
-		log.Printf("[Pool] 常驻推理子进程 #%s 启动完成", name)
+		log.Infof("[Pool] 常驻推理子进程 #%s 启动完成", name)
 	}
 
 	pool.ready = true
@@ -223,10 +223,10 @@ func (p *Pool) tryStartReserveCore() *WorkCore {
 	seq := p.reserveNextSeq.Add(1)
 	name := fmt.Sprintf("r%d", seq)
 
-	log.Printf("[Pool] 启动预留推理子进程 #%s (threads=%d, memMB=%d)...", name, p.coreCPUs, p.coreMemMB)
+	log.Infof("[Pool] 启动预留推理子进程 #%s (threads=%d, memMB=%d)...", name, p.coreCPUs, p.coreMemMB)
 	wp, err := NewWorkerProcess(name, p.modelDir, p.coreCPUs, p.coreMemMB, p.maxNewFrames, p.doSample, p.sampleMode, p.executionMode)
 	if err != nil {
-		log.Printf("[Pool] 启动预留推理子进程 #%s 失败: %v", name, err)
+		log.Errorf("[Pool] 启动预留推理子进程 #%s 失败: %v", name, err)
 		return nil
 	}
 
@@ -240,7 +240,7 @@ func (p *Pool) tryStartReserveCore() *WorkCore {
 	core.ActiveReqs.Add(1)
 	p.reserveCores = append(p.reserveCores, core)
 
-	log.Printf("[Pool] 预留推理子进程 #%s 启动完成", name)
+	log.Infof("[Pool] 预留推理子进程 #%s 启动完成", name)
 	return core
 }
 
@@ -256,7 +256,7 @@ func (p *Pool) enqueueWait(ctx context.Context) (*WorkCore, error) {
 	queueLen := len(p.pendingQueue)
 	p.pendingMu.Unlock()
 
-	log.Printf("[Pool] 所有核心忙，请求排队等候 (队列长度=%d)", queueLen)
+	log.Debugf("[Pool] 所有核心忙，请求排队等候 (队列长度=%d)", queueLen)
 
 	select {
 	case core := <-pending.core:
@@ -299,7 +299,7 @@ func (p *Pool) dispatchPending() {
 
 		select {
 		case pending.core <- core:
-			log.Printf("[Pool] 排队请求已分配到推理子进程 #%s", core.Name)
+			log.Debugf("[Pool] 排队请求已分配到推理子进程 #%s", core.Name)
 		case <-pending.ctx.Done():
 			// 请求已被取消，释放核心
 			p.Release(core)
@@ -349,7 +349,7 @@ func (p *Pool) cleanupIdleReserveCores() {
 
 		if active == 0 && now-lastActive > ReserveIdleTimeout.Milliseconds() {
 			// 闲置超时，销毁进程
-			log.Printf("[Pool] 预留推理子进程 #%s 闲置超时，销毁进程", core.Name)
+			log.Debugf("[Pool] 预留推理子进程 #%s 闲置超时，销毁进程", core.Name)
 			if core.Worker != nil {
 				core.Worker.Close()
 			}
@@ -370,13 +370,13 @@ func (p *Pool) Close() {
 
 	for _, core := range p.workCores {
 		if core != nil && core.Worker != nil {
-			log.Printf("[Pool] 关闭常驻推理子进程 #%s...", core.Name)
+			log.Debugf("[Pool] 关闭常驻推理子进程 #%s...", core.Name)
 			core.Worker.Close()
 		}
 	}
 	for _, core := range p.reserveCores {
 		if core != nil && core.Worker != nil {
-			log.Printf("[Pool] 关闭预留推理子进程 #%s...", core.Name)
+			log.Debugf("[Pool] 关闭预留推理子进程 #%s...", core.Name)
 			core.Worker.Close()
 		}
 	}
@@ -482,9 +482,9 @@ func (p *Pool) SynthesizeWithContextEx(ctx context.Context, text string, voice s
 
 	// 主进程完成文本预处理，子进程不再需要加载 WeTextProcessing
 	preparedText := normalizer.PrepareTTSText(text, enableRobust, enableWeText)
-	log.Printf("[Pool] 文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
+	log.Debugf("[Pool] 文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
 
-	log.Printf("[Pool] 请求分配到推理子进程 #%s (type=%s, active=%d)", core.Name, core.Type, core.ActiveReqs.Load())
+	log.Debugf("[Pool] 请求分配到推理子进程 #%s (type=%s, active=%d)", core.Name, core.Type, core.ActiveReqs.Load())
 	return core.Worker.SynthesizeWithPreparedText(ctx, preparedText, voice, promptAudioPath, outputAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, streaming, maxNewFrames, voiceCloneMaxTextTokens, seed, overrides)
 }
 
@@ -498,9 +498,9 @@ func (p *Pool) SynthesizeStreamEx(ctx context.Context, text string, voice string
 
 	// 主进程完成文本预处理，子进程不再需要加载 WeTextProcessing
 	preparedText := normalizer.PrepareTTSText(text, enableRobust, enableWeText)
-	log.Printf("[Pool] 流式文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
+	log.Debugf("[Pool] 流式文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
 
-	log.Printf("[Pool] 流式请求分配到推理子进程 #%s (type=%s, active=%d)", core.Name, core.Type, core.ActiveReqs.Load())
+	log.Debugf("[Pool] 流式请求分配到推理子进程 #%s (type=%s, active=%d)", core.Name, core.Type, core.ActiveReqs.Load())
 
 	chunkChan, err := core.Worker.SynthesizeStreamWithPreparedText(ctx, preparedText, voice, promptAudioPath, preloadId, preloadAudioPath, sampleMode, doSample, maxNewFrames, voiceCloneMaxTextTokens, seed, overrides)
 	if err != nil {
@@ -559,14 +559,14 @@ func (p *Pool) PreloadVoice(preloadId, audioPath, voice string) error {
 	for _, core := range p.workCores {
 		if core.Worker != nil {
 			if err := core.Worker.PreloadVoice(preloadId, audioPath, voice); err != nil {
-				log.Printf("[Pool] 推理子进程 #%s 预加载音色失败: %v", core.Name, err)
+				log.Warnf("[Pool] 推理子进程 #%s 预加载音色失败: %v", core.Name, err)
 			}
 		}
 	}
 	for _, core := range p.reserveCores {
 		if core.Worker != nil {
 			if err := core.Worker.PreloadVoice(preloadId, audioPath, voice); err != nil {
-				log.Printf("[Pool] 预留推理子进程 #%s 预加载音色失败: %v", core.Name, err)
+				log.Warnf("[Pool] 预留推理子进程 #%s 预加载音色失败: %v", core.Name, err)
 			}
 		}
 	}

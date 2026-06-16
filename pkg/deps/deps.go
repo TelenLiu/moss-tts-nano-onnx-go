@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/proxy"
 )
 
@@ -234,12 +234,12 @@ func EnsureNativeLibs(cfg *Config) error {
 	ortTarget := findOrtLib(ortDir)
 
 	if fileExists(ortTarget) {
-		log.Printf("ONNX Runtime 本地依赖已就绪: %s", ortTarget)
+		log.Infof("ONNX Runtime 本地依赖已就绪: %s", ortTarget)
 		cfg.reportProgress(DownloadProgress{Phase: "download", File: "ONNX Runtime", Message: "ONNX Runtime 已就绪 (跳过下载)", Percent: 100})
 		return nil
 	}
 
-	log.Printf("开始下载 ONNX Runtime v%s ...", OnnxRuntimeVersion)
+	log.Infof("开始下载 ONNX Runtime v%s ...", OnnxRuntimeVersion)
 	ortURL := cfg.ortDownloadURL()
 	if err := downloadAndExtractOrtLibs(cfg, ortURL, ortDir); err != nil {
 		return fmt.Errorf("下载 ONNX Runtime 失败: %w", err)
@@ -250,7 +250,7 @@ func EnsureNativeLibs(cfg *Config) error {
 		return fmt.Errorf("ONNX Runtime 下载完成但未找到库文件 (搜索目录: %s)", ortDir)
 	}
 
-	log.Printf("ONNX Runtime 下载完成: %s", ortTarget)
+	log.Infof("ONNX Runtime 下载完成: %s", ortTarget)
 	return nil
 }
 
@@ -265,17 +265,17 @@ func EnsureModels(cfg *Config) error {
 	} {
 		p := filepath.Join(cfg.ModelDir, candidate)
 		if fileExists(p) {
-			log.Printf("模型已就绪: %s", p)
+			log.Infof("模型已就绪: %s", p)
 			cfg.reportProgress(DownloadProgress{Phase: "download", File: "TTS Model", Message: "模型文件已就绪 (跳过下载)", Percent: 100})
 			return nil
 		}
 	}
 
-	log.Printf("开始下载模型文件 (useMirror=%v, hfBaseURL=%s)...", cfg.UseMirror, cfg.HFBaseURL)
+	log.Infof("开始下载模型文件 (useMirror=%v, hfBaseURL=%s)...", cfg.UseMirror, cfg.HFBaseURL)
 
 	if err := downloadHFRepo(cfg, cfg.HFBaseURL, cfg.TTSRepoID, ttsDir, "TTS"); err != nil {
 		if cfg.UseMirror {
-			log.Printf("镜像源下载TTS模型失败，尝试默认源: %v", err)
+			log.Warnf("镜像源下载TTS模型失败，尝试默认源: %v", err)
 			cfg2 := *cfg
 			cfg2.HFBaseURL = DefaultHFBaseURL
 			if err2 := downloadHFRepo(&cfg2, DefaultHFBaseURL, cfg.TTSRepoID, ttsDir, "TTS"); err2 != nil {
@@ -287,7 +287,7 @@ func EnsureModels(cfg *Config) error {
 	}
 	if err := downloadHFRepo(cfg, cfg.HFBaseURL, cfg.CodecRepoID, codecDir, "Codec"); err != nil {
 		if cfg.UseMirror {
-			log.Printf("镜像源下载Codec模型失败，尝试默认源: %v", err)
+			log.Warnf("镜像源下载Codec模型失败，尝试默认源: %v", err)
 			cfg2 := *cfg
 			cfg2.HFBaseURL = DefaultHFBaseURL
 			if err2 := downloadHFRepo(&cfg2, DefaultHFBaseURL, cfg.CodecRepoID, codecDir, "Codec"); err2 != nil {
@@ -298,7 +298,7 @@ func EnsureModels(cfg *Config) error {
 		}
 	}
 
-	log.Printf("模型下载完成: %s", cfg.ModelDir)
+	log.Infof("模型下载完成: %s", cfg.ModelDir)
 	return nil
 }
 
@@ -379,7 +379,7 @@ func downloadHFRepo(cfg *Config, baseURL, repoID, localDir, label string) error 
 			Message: fmt.Sprintf("%s 下载中...", prefix),
 		})
 		if err := downloadFileTracked(cfg, f.URL, targetPath, f.Size, prefix, totalDownloaded, totalSize, label); err != nil {
-			log.Printf("  警告: 下载 %s 失败: %v", f.Path, err)
+			log.Warnf("  警告: 下载 %s 失败: %v", f.Path, err)
 		}
 		fi, _ := os.Stat(targetPath)
 		if fi != nil {
@@ -402,7 +402,7 @@ func downloadAndExtractOrtLibs(cfg *Config, url, destDir string) error {
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
-	log.Printf("  下载: %s", url)
+	log.Debugf("  下载: %s", url)
 	cfg.reportProgress(DownloadProgress{Phase: "download", File: "ONNX Runtime", Message: "下载 ONNX Runtime..."})
 	if err := downloadFileTracked(cfg, url, tmpPath, 0, "ONNX Runtime", 0, 0, "ORT"); err != nil {
 		return err
@@ -493,7 +493,7 @@ func downloadFileTracked(cfg *Config, url, dest string, expectedSize int64, pref
 	}
 
 	if expectedSize > 0 && written != expectedSize {
-		log.Printf("  警告: 下载大小不匹配 expected=%d actual=%d", expectedSize, written)
+		log.Warnf("  警告: 下载大小不匹配 expected=%d actual=%d", expectedSize, written)
 	}
 	return nil
 }
@@ -680,10 +680,10 @@ func newProxyTransport() *http.Transport {
 			ExpectContinueTimeout: 1 * time.Second,
 		}
 		if err := proxy.ApplyToTransport(transport); err != nil {
-			log.Printf("[Proxy] 注入代理配置失败, 回退到默认 transport: %v", err)
+			log.Warnf("[Proxy] 注入代理配置失败, 回退到默认 transport: %v", err)
 			transport.Proxy = http.ProxyFromEnvironment
 		} else {
-			log.Printf("[Proxy] 已为下载请求启用代理: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
+			log.Debugf("[Proxy] 已为下载请求启用代理: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
 		}
 		httpTransportInst = transport
 	})
@@ -771,19 +771,19 @@ func EnsureFFmpeg(cfg *Config) error {
 	localFFmpeg := FindLocalFFmpeg(cfg.LibDir)
 
 	if localFFmpeg != "" {
-		log.Printf("FFmpeg 本地依赖已就绪: %s", localFFmpeg)
+		log.Infof("FFmpeg 本地依赖已就绪: %s", localFFmpeg)
 		cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "FFmpeg 已就绪 (跳过下载)", Percent: 100})
 		return nil
 	}
 
 	url := ffmpegDownloadURL()
 	if url == "" {
-		log.Printf("[FFmpeg] 当前平台不支持自动下载 FFmpeg，MP3 编码将使用系统 ffmpeg 或回退 WAV")
+		log.Debugf("[FFmpeg] 当前平台不支持自动下载 FFmpeg，MP3 编码将使用系统 ffmpeg 或回退 WAV")
 		cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "当前平台不支持自动下载 FFmpeg", Percent: 100})
 		return nil
 	}
 
-	log.Printf("开始下载 FFmpeg (含 libmp3lame)...")
+	log.Infof("开始下载 FFmpeg (含 libmp3lame)...")
 	cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "下载 FFmpeg..."})
 
 	os.MkdirAll(ffmpegDir, 0755)
@@ -809,7 +809,7 @@ func EnsureFFmpeg(cfg *Config) error {
 
 	if err := downloadFileTracked(cfg, url, tmpPath, 0, "FFmpeg", 0, 0, "FFmpeg"); err != nil {
 		// 下载失败不返回错误，MP3 编码会回退到 WAV
-		log.Printf("[FFmpeg] 下载失败: %v，MP3 编码将回退到 WAV", err)
+		log.Warnf("[FFmpeg] 下载失败: %v，MP3 编码将回退到 WAV", err)
 		cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "FFmpeg 下载失败，MP3 将回退 WAV", Percent: 100})
 		return nil
 	}
@@ -817,21 +817,21 @@ func EnsureFFmpeg(cfg *Config) error {
 	cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "解压 FFmpeg..."})
 
 	if err := extractFFmpeg(tmpPath, ffmpegDir); err != nil {
-		log.Printf("[FFmpeg] 解压失败: %v，MP3 编码将回退到 WAV", err)
+		log.Warnf("[FFmpeg] 解压失败: %v，MP3 编码将回退到 WAV", err)
 		return nil
 	}
 
 	// 验证解压结果
 	localFFmpeg = FindLocalFFmpeg(cfg.LibDir)
 	if localFFmpeg == "" {
-		log.Printf("[FFmpeg] 解压后未找到 ffmpeg 可执行文件")
+		log.Warnf("[FFmpeg] 解压后未找到 ffmpeg 可执行文件")
 		return nil
 	}
 
 	// 设置可执行权限
 	os.Chmod(localFFmpeg, 0755)
 
-	log.Printf("FFmpeg 下载完成: %s", localFFmpeg)
+	log.Infof("FFmpeg 下载完成: %s", localFFmpeg)
 	cfg.reportProgress(DownloadProgress{Phase: "download", File: "FFmpeg", Message: "FFmpeg 下载完成", Percent: 100})
 	return nil
 }

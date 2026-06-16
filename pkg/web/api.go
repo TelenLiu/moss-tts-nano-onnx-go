@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/device"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ttsruntime"
 )
@@ -178,7 +178,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		// 与 Python 源码保持一致：默认 375 帧
 		// 不同随机种子会影响模型语速，帧数不足会导致音频末尾被截断
 		maxNewFrames = 375
-		log.Printf("[API] 使用默认 maxNewFrames: %d", maxNewFrames)
+		log.Debugf("[API] 使用默认 maxNewFrames: %d", maxNewFrames)
 	}
 	voiceCloneMaxTokens := req.VoiceCloneMaxTextTokens
 	if voiceCloneMaxTokens <= 0 {
@@ -220,7 +220,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	if req.Seed != nil {
 		seedVal = fmt.Sprintf("%d", *req.Seed)
 	}
-	log.Printf("[API synthesize] text=%q voice=%q promptAudioPath=%q preloadId=%q sampleMode=%s maxNewFrames=%d voiceCloneMaxTokens=%d seed=%s stream=%v",
+	log.Infof("[API synthesize] text=%q voice=%q promptAudioPath=%q preloadId=%q sampleMode=%s maxNewFrames=%d voiceCloneMaxTokens=%d seed=%s stream=%v",
 		req.Text, voice, promptAudioPath, preloadId, sampleMode, maxNewFrames, voiceCloneMaxTokens, seedVal, req.Stream)
 
 	ctx, cancel := context.WithCancel(r.Context())
@@ -228,7 +228,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("[API synthesize] 请求断开，取消合成")
+		log.Infof("[API synthesize] 请求断开，取消合成")
 	}()
 
 	enableRobust := true
@@ -239,7 +239,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	if req.EnableWeText != nil {
 		enableWeText = *req.EnableWeText
 	}
-	log.Printf("[API synthesize] enableRobust=%v enableWeText=%v", enableRobust, enableWeText)
+	log.Debugf("[API synthesize] enableRobust=%v enableWeText=%v", enableRobust, enableWeText)
 
 	// 构建采样参数覆盖
 	overrides := &ortruntime.GenerationOverrides{
@@ -265,12 +265,12 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		enableRobust, enableWeText, req.Seed, overrides,
 	)
 	if err != nil {
-		log.Printf("[API synthesize] 合成失败: %v", err)
+		log.Errorf("[API synthesize] 合成失败: %v", err)
 		http.Error(w, fmt.Sprintf("Synthesis failed: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[API synthesize] 合成成功: sampleRate=%d audioSamples=%d elapsed=%.2fs chunks=%d",
+	log.Infof("[API synthesize] 合成成功: sampleRate=%d audioSamples=%d elapsed=%.2fs chunks=%d",
 		result.SampleRate, result.AudioSamples, result.ElapsedSec, len(result.TextChunks))
 
 	// 根据 format 参数选择编码格式
@@ -291,7 +291,7 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		}
 		mp3Data, err := audio.EncodeMP3(result.Waveform, result.Channels, result.SampleRate, mp3Cfg)
 		if err != nil {
-			log.Printf("[API synthesize] MP3 编码失败，回退 WAV: %v", err)
+			log.Warnf("[API synthesize] MP3 编码失败，回退 WAV: %v", err)
 			audioData, _ = audio.EncodeWAV(result.Waveform, result.Channels, result.SampleRate)
 			actualFormat = "wav"
 		} else {
@@ -335,7 +335,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		enableRobust, enableWeText, req.Seed, overrides,
 	)
 	if err != nil {
-		log.Printf("[API synthesize stream] 流式合成启动失败: %v", err)
+		log.Errorf("[API synthesize stream] 流式合成启动失败: %v", err)
 		return
 	}
 
@@ -357,7 +357,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		for chunk := range chunkChan {
 			select {
 			case <-ctx.Done():
-				log.Printf("[API synthesize stream] 请求断开，停止流式输出")
+				log.Infof("[API synthesize stream] 请求断开，停止流式输出")
 				return
 			default:
 			}
@@ -386,7 +386,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		}
 		mp3Data, err := audio.EncodeMP3(waveform, channels, sampleRate, mp3Cfg)
 		if err != nil {
-			log.Printf("[API synthesize stream] MP3 编码失败: %v", err)
+			log.Errorf("[API synthesize stream] MP3 编码失败: %v", err)
 			http.Error(w, fmt.Sprintf("MP3 encoding failed: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -400,7 +400,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		w.Header().Set("X-Audio-Format", "mp3")
 		w.Header().Set("X-Seed-Used", fmt.Sprintf("%d", seedUsed))
 		w.Write(mp3Data)
-		log.Printf("[API synthesize stream] MP3流式合成完成: chunks=%d totalSamples=%d elapsed=%.2fs mp3Size=%d",
+		log.Infof("[API synthesize stream] MP3流式合成完成: chunks=%d totalSamples=%d elapsed=%.2fs mp3Size=%d",
 			chunkCount, totalSamples, elapsed, len(mp3Data))
 		return
 	}
@@ -411,7 +411,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 	for chunk := range chunkChan {
 		select {
 		case <-ctx.Done():
-			log.Printf("[API synthesize stream] 请求断开，停止流式输出")
+			log.Infof("[API synthesize stream] 请求断开，停止流式输出")
 			return
 		default:
 		}
@@ -440,7 +440,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		pcmData := unsafe.Slice((*byte)(unsafe.Pointer(&chunk.Waveform[0])), len(chunk.Waveform)*4)
 
 		if _, err := w.Write(pcmData); err != nil {
-			log.Printf("[API synthesize stream] 写入流失败: %v", err)
+			log.Errorf("[API synthesize stream] 写入流失败: %v", err)
 			return
 		}
 		flusher.Flush()
@@ -450,7 +450,7 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 	}
 
 	elapsed := time.Since(startTime).Seconds()
-	log.Printf("[API synthesize stream] 流式合成完成: chunks=%d totalSamples=%d elapsed=%.2fs",
+	log.Infof("[API synthesize stream] 流式合成完成: chunks=%d totalSamples=%d elapsed=%.2fs",
 		chunkCount, totalSamples, elapsed)
 }
 
@@ -489,21 +489,21 @@ func (s *Server) handleVoices(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 	filename := strings.TrimPrefix(r.URL.Path, "/api/audio/")
 	filePath := filepath.Join(os.TempDir(), filename)
-	log.Printf("[API audio] 请求音频: %s (完整路径: %s)", filename, filePath)
+	log.Debugf("[API audio] 请求音频: %s (完整路径: %s)", filename, filePath)
 
 	info, err := os.Stat(filePath)
 	if os.IsNotExist(err) {
-		log.Printf("[API audio] 音频文件不存在: %s", filePath)
+		log.Debugf("[API audio] 音频文件不存在: %s", filePath)
 		http.Error(w, "Audio file not found", http.StatusNotFound)
 		return
 	}
 	if err != nil {
-		log.Printf("[API audio] 访问音频文件出错: %v", err)
+		log.Errorf("[API audio] 访问音频文件出错: %v", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[API audio] 提供音频: %s (大小: %d bytes)", filePath, info.Size())
+	log.Debugf("[API audio] 提供音频: %s (大小: %d bytes)", filePath, info.Size())
 	// 根据文件扩展名设置 Content-Type
 	if strings.HasSuffix(strings.ToLower(filename), ".mp3") {
 		w.Header().Set("Content-Type", "audio/mpeg")
@@ -565,7 +565,7 @@ func (s *Server) handleUploadPromptAudio(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	log.Printf("[API upload] 参考音频上传成功: name=%s size=%d path=%s", req.FileName, len(audioData), tempFile.Name())
+	log.Infof("[API upload] 参考音频上传成功: name=%s size=%d path=%s", req.FileName, len(audioData), tempFile.Name())
 
 	resp := map[string]string{
 		"path":      tempFile.Name(),
@@ -627,5 +627,5 @@ func (s *Server) handleDemoPromptAudio(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Expires", "0")
 
 	http.ServeFile(w, r, demo.Path)
-	log.Printf("[Demo] 提供演示音频: %s -> %s", demoID, demo.Path)
+	log.Debugf("[Demo] 提供演示音频: %s -> %s", demoID, demo.Path)
 }

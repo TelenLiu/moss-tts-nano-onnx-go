@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"math"
 	"os"
 	"os/exec"
@@ -15,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	resample "github.com/gunter-q12/resample"
 )
 
@@ -55,18 +55,18 @@ func GetFFmpegPath() string {
 			localFFmpeg := deps.FindLocalFFmpeg(libDir)
 			if localFFmpeg != "" {
 				ffmpegPathCache = localFFmpeg
-				log.Printf("[Audio] 使用本地 FFmpeg: %s", localFFmpeg)
+				log.Debugf("[Audio] 使用本地 FFmpeg: %s", localFFmpeg)
 				return
 			}
 		}
 		// 2. 使用系统 PATH 中的 ffmpeg
 		if path, err := exec.LookPath("ffmpeg"); err == nil {
 			ffmpegPathCache = path
-			log.Printf("[Audio] 使用系统 FFmpeg: %s", path)
+			log.Debugf("[Audio] 使用系统 FFmpeg: %s", path)
 			return
 		}
 		ffmpegPathCache = ""
-		log.Printf("[Audio] 未找到 FFmpeg，MP3 编码不可用")
+		log.Debugf("[Audio] 未找到 FFmpeg，MP3 编码不可用")
 	})
 	return ffmpegPathCache
 }
@@ -90,12 +90,12 @@ func detectMP3Encoder(ffmpegBin string) string {
 		for _, enc := range []string{"libmp3lame", "mp3"} {
 			if bytes.Contains(output, []byte(enc)) {
 				mp3EncoderCache = enc
-				log.Printf("[Audio] 检测到 FFmpeg MP3 编码器: %s", enc)
+				log.Debugf("[Audio] 检测到 FFmpeg MP3 编码器: %s", enc)
 				return
 			}
 		}
 		mp3EncoderCache = ""
-		log.Printf("[Audio] FFmpeg 未找到 MP3 编码器")
+		log.Debugf("[Audio] FFmpeg 未找到 MP3 编码器")
 	})
 	return mp3EncoderCache
 }
@@ -107,7 +107,7 @@ func EncodeMP3(waveform []float32, channels, sampleRate int, cfg MP3EncodeConfig
 	ffmpegBin := GetFFmpegPath()
 	encoder := detectMP3Encoder(ffmpegBin)
 	if ffmpegBin == "" || encoder == "" {
-		log.Printf("[EncodeMP3] FFmpeg 或 MP3 编码器不可用，回退到 WAV 格式")
+		log.Debugf("[EncodeMP3] FFmpeg 或 MP3 编码器不可用，回退到 WAV 格式")
 		return EncodeWAV(waveform, channels, sampleRate)
 	}
 
@@ -624,13 +624,13 @@ func resampleWaveform(waveform []float32, channels, inRate, outRate int) ([]floa
 		return nil, fmt.Errorf("重采样写入失败: %w", err)
 	}
 	if n != len(inputBytes) {
-		log.Printf("[resampleWaveform] 警告: 写入 %d 字节，期望 %d 字节", n, len(inputBytes))
+		log.Warnf("[resampleWaveform] 警告: 写入 %d 字节，期望 %d 字节", n, len(inputBytes))
 	}
 
 	// 使用 ReadFrom 刷新重采样器内部缓冲区
 	// 传入空的 reader 以确保所有数据都被处理
 	if _, err := r.ReadFrom(bytes.NewReader([]byte{})); err != nil {
-		log.Printf("[resampleWaveform] 刷新重采样器失败: %v", err)
+		log.Warnf("[resampleWaveform] 刷新重采样器失败: %v", err)
 	}
 
 	// 从 outBuf 读取重采样后的 bytes 并转换为 float32
@@ -657,13 +657,13 @@ func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]fl
 	}
 
 	// 高质量重采样失败，回退到 ffmpeg
-	log.Printf("[LoadReferenceAudio] 高质量重采样失败(%v)，回退到 ffmpeg", err)
+	log.Debugf("[LoadReferenceAudio] 高质量重采样失败(%v)，回退到 ffmpeg", err)
 	waveform, channels, sampleRate, err = loadWithFFmpegResampled(path, targetSampleRate, targetChannels)
 	if err == nil {
 		// 截断过长的参考音频
 		maxSamples := MaxReferenceAudioDurationSec * targetSampleRate * targetChannels
 		if len(waveform) > maxSamples {
-			log.Printf("[LoadReferenceAudio] 参考音频过长(%d样本, 约%.1f秒)，截断至%d秒",
+			log.Debugf("[LoadReferenceAudio] 参考音频过长(%d样本, 约%.1f秒)，截断至%d秒",
 				len(waveform), float64(len(waveform))/float64(targetSampleRate*targetChannels), float64(MaxReferenceAudioDurationSec))
 			waveform = waveform[:maxSamples]
 		}
@@ -671,7 +671,7 @@ func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]fl
 	}
 
 	// ffmpeg 不可用时回退到原有逻辑
-	log.Printf("[LoadReferenceAudio] ffmpeg重采样失败(%v)，回退到内置重采样", err)
+	log.Debugf("[LoadReferenceAudio] ffmpeg重采样失败(%v)，回退到内置重采样", err)
 	waveform, channels, sampleRate, err = ReadWAV(path)
 	if err != nil {
 		return nil, 0, 0, err
@@ -685,7 +685,7 @@ func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]fl
 	// 截断过长的参考音频，避免编码后帧数过多导致 OOM
 	maxSamples := MaxReferenceAudioDurationSec * sampleRate * channels
 	if len(waveform) > maxSamples {
-		log.Printf("[LoadReferenceAudio] 参考音频过长(%d样本, 约%.1f秒)，截断至%d秒",
+		log.Debugf("[LoadReferenceAudio] 参考音频过长(%d样本, 约%.1f秒)，截断至%d秒",
 			len(waveform), float64(len(waveform))/float64(sampleRate*channels), float64(MaxReferenceAudioDurationSec))
 		waveform = waveform[:maxSamples]
 	}

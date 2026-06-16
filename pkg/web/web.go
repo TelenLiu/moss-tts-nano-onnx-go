@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"net/http/pprof"
 	"os"
@@ -16,6 +15,7 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/device"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
@@ -53,10 +53,10 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, ho
 	// 加载 onnx 配置
 	onnxCfg, err := onnxconfig.Load("")
 	if err != nil {
-		log.Printf("[Server] 加载 onnx 配置失败，使用默认值: %v", err)
+		log.Warnf("[Server] 加载 onnx 配置失败，使用默认值: %v", err)
 		onnxCfg = onnxconfig.DefaultConfig()
 	}
-	log.Printf("[Server] ONNX 配置: workCores=%d reserveWorkCores=%d coreCPUs=%d", onnxCfg.WorkCores, onnxCfg.ReserveWorkCores, onnxCfg.CoreCPUs)
+	log.Infof("[Server] ONNX 配置: workCores=%d reserveWorkCores=%d coreCPUs=%d", onnxCfg.WorkCores, onnxCfg.ReserveWorkCores, onnxCfg.CoreCPUs)
 
 	s := &Server{
 		Cfg:             cfg,
@@ -75,9 +75,9 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, ho
 
 	if _, err := os.Stat(demoPath); err == nil {
 		s.loadDemoEntries(demoPath, assetsDir)
-		log.Printf("[Demo] 已加载 %d 个默认样例", len(s.DemoEntries))
+		log.Infof("[Demo] 已加载 %d 个默认样例", len(s.DemoEntries))
 	} else {
-		log.Printf("[Demo] 未找到demo.jsonl，跳过加载: %v", err)
+		log.Debugf("[Demo] 未找到demo.jsonl，跳过加载: %v", err)
 	}
 
 	return s
@@ -106,13 +106,13 @@ func (s *Server) emit(evt ProgressEvent) {
 			msg += fmt.Sprintf(" 预计需要: %ds", remainSec)
 		}
 	}
-	log.Print(msg)
+	log.Infof(msg)
 }
 
 func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 	file, err := os.Open(demoPath)
 	if err != nil {
-		log.Printf("[Demo] 打开demo.jsonl失败: %v", err)
+		log.Warnf("[Demo] 打开demo.jsonl失败: %v", err)
 		return
 	}
 	defer file.Close()
@@ -132,7 +132,7 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 			PreloadID string `json:"preloadId"`
 		}
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			log.Printf("[Demo] 解析demo行失败: %v", err)
+			log.Warnf("[Demo] 解析demo行失败: %v", err)
 			continue
 		}
 
@@ -144,7 +144,7 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 		rolePath = strings.TrimPrefix(rolePath, "assets/")
 		fullPath := filepath.Join(assetsDir, filepath.FromSlash(rolePath))
 		if _, err := os.Stat(fullPath); err != nil {
-			log.Printf("[Demo] 跳过demo，音频文件不存在: %s", fullPath)
+			log.Debugf("[Demo] 跳过demo，音频文件不存在: %s", fullPath)
 			continue
 		}
 
@@ -163,7 +163,7 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 	}
 
 	if err := scanner.Err(); err != nil {
-		log.Printf("[Demo] 读取demo.jsonl错误: %v", err)
+		log.Warnf("[Demo] 读取demo.jsonl错误: %v", err)
 	}
 }
 
@@ -200,7 +200,7 @@ func (s *Server) Start() error {
 	if s.Host == "" {
 		displayAddr = fmt.Sprintf("0.0.0.0:%d", s.Port)
 	}
-	log.Printf("Web 服务启动于 http://%s/ (监听所有网络接口)", displayAddr)
+	log.Infof("Web 服务启动于 http://%s/ (监听所有网络接口)", displayAddr)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -220,7 +220,7 @@ func (s *Server) Close() {
 	normalizer.Close()
 
 	s.Ready = false
-	log.Printf("[Server] 资源已释放")
+	log.Infof("[Server] 资源已释放")
 }
 
 func (s *Server) backgroundInit() {
@@ -259,11 +259,11 @@ func (s *Server) backgroundInit() {
 	s.mu.Lock()
 	s.DeviceInfo = deviceInfo
 	s.mu.Unlock()
-	log.Printf("[Device] CPU核心数: %d, GPU可用: %v, CUDA可用: %v", deviceInfo.CPUInfo.NumCores, deviceInfo.HasGPU, deviceInfo.HasCUDA)
+	log.Infof("[Device] CPU核心数: %d, GPU可用: %v, CUDA可用: %v", deviceInfo.CPUInfo.NumCores, deviceInfo.HasGPU, deviceInfo.HasCUDA)
 
 	// 如果用户选择GPU模式但没有GPU，自动切换到混合模式
 	if s.ExecutionMode == "gpu" && !deviceInfo.HasCUDA {
-		log.Printf("[Device] GPU不可用，自动切换到混合模式")
+		log.Warnf("[Device] GPU不可用，自动切换到混合模式")
 		s.ExecutionMode = "hybrid"
 	}
 

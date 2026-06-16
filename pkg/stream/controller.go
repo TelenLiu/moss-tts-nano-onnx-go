@@ -3,7 +3,6 @@ package stream
 import (
 	"bytes"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"runtime"
@@ -11,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 )
 
 type MemoryStats struct {
@@ -111,11 +112,11 @@ func (m *MemoryMonitor) Sample() MemoryStats {
 	}
 
 	if stats.RSS > m.criticalThreshold {
-		log.Printf("[内存警告] 严重：RSS=%.1fMB Alloc=%.1fMB (阈值：%.1fMB)",
+		log.Warnf("[内存警告] 严重：RSS=%.1fMB Alloc=%.1fMB (阈值：%.1fMB)",
 			float64(stats.RSS)/1024/1024, float64(stats.Alloc)/1024/1024,
 			float64(m.criticalThreshold)/1024/1024)
 	} else if stats.RSS > m.warningThreshold {
-		log.Printf("[内存警告] RSS=%.1fMB Alloc=%.1fMB (阈值：%.1fMB)",
+		log.Warnf("[内存警告] RSS=%.1fMB Alloc=%.1fMB (阈值：%.1fMB)",
 			float64(stats.RSS)/1024/1024, float64(stats.Alloc)/1024/1024,
 			float64(m.warningThreshold)/1024/1024)
 	}
@@ -138,7 +139,7 @@ func (m *MemoryMonitor) GetHistory() []MemoryStats {
 }
 
 func (m *MemoryMonitor) ForceGC() {
-	log.Printf("[内存管理] 触发强制 GC")
+	log.Debugf("[内存管理] 触发强制 GC")
 	runtime.GC()
 	m.Sample()
 }
@@ -167,19 +168,19 @@ func (b *BackpressureController) Update(bufferSize, bufferCapacity int, processi
 
 	if b.bufferUsage > 0.9 {
 		b.throttleFactor = 0.5
-		log.Printf("[背压] 高负载：buffer 使用率 %.0f%%，降低生成速度", b.bufferUsage*100)
+		log.Debugf("[背压] 高负载：buffer 使用率 %.0f%%，降低生成速度", b.bufferUsage*100)
 	} else if b.bufferUsage > 0.7 {
 		b.throttleFactor = 0.75
 	} else if b.bufferUsage < 0.3 {
 		b.throttleFactor = 1.2
-		log.Printf("[背压] 低负载：buffer 使用率 %.0f%%，提高生成速度", b.bufferUsage*100)
+		log.Debugf("[背压] 低负载：buffer 使用率 %.0f%%，提高生成速度", b.bufferUsage*100)
 	} else {
 		b.throttleFactor = 1.0
 	}
 
 	if b.currentLatencyMs > b.targetLatencyMs*2 {
 		b.throttleFactor *= 0.8
-		log.Printf("[背压] 高延迟：%.1fms (目标：%.1fms)", b.currentLatencyMs, b.targetLatencyMs)
+		log.Debugf("[背压] 高延迟：%.1fms (目标：%.1fms)", b.currentLatencyMs, b.targetLatencyMs)
 	}
 }
 

@@ -3,11 +3,12 @@ package ttsruntime
 import (
 	"encoding/gob"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 )
 
 // PreloadData 预加载的音频数据
@@ -44,7 +45,7 @@ func NewPreloadCache(cacheDir string, maxInMemory int, rt *OnnxTtsRuntime) *Prel
 	}
 	// 创建缓存目录
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		log.Printf("[PreloadCache] 创建缓存目录失败: %v", err)
+		log.Warnf("[PreloadCache] 创建缓存目录失败: %v", err)
 	}
 	return pc
 }
@@ -58,7 +59,7 @@ func (pc *PreloadCache) Get(id string) (*PreloadData, error) {
 	if data, ok := pc.cache[id]; ok {
 		data.LastAccessTime = time.Now()
 		pc.updateAccessOrder(id)
-		log.Printf("[PreloadCache] 从内存缓存获取: %s (frames=%d)", id, len(data.AudioCodes))
+		log.Debugf("[PreloadCache] 从内存缓存获取: %s (frames=%d)", id, len(data.AudioCodes))
 		return data, nil
 	}
 
@@ -67,12 +68,12 @@ func (pc *PreloadCache) Get(id string) (*PreloadData, error) {
 	if _, err := os.Stat(cacheFile); err == nil {
 		data, err := pc.loadFromDisk(id)
 		if err != nil {
-			log.Printf("[PreloadCache] 从磁盘加载失败: %v", err)
+			log.Warnf("[PreloadCache] 从磁盘加载失败: %v", err)
 			return nil, err
 		}
 		// 加入内存缓存
 		pc.addToMemoryCache(id, data)
-		log.Printf("[PreloadCache] 从磁盘缓存加载: %s (frames=%d)", id, len(data.AudioCodes))
+		log.Debugf("[PreloadCache] 从磁盘缓存加载: %s (frames=%d)", id, len(data.AudioCodes))
 		return data, nil
 	}
 
@@ -86,19 +87,19 @@ func (pc *PreloadCache) Preload(id string, audioPath string, text string) error 
 
 	// 检查是否已缓存
 	if _, ok := pc.cache[id]; ok {
-		log.Printf("[PreloadCache] 已缓存: %s", id)
+		log.Debugf("[PreloadCache] 已缓存: %s", id)
 		return nil
 	}
 
 	// 检查磁盘缓存
 	cacheFile := pc.getCacheFilePath(id)
 	if _, err := os.Stat(cacheFile); err == nil {
-		log.Printf("[PreloadCache] 磁盘缓存已存在: %s", id)
+		log.Debugf("[PreloadCache] 磁盘缓存已存在: %s", id)
 		return nil
 	}
 
 	// 编码音频
-	log.Printf("[PreloadCache] 预加载音频: %s -> %s", id, audioPath)
+	log.Debugf("[PreloadCache] 预加载音频: %s -> %s", id, audioPath)
 	audioCodes := pc.rt.EncodeReferenceAudioWithOptions(audioPath, true)
 	if audioCodes == nil {
 		return fmt.Errorf("音频编码失败: %s", audioPath)
@@ -116,13 +117,13 @@ func (pc *PreloadCache) Preload(id string, audioPath string, text string) error 
 
 	// 保存到磁盘
 	if err := pc.saveToDisk(id, data); err != nil {
-		log.Printf("[PreloadCache] 保存到磁盘失败: %v", err)
+		log.Warnf("[PreloadCache] 保存到磁盘失败: %v", err)
 	}
 
 	// 加入内存缓存
 	pc.addToMemoryCache(id, data)
 
-	log.Printf("[PreloadCache] 预加载完成: %s (frames=%d)", id, len(audioCodes))
+	log.Debugf("[PreloadCache] 预加载完成: %s (frames=%d)", id, len(audioCodes))
 	return nil
 }
 
@@ -140,7 +141,7 @@ func (pc *PreloadCache) addToMemoryCache(id string, data *PreloadData) {
 		// 淘汰最旧的（第一个）
 		if len(pc.accessOrder) > 0 {
 			evictID := pc.accessOrder[0]
-			log.Printf("[PreloadCache] LRU淘汰: %s", evictID)
+			log.Debugf("[PreloadCache] LRU淘汰: %s", evictID)
 			delete(pc.cache, evictID)
 			pc.accessOrder = pc.accessOrder[1:]
 		}
@@ -211,13 +212,13 @@ func (pc *PreloadCache) Clear() {
 
 	// 清空磁盘缓存
 	if err := os.RemoveAll(pc.cacheDir); err != nil {
-		log.Printf("[PreloadCache] 清空磁盘缓存失败: %v", err)
+		log.Warnf("[PreloadCache] 清空磁盘缓存失败: %v", err)
 	}
 	if err := os.MkdirAll(pc.cacheDir, 0755); err != nil {
-		log.Printf("[PreloadCache] 重新创建缓存目录失败: %v", err)
+		log.Warnf("[PreloadCache] 重新创建缓存目录失败: %v", err)
 	}
 
-	log.Printf("[PreloadCache] 缓存已清空")
+	log.Debugf("[PreloadCache] 缓存已清空")
 }
 
 // Stats 获取缓存统计信息

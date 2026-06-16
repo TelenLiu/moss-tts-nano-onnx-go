@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/tokenizer"
@@ -153,9 +153,9 @@ func (t *OnnxTtsRuntime) SplitVoiceCloneText(text string, maxTokens int) []strin
 	if len(sentenceCandidates) == 0 {
 		sentenceCandidates = []string{strings.TrimSpace(preparedText)}
 	}
-	log.Printf("[SplitVoiceCloneText] 原始句子数: %d, maxTokens=%d", len(sentenceCandidates), safeMaxTokens)
+	log.Debugf("[SplitVoiceCloneText] 原始句子数: %d, maxTokens=%d", len(sentenceCandidates), safeMaxTokens)
 	for i, s := range sentenceCandidates {
-		log.Printf("[SplitVoiceCloneText]   句子 %d: %q (tokens=%d)", i+1, s, t.CountTextTokens(s))
+		log.Debugf("[SplitVoiceCloneText]   句子 %d: %q (tokens=%d)", i+1, s, t.CountTextTokens(s))
 	}
 	type slice struct {
 		tokenCount int
@@ -215,9 +215,9 @@ func (t *OnnxTtsRuntime) SplitVoiceCloneText(text string, maxTokens int) []strin
 	if currentChunk != "" {
 		chunks = append(chunks, strings.TrimSpace(currentChunk))
 	}
-	log.Printf("[SplitVoiceCloneText] 分块结果: %d 块", len(chunks))
+	log.Debugf("[SplitVoiceCloneText] 分块结果: %d 块", len(chunks))
 	for i, chunk := range chunks {
-		log.Printf("[SplitVoiceCloneText]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
+		log.Debugf("[SplitVoiceCloneText]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
 	}
 	if len(chunks) > 1 {
 		return chunks
@@ -292,44 +292,44 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodes(voice string, promptAudioPath s
 }
 
 func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, promptAudioPath string, preloadId string, preloadAudioPath string) [][]int {
-	log.Printf("[ResolvePromptAudioCodes] voice=%q promptAudioPath=%q preloadId=%q preloadAudioPath=%q", voice, promptAudioPath, preloadId, preloadAudioPath)
+	log.Infof("[ResolvePromptAudioCodes] voice=%q promptAudioPath=%q preloadId=%q preloadAudioPath=%q", voice, promptAudioPath, preloadId, preloadAudioPath)
 
 	var result [][]int
 
 	// 优先使用preloadId
 	if preloadId != "" && t.PreloadCache != nil {
-		log.Printf("[ResolvePromptAudioCodes] 尝试使用preload缓存: %s", preloadId)
+		log.Infof("[ResolvePromptAudioCodes] 尝试使用preload缓存: %s", preloadId)
 		data, err := t.PreloadCache.Get(preloadId)
 		if err != nil {
-			log.Printf("[ResolvePromptAudioCodes] preload缓存获取失败: %v，尝试预加载", err)
+			log.Errorf("[ResolvePromptAudioCodes] preload缓存获取失败: %v，尝试预加载", err)
 			// 尝试预加载
 			if preloadAudioPath != "" {
 				if err := t.PreloadCache.Preload(preloadId, preloadAudioPath, ""); err != nil {
-					log.Printf("[ResolvePromptAudioCodes] 预加载失败: %v", err)
+					log.Errorf("[ResolvePromptAudioCodes] 预加载失败: %v", err)
 				} else {
 					// 再次尝试获取
 					data, err = t.PreloadCache.Get(preloadId)
 					if err == nil {
-						log.Printf("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
+						log.Infof("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
 						result = data.AudioCodes
 					}
 				}
 			}
 		} else {
-			log.Printf("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
+			log.Infof("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
 			result = data.AudioCodes
 		}
 	} else if preloadId != "" && t.PreloadCache == nil {
-		log.Printf("[ResolvePromptAudioCodes] 警告: PreloadCache未初始化，无法使用preloadId")
+		log.Warnf("[ResolvePromptAudioCodes] 警告: PreloadCache未初始化，无法使用preloadId")
 	}
 
 	if result == nil && promptAudioPath != "" {
-		log.Printf("[ResolvePromptAudioCodes] 使用上传的参考音频: %s", promptAudioPath)
+		log.Infof("[ResolvePromptAudioCodes] 使用上传的参考音频: %s", promptAudioPath)
 		codes := t.EncodeReferenceAudio(promptAudioPath)
 		if codes != nil {
-			log.Printf("[ResolvePromptAudioCodes] 参考音频编码成功: %d 帧", len(codes))
+			log.Debugf("[ResolvePromptAudioCodes] 参考音频编码成功: %d 帧", len(codes))
 		} else {
-			log.Printf("[ResolvePromptAudioCodes] 参考音频编码失败，将回退到内置音色")
+			log.Errorf("[ResolvePromptAudioCodes] 参考音频编码失败，将回退到内置音色")
 		}
 		if codes != nil {
 			result = codes
@@ -344,12 +344,12 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 				resolvedVoice = fmt.Sprintf("%v", voices[0]["voice"])
 			}
 		}
-		log.Printf("[ResolvePromptAudioCodes] 使用内置音色: %s", resolvedVoice)
+		log.Infof("[ResolvePromptAudioCodes] 使用内置音色: %s", resolvedVoice)
 		for _, v := range t.OrtRuntime.ListBuiltinVoices() {
 			if fmt.Sprintf("%v", v["voice"]) == resolvedVoice {
 				codes, ok := v["prompt_audio_codes"].([]interface{})
 				if !ok {
-					log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的prompt_audio_codes格式不正确，跳过", resolvedVoice)
+					log.Warnf("[ResolvePromptAudioCodes] 警告: 音色 %s 的prompt_audio_codes格式不正确，跳过", resolvedVoice)
 					continue
 				}
 				parsed := make([][]int, len(codes))
@@ -357,7 +357,7 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 				for i, codeRow := range codes {
 					row, ok := codeRow.([]interface{})
 					if !ok {
-						log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 的第%d行格式不正确", resolvedVoice, i)
+						log.Warnf("[ResolvePromptAudioCodes] 警告: 音色 %s 的第%d行格式不正确", resolvedVoice, i)
 						allOk = false
 						break
 					}
@@ -367,15 +367,15 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 					}
 				}
 				if allOk {
-					log.Printf("[ResolvePromptAudioCodes] 内置音色 %s 加载成功: %d 帧", resolvedVoice, len(parsed))
+					log.Debugf("[ResolvePromptAudioCodes] 内置音色 %s 加载成功: %d 帧", resolvedVoice, len(parsed))
 					result = parsed
 					break
 				}
-				log.Printf("[ResolvePromptAudioCodes] 警告: 音色 %s 加载失败，继续查找", resolvedVoice)
+				log.Errorf("[ResolvePromptAudioCodes] 警告: 音色 %s 加载失败，继续查找", resolvedVoice)
 			}
 		}
 		if result == nil {
-			log.Printf("[ResolvePromptAudioCodes] 警告: 未找到内置音色 %s，使用第一个内置音色作为默认", resolvedVoice)
+			log.Warnf("[ResolvePromptAudioCodes] 警告: 未找到内置音色 %s，使用第一个内置音色作为默认", resolvedVoice)
 			voices := t.OrtRuntime.ListBuiltinVoices()
 			if len(voices) > 0 {
 				for _, v := range voices {
@@ -397,7 +397,7 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 						}
 					}
 					if allOk {
-						log.Printf("[ResolvePromptAudioCodes] 使用第一个可用音色: %s (%d 帧)", fmt.Sprintf("%v", v["voice"]), len(parsed))
+						log.Debugf("[ResolvePromptAudioCodes] 使用第一个可用音色: %s (%d 帧)", fmt.Sprintf("%v", v["voice"]), len(parsed))
 						result = parsed
 						break
 					}
@@ -409,12 +409,12 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 	// 统一截断保护：限制 audio codes 帧数，避免 prefill 输入序列过长导致 OOM
 	const maxPromptAudioFrames = 300
 	if len(result) > maxPromptAudioFrames {
-		log.Printf("[ResolvePromptAudioCodes] 音频编码帧数过多(%d帧)，截断至%d帧", len(result), maxPromptAudioFrames)
+		log.Warnf("[ResolvePromptAudioCodes] 音频编码帧数过多(%d帧)，截断至%d帧", len(result), maxPromptAudioFrames)
 		result = result[:maxPromptAudioFrames]
 	}
 
 	if result == nil {
-		log.Printf("[ResolvePromptAudioCodes] 错误: 没有可用的内置音色，返回空")
+		log.Errorf("[ResolvePromptAudioCodes] 错误: 没有可用的内置音色，返回空")
 	}
 	return result
 }
@@ -429,7 +429,7 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	// 计算音频文件 hash，用于文件缓存 key
 	hashKey, err := t.AudioCloneCache.HashAudioFile(audioPath)
 	if err != nil {
-		log.Printf("[EncodeReferenceAudio] 计算音频hash失败: %v, 跳过缓存", err)
+		log.Errorf("[EncodeReferenceAudio] 计算音频hash失败: %v, 跳过缓存", err)
 	} else {
 		// 先查文件缓存，命中则直接返回，跳过阶段1
 		if cached := t.AudioCloneCache.Get(hashKey); cached != nil {
@@ -437,11 +437,11 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 		}
 	}
 
-	log.Printf("[EncodeReferenceAudio] 开始编码参考音频: %s", audioPath)
+	log.Debugf("[EncodeReferenceAudio] 开始编码参考音频: %s", audioPath)
 
 	// ========== 阶段1：音频编码 ==========
 	// 先销毁阶段2的推理 session，确保只有 CodecEncode 在内存中，避免峰值叠加
-	log.Printf("[EncodeReferenceAudio] [阶段1] 销毁推理 sessions，切换到音频编码阶段...")
+	log.Debugf("[EncodeReferenceAudio] [阶段1] 销毁推理 sessions，切换到音频编码阶段...")
 	t.OrtRuntime.DestroyAllSessions()
 	runtime.GC()
 	debug.FreeOSMemory()
@@ -450,16 +450,16 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	targetSampleRate := int(ortruntime.ToFloat64(codecConfig["sample_rate"]))
 	targetChannels := int(ortruntime.ToFloat64(codecConfig["channels"]))
 	numQuantizers := int(ortruntime.ToFloat64(codecConfig["num_quantizers"]))
-	log.Printf("[EncodeReferenceAudio] codec配置: sampleRate=%d channels=%d numQuantizers=%d", targetSampleRate, targetChannels, numQuantizers)
+	log.Debugf("[EncodeReferenceAudio] codec配置: sampleRate=%d channels=%d numQuantizers=%d", targetSampleRate, targetChannels, numQuantizers)
 
 	waveform, channels, sampleRate, err := audio.LoadReferenceAudio(audioPath, targetSampleRate, targetChannels)
 	if err != nil {
-		log.Printf("[EncodeReferenceAudio] 加载参考音频失败: %v, 使用内置音色", err)
+		log.Errorf("[EncodeReferenceAudio] 加载参考音频失败: %v, 使用内置音色", err)
 		// 加载失败，直接进入阶段2
 		t.OrtRuntime.CreateSessions()
 		return nil
 	}
-	log.Printf("[EncodeReferenceAudio] 加载完成: 原始采样率=%d 通道数=%d 总样本数=%d", sampleRate, channels, len(waveform))
+	log.Debugf("[EncodeReferenceAudio] 加载完成: 原始采样率=%d 通道数=%d 总样本数=%d", sampleRate, channels, len(waveform))
 
 	waveformLength := len(waveform) / channels
 
@@ -480,11 +480,11 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	inputs := []ort.Value{waveformTensor, inputLengthsTensor}
 	outputs := make([]ort.Value, 2)
 
-	log.Printf("[EncodeReferenceAudio] [阶段1] 创建 CodecEncode session 并编码...")
+	log.Debugf("[EncodeReferenceAudio] [阶段1] 创建 CodecEncode session 并编码...")
 
 	// 懒加载 CodecEncode session（此时推理 session 已销毁，不会内存叠加）
 	if err := t.OrtRuntime.EnsureCodecEncodeSession(); err != nil {
-		log.Printf("[EncodeReferenceAudio] CodecEncode session 创建失败: %v, 使用内置音色", err)
+		log.Errorf("[EncodeReferenceAudio] CodecEncode session 创建失败: %v, 使用内置音色", err)
 		t.OrtRuntime.CreateSessions()
 		return nil
 	}
@@ -494,7 +494,7 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	inputLengthsTensor.Destroy()
 
 	if err != nil {
-		log.Printf("[EncodeReferenceAudio] codec_encode 失败: %v, 使用内置音色", err)
+		log.Errorf("[EncodeReferenceAudio] codec_encode 失败: %v, 使用内置音色", err)
 		t.OrtRuntime.DestroyCodecEncodeSession()
 		runtime.GC()
 		debug.FreeOSMemory()
@@ -505,11 +505,11 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	audioCodesData := getInt32Data(outputs[0])
 	audioCodesShape := outputs[0].GetShape()
 	audioCodeLengthsData := getInt32Data(outputs[1])
-	log.Printf("[EncodeReferenceAudio] codec_encode 成功: audioCodes形状=%v audioCodeLengths=%v 数据长度=%d",
+	log.Debugf("[EncodeReferenceAudio] codec_encode 成功: audioCodes形状=%v audioCodeLengths=%v 数据长度=%d",
 		audioCodesShape, audioCodeLengthsData, len(audioCodesData))
 	// 调试：打印前32个原始数据
 	if len(audioCodesData) >= 32 {
-		log.Printf("[EncodeReferenceAudio] audioCodesData[:32]=%v", audioCodesData[:32])
+		log.Debugf("[EncodeReferenceAudio] audioCodesData[:32]=%v", audioCodesData[:32])
 	}
 
 	for _, v := range outputs {
@@ -526,11 +526,11 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	// 截断过长的音频编码帧，避免 prefill 输入序列过长导致 OOM
 	maxPromptAudioFrames := 300 // 约 24 秒（帧率 12.5/秒）
 	if codeLength > maxPromptAudioFrames {
-		log.Printf("[EncodeReferenceAudio] 音频编码帧数过多(%d帧)，截断至%d帧", codeLength, maxPromptAudioFrames)
+		log.Warnf("[EncodeReferenceAudio] 音频编码帧数过多(%d帧)，截断至%d帧", codeLength, maxPromptAudioFrames)
 		codeLength = maxPromptAudioFrames
 	}
 
-	log.Printf("[EncodeReferenceAudio] 解析codeLength=%d", codeLength)
+	log.Debugf("[EncodeReferenceAudio] 解析codeLength=%d", codeLength)
 
 	promptAudioCodes := make([][]int, codeLength)
 	for frameIndex := 0; frameIndex < codeLength; frameIndex++ {
@@ -544,30 +544,30 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	}
 
 	if codeLength > 0 {
-		log.Printf("[EncodeReferenceAudio] 参考音频编码完成: %d 帧, 第一帧codes=%v, 最后一帧codes=%v",
+		log.Debugf("[EncodeReferenceAudio] 参考音频编码完成: %d 帧, 第一帧codes=%v, 最后一帧codes=%v",
 			codeLength, promptAudioCodes[0], promptAudioCodes[codeLength-1])
 	} else {
-		log.Printf("[EncodeReferenceAudio] 参考音频编码完成: 0 帧")
+		log.Debugf("[EncodeReferenceAudio] 参考音频编码完成: 0 帧")
 	}
 
 	// 缓存编码结果到文件，后续相同音频无需再调用 CodecEncode
 	// skipAudioCloneCacheWrite 时跳过写入（PreloadCache 自身已有永久存储，避免重复）
 	if hashKey != "" && !skipAudioCloneCacheWrite {
 		if err := t.AudioCloneCache.Put(hashKey, promptAudioCodes); err != nil {
-			log.Printf("[EncodeReferenceAudio] 写入缓存失败: %v", err)
+			log.Errorf("[EncodeReferenceAudio] 写入缓存失败: %v", err)
 		}
 	}
 
 	// ========== 阶段1结束 → 阶段2准备 ==========
 	// 销毁 CodecEncode session，释放阶段1内存，然后重建推理 session
-	log.Printf("[EncodeReferenceAudio] [阶段1→阶段2] 销毁 CodecEncode，重建推理 sessions...")
+	log.Debugf("[EncodeReferenceAudio] [阶段1→阶段2] 销毁 CodecEncode，重建推理 sessions...")
 	t.OrtRuntime.DestroyCodecEncodeSession()
 	runtime.GC()
 	debug.FreeOSMemory()
 
 	// 重建推理 sessions（阶段2）
 	if err := t.OrtRuntime.CreateSessions(); err != nil {
-		log.Printf("[EncodeReferenceAudio] 重建推理 sessions 失败: %v", err)
+		log.Errorf("[EncodeReferenceAudio] 重建推理 sessions 失败: %v", err)
 	}
 
 	return promptAudioCodes
@@ -594,22 +594,22 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		if interrupted {
 			// 中断时强制重置 Session，释放 ONNX 内存池
 			t.OrtRuntime.ForceResetSessions()
-			log.Printf("[Synthesize] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
+			log.Infof("[Synthesize] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
 		}
 	}()
 
 	t.OrtRuntime.CheckAndReleaseIdleSessions()
 
-	log.Printf("[Synthesize] ========== 阶段1：音频编码 ==========")
-	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q preloadId=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, preloadId, sampleMode, doSample, maxNewFrames)
+	log.Infof("[Synthesize] ========== 阶段1：音频编码 ==========")
+	log.Infof("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q preloadId=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, preloadId, sampleMode, doSample, maxNewFrames)
 
 	var rngSeed int64 = 1234
 	if seed != nil {
 		rngSeed = int64(*seed)
-		log.Printf("[Synthesize] 使用随机种子: %d", *seed)
+		log.Infof("[Synthesize] 使用随机种子: %d", *seed)
 	} else {
 		rngSeed = time.Now().UnixNano()
-		log.Printf("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
+		log.Infof("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
 	}
 	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
 
@@ -617,33 +617,33 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	overrides := t.buildGenerationOverrides(sampleMode, doSample)
 
 	preparedText := t.PrepareSynthesisTextWithVoice(text, enableRobust, enableWeText, voice)
-	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
+	log.Debugf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(text), len(preparedText), enableRobust, enableWeText)
 	promptAudioCodes := t.ResolvePromptAudioCodesWithPreload(voice, promptAudioPath, preloadId, preloadAudioPath)
 	if promptAudioCodes == nil {
-		log.Printf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
+		log.Warnf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
 		promptAudioCodes = [][]int{}
 	} else {
 		// 截断过长的参考音频帧，减少 prefill 输入长度
 		promptAudioCodes = truncatePromptAudioCodes(promptAudioCodes, defaultMaxPromptAudioFrames)
-		log.Printf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
+		log.Debugf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
 	}
 
 	// ========== 阶段2：TTS 推理 ==========
 	// 此时阶段1的 CodecEncode session 已销毁，只有推理 session 在内存中
-	log.Printf("[Synthesize] ========== 阶段2：TTS 推理 ==========")
+	log.Infof("[Synthesize] ========== 阶段2：TTS 推理 ==========")
 	textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
-	log.Printf("[Synthesize] 文本分块: %d 块", len(textChunks))
+	log.Infof("[Synthesize] 文本分块: %d 块", len(textChunks))
 	for i, chunk := range textChunks {
-		log.Printf("[Synthesize]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
+		log.Debugf("[Synthesize]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
 	}
 	codecMeta := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
 	sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
-	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
+	log.Infof("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
 
 	// 确保推理 sessions 存在（可能被 ForceResetSessions 销毁后尚未重建）
 	if t.OrtRuntime.Onnx.Inference == nil || t.OrtRuntime.Onnx.Inference.CodecDecodeStep == nil {
-		log.Printf("[Synthesize] 推理 sessions 不存在，重新创建...")
+		log.Debugf("[Synthesize] 推理 sessions 不存在，重新创建...")
 		if err := t.OrtRuntime.CreateSessions(); err != nil {
 			return nil, fmt.Errorf("重建推理 sessions 失败: %w", err)
 		}
@@ -663,18 +663,18 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 			if streamingCodecSession != nil {
 				streamingCodecSession.Reset()
 			}
-			log.Printf("[Synthesize] 合成被取消")
+			log.Infof("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		default:
 		}
-		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
+		log.Debugf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
 		// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
 		t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
 
 		textTokenIDs := t.EncodeText(chunkText)
-		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
+		log.Debugf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 
 		// 将前一个 chunk 的尾部帧作为声学上下文追加到参考音频后面
 		chunkPromptCodes := promptAudioCodes
@@ -682,11 +682,11 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 			chunkPromptCodes = make([][]int, len(promptAudioCodes), len(promptAudioCodes)+len(prevChunkTailFrames))
 			copy(chunkPromptCodes, promptAudioCodes)
 			chunkPromptCodes = append(chunkPromptCodes, prevChunkTailFrames...)
-			log.Printf("[Synthesize]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
+			log.Debugf("[Synthesize]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
 		}
 
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
-		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
+		log.Debugf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
 
 		// 直接使用 maxNewFrames，不再用 estimateMaxNewFrames 缩减
 		// 缩减帧数会导致某些随机种子下模型语速较慢时音频末尾被截断
@@ -696,10 +696,10 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 			if streamingCodecSession != nil {
 				streamingCodecSession.Reset()
 			}
-			log.Printf("[Synthesize] 合成被取消")
+			log.Infof("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d)", len(generatedFrames), maxNewFrames)
+		log.Debugf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d)", len(generatedFrames), maxNewFrames)
 
 		// 保存当前 chunk 的最后几帧，作为下一个 chunk 的声学上下文
 		if len(generatedFrames) >= ChunkContextFrames {
@@ -724,10 +724,10 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 			if streamingCodecSession != nil {
 				streamingCodecSession.Reset()
 			}
-			log.Printf("[Synthesize] 合成被取消")
+			log.Infof("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频解码完成: channels=%d samples=%d", len(channelArrays), audioLength)
+		log.Infof("[Synthesize]   音频解码完成: channels=%d samples=%d", len(channelArrays), audioLength)
 		if len(channelArrays) > 0 {
 			merged := audio.MergeAudioChannels(channelArrays)
 			allWaveforms = append(allWaveforms, merged)
@@ -799,24 +799,24 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		if interrupted {
 			// 中断时强制重置 Session，释放 ONNX 内存池
 			t.OrtRuntime.ForceResetSessions()
-			log.Printf("[Synthesize] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
+			log.Infof("[Synthesize] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
 		}
 	}()
 
 	// 检查并释放空闲超时的 Session
 	t.OrtRuntime.CheckAndReleaseIdleSessions()
 
-	log.Printf("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
+	log.Infof("[Synthesize] 开始合成：text=%q voice=%q promptAudioPath=%q sampleMode=%s doSample=%v maxNewFrames=%d", text, voice, promptAudioPath, sampleMode, doSample, maxNewFrames)
 
 	// 保存初始随机种子，只在开始时设置一次，确保RNG状态在分块之间连续
 	var rngSeed int64 = 1234 // 默认种子
 	if seed != nil {
 		rngSeed = int64(*seed)
-		log.Printf("[Synthesize] 使用随机种子: %d", *seed)
+		log.Infof("[Synthesize] 使用随机种子: %d", *seed)
 	} else {
 		// 如果没有指定种子，使用当前时间作为种子，确保每次合成都是独立的
 		rngSeed = time.Now().UnixNano()
-		log.Printf("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
+		log.Infof("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
 	}
 	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
 
@@ -824,29 +824,29 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 	overrides := t.buildGenerationOverrides(sampleMode, doSample)
 
 	preparedText := t.PrepareSynthesisText(text, enableNormalize)
-	log.Printf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d", len(text), len(preparedText))
+	log.Debugf("[Synthesize] 文本预处理完成: 原始长度=%d 预处理后长度=%d", len(text), len(preparedText))
 	promptAudioCodes := t.ResolvePromptAudioCodes(voice, promptAudioPath)
 	if promptAudioCodes == nil {
-		log.Printf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
+		log.Warnf("[Synthesize] 警告: promptAudioCodes 为 nil，将使用空列表")
 		promptAudioCodes = [][]int{}
 	} else {
 		// 截断过长的参考音频帧，减少 prefill 输入长度
 		promptAudioCodes = truncatePromptAudioCodes(promptAudioCodes, defaultMaxPromptAudioFrames)
-		log.Printf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
+		log.Debugf("[Synthesize] promptAudioCodes: %d 帧", len(promptAudioCodes))
 	}
 	textChunks := t.SplitVoiceCloneText(preparedText, voiceCloneMaxTextTokens)
-	log.Printf("[Synthesize] 文本分块: %d 块", len(textChunks))
+	log.Infof("[Synthesize] 文本分块: %d 块", len(textChunks))
 	for i, chunk := range textChunks {
-		log.Printf("[Synthesize]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
+		log.Debugf("[Synthesize]   chunk[%d]: %q (tokens=%d)", i, chunk, t.CountTextTokens(chunk))
 	}
 	codecMeta := t.OrtRuntime.CodecMeta["codec_config"].(map[string]interface{})
 	sampleRate := int(ortruntime.ToFloat64(codecMeta["sample_rate"]))
 	channels := int(ortruntime.ToFloat64(codecMeta["channels"]))
-	log.Printf("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
+	log.Infof("[Synthesize] codec配置: sampleRate=%d channels=%d", sampleRate, channels)
 
 	// 确保推理 sessions 存在（可能被 ForceResetSessions 销毁后尚未重建）
 	if t.OrtRuntime.Onnx.Inference == nil || t.OrtRuntime.Onnx.Inference.CodecDecodeStep == nil {
-		log.Printf("[Synthesize] 推理 sessions 不存在，重新创建...")
+		log.Debugf("[Synthesize] 推理 sessions 不存在，重新创建...")
 		if err := t.OrtRuntime.CreateSessions(); err != nil {
 			return nil, fmt.Errorf("重建推理 sessions 失败: %w", err)
 		}
@@ -866,18 +866,18 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 			if streamingCodecSession != nil {
 				streamingCodecSession.Reset()
 			}
-			log.Printf("[Synthesize] 合成被取消")
+			log.Infof("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		default:
 		}
-		log.Printf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
+		log.Debugf("[Synthesize] 处理 chunk %d/%d...", chunkIndex+1, len(textChunks))
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
 		// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
 		t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
 
 		textTokenIDs := t.EncodeText(chunkText)
-		log.Printf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
+		log.Debugf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
 
 		// 将前一个 chunk 的尾部帧作为声学上下文追加到参考音频后面
 		chunkPromptCodes := promptAudioCodes
@@ -885,11 +885,11 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 			chunkPromptCodes = make([][]int, len(promptAudioCodes), len(promptAudioCodes)+len(prevChunkTailFrames))
 			copy(chunkPromptCodes, promptAudioCodes)
 			chunkPromptCodes = append(chunkPromptCodes, prevChunkTailFrames...)
-			log.Printf("[Synthesize]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
+			log.Debugf("[Synthesize]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
 		}
 
 		requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
-		log.Printf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
+		log.Debugf("[Synthesize]   请求行构建完成：%d 行", len(requestRows["inputIds"]))
 
 		// 直接使用 maxNewFrames，不再用 estimateMaxNewFrames 缩减
 		// 缩减帧数会导致某些随机种子下模型语速较慢时音频末尾被截断
@@ -899,10 +899,10 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 			if streamingCodecSession != nil {
 				streamingCodecSession.Reset()
 			}
-			log.Printf("[Synthesize] 合成被取消")
+			log.Infof("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d)", len(generatedFrames), maxNewFrames)
+		log.Debugf("[Synthesize]   音频帧生成完成: %d 帧 (maxNewFrames=%d)", len(generatedFrames), maxNewFrames)
 
 		// 保存当前 chunk 的最后几帧，作为下一个 chunk 的声学上下文
 		if len(generatedFrames) >= ChunkContextFrames {
@@ -927,10 +927,10 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 			if streamingCodecSession != nil {
 				streamingCodecSession.Reset()
 			}
-			log.Printf("[Synthesize] 合成被取消")
+			log.Infof("[Synthesize] 合成被取消")
 			return nil, ctx.Err()
 		}
-		log.Printf("[Synthesize]   音频解码完成: channels=%d samples=%d", len(channelArrays), audioLength)
+		log.Infof("[Synthesize]   音频解码完成: channels=%d samples=%d", len(channelArrays), audioLength)
 		if len(channelArrays) > 0 {
 			merged := audio.MergeAudioChannels(channelArrays)
 			allWaveforms = append(allWaveforms, merged)
@@ -1007,7 +1007,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 			if interrupted {
 				// 中断时强制重置 Session，释放 ONNX 内存池
 				t.OrtRuntime.ForceResetSessions()
-				log.Printf("[SynthesizeStream] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
+				log.Infof("[SynthesizeStream] 推理被中断，Session 已强制重置，ONNX 内存池已释放")
 			}
 		}()
 
@@ -1042,9 +1042,9 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 
 		// 确保推理 sessions 存在（可能被 ForceResetSessions 销毁后尚未重建）
 		if t.OrtRuntime.Onnx.Inference == nil || t.OrtRuntime.Onnx.Inference.CodecDecodeStep == nil {
-			log.Printf("[SynthesizeStream] 推理 sessions 不存在，重新创建...")
+			log.Debugf("[SynthesizeStream] 推理 sessions 不存在，重新创建...")
 			if err := t.OrtRuntime.CreateSessions(); err != nil {
-				log.Printf("[SynthesizeStream] 重建推理 sessions 失败: %v", err)
+				log.Errorf("[SynthesizeStream] 重建推理 sessions 失败: %v", err)
 				close(chunkChan)
 				return
 			}
@@ -1054,7 +1054,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 		// 所以不能用 defer 重置 streamingSession，需手动管理
 		streamingSession := ortruntime.NewCodecStreamingDecodeSession(t.OrtRuntime.CodecMeta, t.OrtRuntime.Onnx.Inference.CodecDecodeStep.Session, t.OrtRuntime)
 		if streamingSession == nil {
-			log.Printf("[SynthesizeStream] 错误: 无法创建流式解码会话")
+			log.Errorf("[SynthesizeStream] 错误: 无法创建流式解码会话")
 			return
 		}
 
@@ -1081,11 +1081,11 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 				chunkPromptCodes = make([][]int, len(promptAudioCodes), len(promptAudioCodes)+len(prevChunkTailFrames))
 				copy(chunkPromptCodes, promptAudioCodes)
 				chunkPromptCodes = append(chunkPromptCodes, prevChunkTailFrames...)
-				log.Printf("[SynthesizeStream]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
+				log.Debugf("[SynthesizeStream]   追加 %d 帧上下文帧到参考音频", len(prevChunkTailFrames))
 			}
 
 			requestRows := t.OrtRuntime.BuildVoiceCloneRequestRows(chunkPromptCodes, textTokenIDs)
-			log.Printf("[SynthesizeStream] 处理 chunk %d/%d: maxNewFrames=%d", chunkIndex+1, len(textChunks), maxNewFrames)
+			log.Debugf("[SynthesizeStream] 处理 chunk %d/%d: maxNewFrames=%d", chunkIndex+1, len(textChunks), maxNewFrames)
 			logMemoryStats(fmt.Sprintf("stream chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
 			pendingDecodeFrames := make([][]int, 0)
@@ -1428,7 +1428,7 @@ func logMemoryStats(label string) uint64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	rssMB := getProcessRSSMB()
-	log.Printf("[Memory] %s: RSS=%.1fMB Alloc=%.1fMB Sys=%.1fMB HeapAlloc=%.1fMB",
+	log.Infof("[Memory] %s: RSS=%.1fMB Alloc=%.1fMB Sys=%.1fMB HeapAlloc=%.1fMB",
 		label, rssMB, float64(m.Alloc)/1024/1024, float64(m.Sys)/1024/1024,
 		float64(m.HeapAlloc)/1024/1024)
 	// 返回 RSS 字节数
@@ -1446,11 +1446,11 @@ func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortrun
 	if rssMB <= float64(threshold) {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
-		log.Printf("[Memory] %s: RSS=%.1fMB (阈值=%dMB), Alloc=%.1fMB, 跳过Session重置",
+		log.Warnf("[Memory] %s: RSS=%.1fMB (阈值=%dMB), Alloc=%.1fMB, 跳过Session重置",
 			chunkLabel, rssMB, threshold, float64(m.Alloc)/1024/1024)
 		return streamingCodecSession, false
 	}
-	log.Printf("[Memory] %s: RSS=%.1fMB > 阈值%dMB, 执行ForceResetSessions", chunkLabel, rssMB, threshold)
+	log.Infof("[Memory] %s: RSS=%.1fMB > 阈值%dMB, 执行ForceResetSessions", chunkLabel, rssMB, threshold)
 	// 1. 重置 codec streaming 状态
 	if streamingCodecSession != nil {
 		streamingCodecSession.Reset()
@@ -1460,7 +1460,7 @@ func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortrun
 	debug.FreeOSMemory()
 	// 3. 销毁并重建 ONNX Session，释放 C++ 内存池
 	if err := t.OrtRuntime.ForceResetSessions(); err != nil {
-		log.Printf("[Memory] 警告: ForceResetSessions失败: %v", err)
+		log.Errorf("[Memory] 警告: ForceResetSessions失败: %v", err)
 		return streamingCodecSession, false
 	}
 	// 4. 用新 Session 重建 codec streaming session
@@ -1481,7 +1481,7 @@ func truncatePromptAudioCodes(codes [][]int, maxFrames int) [][]int {
 	if len(codes) <= maxFrames {
 		return codes
 	}
-	log.Printf("[TruncatePromptAudio] 参考音频从 %d 帧截断为 %d 帧", len(codes), maxFrames)
+	log.Warnf("[TruncatePromptAudio] 参考音频从 %d 帧截断为 %d 帧", len(codes), maxFrames)
 	return codes[:maxFrames]
 }
 

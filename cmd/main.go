@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/onnxconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/proxy"
@@ -30,7 +30,7 @@ func init() {
 	if cfg, err := proxy.Load(proxy.DefaultConfigPath()); err != nil {
 		//log.Printf("[Proxy] 警告: 加载代理配置失败, 已忽略: %v", err)
 	} else if cfg != nil {
-		log.Printf("[Proxy] 代理已启用: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
+		log.Infof("[Proxy] 代理已启用: type=%s addr=%s:%s", cfg.Type, cfg.IP, cfg.Port)
 	}
 }
 
@@ -114,7 +114,7 @@ func runInfer(args []string) {
 		cfg.ModelDir = *modelDir
 	}
 
-	log.Println("确保本地依赖已就绪...")
+	log.Infoln("确保本地依赖已就绪...")
 	deps.SetDynlibPath(cfg.LibDir)
 	if err := deps.EnsureNativeLibs(cfg); err != nil {
 		log.Fatalf("本地依赖准备失败: %v", err)
@@ -148,18 +148,18 @@ func runInfer(args []string) {
 		*outputPath = filepath.Join(cwd, "infer_onnx_output.wav")
 	}
 
-	log.Printf("初始化 TTS 运行时 (model_dir=%s threads=%d mode=%s)...", cfg.ModelDir, *cpuThreads, *executionMode)
+	log.Infof("初始化 TTS 运行时 (model_dir=%s threads=%d mode=%s)...", cfg.ModelDir, *cpuThreads, *executionMode)
 	wp, err := ttsruntime.NewWorkerProcess("0", cfg.ModelDir, *cpuThreads, 0, &maxFrames, &doSampleBool, sampleMode, *executionMode)
 	if err != nil {
 		log.Fatalf("初始化 TTS 运行时失败: %v", err)
 	}
 	defer wp.Close()
 
-	log.Printf("开始合成: text=%q voice=%s sample_mode=%s robust=%v wetext=%v", resolvedText, *voice, *sampleMode, robustEnabled, wetextEnabled)
+	log.Infof("开始合成: text=%q voice=%s sample_mode=%s robust=%v wetext=%v", resolvedText, *voice, *sampleMode, robustEnabled, wetextEnabled)
 
 	// 主进程完成文本预处理，子进程不再需要加载 WeTextProcessing
 	preparedText := normalizer.PrepareTTSText(resolvedText, robustEnabled, wetextEnabled)
-	log.Printf("文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(resolvedText), len(preparedText), robustEnabled, wetextEnabled)
+	log.Infof("文本预处理完成(主进程): 原始长度=%d 预处理后长度=%d (robust=%v wetext=%v)", len(resolvedText), len(preparedText), robustEnabled, wetextEnabled)
 
 	result, err := wp.SynthesizeWithPreparedText(
 		context.Background(),
@@ -171,7 +171,7 @@ func runInfer(args []string) {
 	if err != nil {
 		log.Fatalf("合成失败: %v", err)
 	}
-	log.Printf("合成完成: audio_path=%s sample_rate=%d elapsed=%.2fs frames=%d",
+	log.Infof("合成完成: audio_path=%s sample_rate=%d elapsed=%.2fs frames=%d",
 		result.AudioPath, result.SampleRate, result.ElapsedSec, len(result.TextChunks))
 }
 
@@ -216,7 +216,7 @@ func runServe(args []string) {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
-		log.Println("\n收到退出信号，正在清理资源...")
+		log.Infoln("\n收到退出信号，正在清理资源...")
 		srv.Close()
 		os.Exit(0)
 	}()
@@ -242,25 +242,25 @@ func runDownload(args []string) {
 		cfg.LibDir = *libDir
 	}
 
-	log.Println("下载本地依赖...")
+	log.Infoln("下载本地依赖...")
 	if err := deps.EnsureNativeLibs(cfg); err != nil {
 		log.Fatalf("下载本地依赖失败: %v", err)
 	}
-	log.Println("下载模型文件...")
+	log.Infoln("下载模型文件...")
 	if err := deps.EnsureModels(cfg); err != nil {
 		log.Fatalf("下载模型文件失败: %v", err)
 	}
-	log.Println("下载 FFmpeg (MP3 编码依赖)...")
+	log.Infoln("下载 FFmpeg (MP3 编码依赖)...")
 	deps.EnsureFFmpeg(cfg)
 
-	log.Println("构建文本归一化 FST 缓存（首次运行需要 5-10 分钟）...")
+	log.Infoln("构建文本归一化 FST 缓存（首次运行需要 5-10 分钟）...")
 	if err := normalizer.BuildCache(); err != nil {
-		log.Printf("警告: 文本归一化缓存构建异常: %v", err)
+		log.Warnf("警告: 文本归一化缓存构建异常: %v", err)
 	} else {
-		log.Println("文本归一化 FST 缓存构建完成!")
+		log.Infoln("文本归一化 FST 缓存构建完成!")
 	}
 
-	log.Println("所有依赖和模型下载完成!")
+	log.Infoln("所有依赖和模型下载完成!")
 }
 
 func validateText(text, textFile string) {
