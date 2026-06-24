@@ -190,26 +190,33 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	preloadAudioPath := ""
 
 	if req.UploadedPromptAudio != "" {
+		// 上传音频优先，不使用 preload，避免缓存串音
 		promptAudioPath = req.UploadedPromptAudio
+		preloadId = ""
+		preloadAudioPath = ""
 	} else if req.DemoID != "" {
+		// 选择 demo 时，以 demo 自身配置为准，忽略请求中的 preload_id
 		s.mu.RLock()
 		if demo, ok := s.DemoEntriesByID[req.DemoID]; ok {
 			promptAudioPath = demo.Path
-			// 如果demo有preloadId，使用preloadId
 			if demo.PreloadID != "" {
+				// demo 声明了 preloadId，使用 demo 自身的音频路径进行预加载
 				preloadId = demo.PreloadID
 				preloadAudioPath = demo.Path
+			} else {
+				// demo 未声明 preloadId，不使用 preload，直接使用 demo 音频
+				preloadId = ""
+				preloadAudioPath = ""
 			}
 		}
 		s.mu.RUnlock()
-	}
-
-	// 如果直接指定了preloadId，但没有preloadAudioPath，从demo中查找
-	if preloadId != "" && preloadAudioPath == "" {
+	} else if preloadId != "" {
+		// 未选择 demo 但指定了 preloadId，从 demo 列表中查找对应的音频路径
 		s.mu.RLock()
 		for _, demo := range s.DemoEntries {
 			if demo.PreloadID == preloadId {
 				preloadAudioPath = demo.Path
+				promptAudioPath = demo.Path
 				break
 			}
 		}

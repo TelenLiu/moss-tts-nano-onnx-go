@@ -26,17 +26,18 @@ docker run -d \
   -v ./conf:/app/conf \
   -v ./models:/app/models \
   -v ./lib/cache:/app/lib/cache \
+  -v ./lib/ffmpeg:/app/lib/ffmpeg \
   -v ./lib/onnxruntime-linux:/app/lib/onnxruntime \
   --log-driver json-file \
   --log-opt max-size=100m \
   --log-opt max-file=7 \
-  telenliu/moss-tts-nano-onnx-go:v26.06.1013
+  telenliu/moss-tts-nano-onnx-go:v26.06.1611
 ```
 
 ```yaml
 services:
   moss_tts_nano_onnx_go:
-    image: telenliu/moss-tts-nano-onnx-go:v26.06.1013
+    image: telenliu/moss-tts-nano-onnx-go:v26.06.1611
     container_name: moss_tts_nano_onnx_go
     restart: unless-stopped
     extra_hosts:
@@ -58,6 +59,7 @@ services:
       - /data/moss_tts_nano_onnx_go/app/conf:/app/conf
       - /data/moss_tts_nano_onnx_go/app/models:/app/models
       - /data/moss_tts_nano_onnx_go/app/lib/cache:/app/lib/cache
+      - /data/moss_tts_nano_onnx_go/app/lib/ffmpeg:/app/lib/ffmpeg
       - /data/moss_tts_nano_onnx_go/app/lib/onnxruntime:/app/lib/onnxruntime
     mem_limit: 6g  #单机优先
     mem_reservation: 1g

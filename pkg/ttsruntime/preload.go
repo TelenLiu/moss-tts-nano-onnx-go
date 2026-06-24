@@ -221,6 +221,31 @@ func (pc *PreloadCache) Clear() {
 	log.Debugf("[PreloadCache] 缓存已清空")
 }
 
+// Remove 移除指定 id 的缓存条目（内存 + 磁盘）
+func (pc *PreloadCache) Remove(id string) {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+
+	// 从内存缓存移除
+	if _, ok := pc.cache[id]; ok {
+		delete(pc.cache, id)
+		for i, accessID := range pc.accessOrder {
+			if accessID == id {
+				pc.accessOrder = append(pc.accessOrder[:i], pc.accessOrder[i+1:]...)
+				break
+			}
+		}
+	}
+
+	// 从磁盘缓存移除
+	cacheFile := pc.getCacheFilePath(id)
+	if err := os.Remove(cacheFile); err != nil && !os.IsNotExist(err) {
+		log.Warnf("[PreloadCache] 移除磁盘缓存失败: %s: %v", id, err)
+	}
+
+	log.Debugf("[PreloadCache] 已移除缓存条目: %s", id)
+}
+
 // Stats 获取缓存统计信息
 func (pc *PreloadCache) Stats() map[string]interface{} {
 	pc.mu.RLock()

@@ -118,6 +118,7 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	demoIndex := 1
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -126,6 +127,7 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 		}
 
 		var entry struct {
+			ID        string `json:"id"`
 			Name      string `json:"name"`
 			Role      string `json:"role"`
 			Text      string `json:"text"`
@@ -148,7 +150,24 @@ func (s *Server) loadDemoEntries(demoPath, assetsDir string) {
 			continue
 		}
 
-		demoID := fmt.Sprintf("demo-%d", demoIndex)
+		// 优先使用 JSONL 中定义的固定 id；若缺失则回退到序号 id（兼容旧格式）
+		demoID := entry.ID
+		if demoID == "" {
+			demoID = fmt.Sprintf("demo-%d", demoIndex)
+		}
+		// 校验 id 唯一性，重复时追加序号后缀避免冲突
+		if _, exists := s.DemoEntriesByID[demoID]; exists {
+			original := demoID
+			for suffix := 2; ; suffix++ {
+				candidate := fmt.Sprintf("%s_%d", original, suffix)
+				if _, dup := s.DemoEntriesByID[candidate]; !dup {
+					demoID = candidate
+					break
+				}
+			}
+			log.Warnf("[Demo] demo id 重复，已重命名: %s -> %s", original, demoID)
+		}
+
 		demoEntry := DemoEntry{
 			ID:        demoID,
 			Name:      entry.Name,

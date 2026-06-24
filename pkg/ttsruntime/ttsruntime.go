@@ -316,8 +316,24 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 				}
 			}
 		} else {
-			log.Infof("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
-			result = data.AudioCodes
+			// 缓存命中：校验音频路径是否一致，避免 preloadId 复用导致的串音问题
+			if preloadAudioPath != "" && data.AudioPath != "" && data.AudioPath != preloadAudioPath {
+				log.Warnf("[ResolvePromptAudioCodes] 缓存音频路径不匹配，清除旧缓存并重新预加载: id=%s cached=%s requested=%s",
+					preloadId, data.AudioPath, preloadAudioPath)
+				t.PreloadCache.Remove(preloadId)
+				if err := t.PreloadCache.Preload(preloadId, preloadAudioPath, ""); err != nil {
+					log.Errorf("[ResolvePromptAudioCodes] 重新预加载失败: %v", err)
+				} else {
+					data, err = t.PreloadCache.Get(preloadId)
+					if err == nil {
+						log.Infof("[ResolvePromptAudioCodes] 重新预加载后使用缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
+						result = data.AudioCodes
+					}
+				}
+			} else {
+				log.Infof("[ResolvePromptAudioCodes] 使用preload缓存: %s (frames=%d)", preloadId, len(data.AudioCodes))
+				result = data.AudioCodes
+			}
 		}
 	} else if preloadId != "" && t.PreloadCache == nil {
 		log.Warnf("[ResolvePromptAudioCodes] 警告: PreloadCache未初始化，无法使用preloadId")
