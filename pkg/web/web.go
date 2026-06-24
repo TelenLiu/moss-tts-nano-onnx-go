@@ -208,7 +208,6 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/synthesize", s.handleSynthesize)
 	mux.HandleFunc("/api/voices", s.handleVoices)
 	mux.HandleFunc("/api/audio/", s.handleAudio)
-	mux.HandleFunc("/api/upload-prompt-audio", s.handleUploadPromptAudio)
 	mux.HandleFunc("/api/demos", s.handleDemos)
 	mux.HandleFunc("/api/demo-prompt-audio/", s.handleDemoPromptAudio)
 
@@ -606,8 +605,6 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
 <div id="result" class="result" style="display:none"></div>
 
 <script>
-let uploadedPromptAudioPath = '';
-let uploadedPromptAudioName = '';
 let currentDemoPromptAudioUrl = null;
 let voiceDataMap = {};
 let demosById = {};
@@ -768,8 +765,6 @@ function onDemoChange() {
   source.textContent = sourceText;
   chooseBtn.hidden = false;
   clearBtn.hidden = false;
-  uploadedPromptAudioPath = '';
-  uploadedPromptAudioName = '';
 }
 
 function choosePromptAudio() {
@@ -795,7 +790,6 @@ function onPromptAudioChange() {
     source.textContent = '已选择: ' + file.name + ' (点击合成时将上传)';
     chooseBtn.hidden = true;
     clearBtn.hidden = false;
-    uploadedPromptAudioName = file.name;
   }
 }
 
@@ -815,8 +809,6 @@ function clearUploadedPromptAudio() {
   source.textContent = '使用内置音色，未上传参考音频。';
   chooseBtn.hidden = true;
   clearBtn.hidden = true;
-  uploadedPromptAudioPath = '';
-  uploadedPromptAudioName = '';
 }
 
 function clearPromptAudio() {
@@ -855,10 +847,10 @@ async function doSynthesize() {
   try {
     const input = document.getElementById('prompt-audio-upload');
     const files = input.files;
-    let uploadedPath = '';
+    let promptAudioB64 = '';
 
     if (files && files.length > 0) {
-      result.innerHTML = '<p>正在上传参考音频...</p>';
+      result.innerHTML = '<p>正在读取参考音频...</p>';
       const file = files[0];
       const fileBuffer = await file.arrayBuffer();
       const bytes = new Uint8Array(fileBuffer);
@@ -866,20 +858,7 @@ async function doSynthesize() {
       for (let i = 0; i < bytes.length; i++) {
         binary += String.fromCharCode(bytes[i]);
       }
-      const base64Data = btoa(binary);
-
-      const uploadResp = await fetch('/api/upload-prompt-audio', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          audio_data_b64: base64Data,
-          file_name: file.name
-        })
-      });
-      if (!uploadResp.ok) throw new Error('上传失败');
-      const uploadData = await uploadResp.json();
-      uploadedPath = uploadData.path;
-      uploadedPromptAudioPath = uploadedPath;
+      promptAudioB64 = btoa(binary);
     }
 
     const cfg = getConfig();
@@ -893,7 +872,7 @@ async function doSynthesize() {
       voice: cfg.voice,
       demo_id: cfg.demo_id,
       prompt_audio_path: '',
-      uploaded_prompt_audio: uploadedPath,
+      prompt_audio_b64: promptAudioB64,
       sample_mode: cfg.sample_mode,
       max_new_frames: cfg.max_new_frames,
       voice_clone_max_text_tokens: cfg.voice_clone_max_text_tokens,

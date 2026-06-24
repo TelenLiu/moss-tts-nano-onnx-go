@@ -189,11 +189,38 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 	preloadId := req.PreloadID
 	preloadAudioPath := ""
 
-	if req.UploadedPromptAudio != "" {
-		// 上传音频优先，不使用 preload，避免缓存串音
-		promptAudioPath = req.UploadedPromptAudio
+	// 处理 base64 参考音频：解码写入临时文件，合成完成后自动清理
+	// audio_clone_gob 缓存基于音频内容 hash，相同内容重复上传会命中缓存
+	var tempAudioPath string
+	if req.PromptAudioB64 != "" {
+		audioData, err := base64.StdEncoding.DecodeString(req.PromptAudioB64)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("prompt_audio_b64 base64解码失败: %v", err), http.StatusBadRequest)
+			return
+		}
+		if len(audioData) == 0 {
+			http.Error(w, "prompt_audio_b64 音频数据为空", http.StatusBadRequest)
+			return
+		}
+
+		tempFile, err := os.CreateTemp("", "prompt-speech-*.wav")
+		if err != nil {
+			http.Error(w, fmt.Sprintf("创建临时文件失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if _, err := tempFile.Write(audioData); err != nil {
+			tempFile.Close()
+			os.Remove(tempFile.Name())
+			http.Error(w, fmt.Sprintf("写入临时文件失败: %v", err), http.StatusInternalServerError)
+			return
+		}
+		tempFile.Close()
+
+		tempAudioPath = tempFile.Name()
+		promptAudioPath = tempAudioPath
 		preloadId = ""
 		preloadAudioPath = ""
+		log.Infof("[API synthesize] base64参考音频已写入临时文件: %s (size=%d)", tempAudioPath, len(audioData))
 	} else if req.DemoID != "" {
 		// 选择 demo 时，以 demo 自身配置为准，忽略请求中的 preload_id
 		s.mu.RLock()
@@ -221,6 +248,11 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.mu.RUnlock()
+	}
+
+	// 清理 base64 参考音频临时文件（合成完成后自动删除）
+	if tempAudioPath != "" {
+		defer os.Remove(tempAudioPath)
 	}
 
 	seedVal := "nil"
@@ -519,68 +551,6 @@ func (s *Server) handleAudio(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", info.Size()))
 	http.ServeFile(w, r, filePath)
-}
-
-func (s *Server) handleUploadPromptAudio(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req struct {
-		AudioDataB64 string `json:"audio_data_b64"`
-		FileName     string `json:"file_name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, fmt.Sprintf("解析请求失败: %v", err), http.StatusBadRequest)
-		return
-	}
-	if req.AudioDataB64 == "" {
-		http.Error(w, "audio_data_b64 不能为空", http.StatusBadRequest)
-		return
-	}
-
-	audioData, err := base64.StdEncoding.DecodeString(req.AudioDataB64)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("base64解码失败: %v", err), http.StatusBadRequest)
-		return
-	}
-	if len(audioData) == 0 {
-		http.Error(w, "音频数据为空", http.StatusBadRequest)
-		return
-	}
-
-	ext := ".wav"
-	if req.FileName != "" {
-		e := filepath.Ext(req.FileName)
-		if e != "" && len(e) <= 16 {
-			ext = e
-		}
-	}
-
-	tempFile, err := os.CreateTemp("", "prompt-speech-*"+ext)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("创建临时文件失败：%v", err), http.StatusInternalServerError)
-		return
-	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
-
-	if _, err := tempFile.Write(audioData); err != nil {
-		os.Remove(tempFile.Name())
-		http.Error(w, fmt.Sprintf("写入文件失败: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	log.Infof("[API upload] 参考音频上传成功: name=%s size=%d path=%s", req.FileName, len(audioData), tempFile.Name())
-
-	resp := map[string]string{
-		"path":      tempFile.Name(),
-		"name":      req.FileName,
-		"file_size": fmt.Sprintf("%d", len(audioData)),
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleDemos(w http.ResponseWriter, r *http.Request) {

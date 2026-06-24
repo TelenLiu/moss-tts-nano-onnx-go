@@ -166,7 +166,7 @@ Content-Type: application/json
 | demo_id | string | 否 | `""` | 演示样例 ID，指定后自动使用该样例的参考音频。可通过 `/api/demos` 获取列表 |
 | preload_id | string | 否 | `""` | 预加载缓存 ID，用于复用已加载的参考音频特征，减少重复计算 |
 | prompt_audio_path | string | 否 | `""` | 参考音频的服务器本地路径（服务端路径，非客户端路径） |
-| uploaded_prompt_audio | string | 否 | `""` | 已上传的参考音频临时路径，优先级高于 `demo_id`。通过 `/api/upload-prompt-audio` 上传获得 |
+| prompt_audio_b64 | string | 否 | `""` | Base64 编码的参考音频数据，支持 WAV/MP3/FLAC/M4A/OGG/OPUS/AAC 格式。优先级高于 `demo_id`，相同内容会命中 audio_clone_gob 缓存 |
 | sample_mode | string | 否 | `"fixed"` | 采样模式，见下方说明 |
 | max_new_frames | int | 否 | 动态计算 | 最大生成帧数。默认按 `文本长度×4+100` 动态计算，上限 2000 |
 | voice_clone_max_text_tokens | int | 否 | `75` | 音色克隆时的最大文本 Token 数，影响克隆质量，与 Python 源码保持一致 |
@@ -197,7 +197,7 @@ Content-Type: application/json
 
 当需要指定参考音频（用于音色克隆）时，按以下优先级选择：
 
-1. **`uploaded_prompt_audio`** — 已上传的音频临时路径（最高优先级）
+1. **`prompt_audio_b64`** — Base64 编码的参考音频数据（最高优先级）
 2. **`demo_id`** — 演示样例的参考音频
 3. **`prompt_audio_path`** — 服务器本地路径
 
@@ -347,66 +347,7 @@ GET /api/voices
 
 ---
 
-## 7. 上传参考音频
-
-上传参考音频用于音色克隆，音频数据通过 Base64 编码传输。上传成功后返回临时文件路径，可在合成请求中使用。
-
-```
-POST /api/upload-prompt-audio
-Content-Type: application/json
-```
-
-### 请求参数
-
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| audio_data_b64 | string | **是** | Base64 编码的音频数据，支持 WAV/MP3/FLAC/M4A/OGG/OPUS/AAC 格式 |
-| file_name | string | 否 | 原始文件名，用于确定文件扩展名。若不提供则默认 `.wav` |
-
-### 响应
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| path | string | 服务器临时文件路径，用于合成请求的 `uploaded_prompt_audio` 参数 |
-| name | string | 原始文件名 |
-| file_size | string | 文件大小（字节） |
-
-### 示例
-
-**请求**：
-```json
-{
-  "audio_data_b64": "UklGRiQAAABXQVZFZm10IBAAAAABAAEA...",
-  "file_name": "my_voice.wav"
-}
-```
-
-**响应**：
-```json
-{
-  "path": "/tmp/prompt-speech-123456789.wav",
-  "name": "my_voice.wav",
-  "file_size": "102400"
-}
-```
-
-### 音色克隆使用流程
-
-1. 调用 `/api/upload-prompt-audio` 上传参考音频，获取 `path`
-2. 调用 `/api/synthesize`，将 `path` 填入 `uploaded_prompt_audio` 参数
-3. 合成结果将使用上传音频的音色
-
-### 错误响应
-
-| HTTP 状态码 | 说明 |
-|-------------|------|
-| 400 | 参数错误（`audio_data_b64` 为空、Base64 解码失败、音频数据为空） |
-| 405 | 请求方法不是 POST |
-| 500 | 服务器创建临时文件失败 |
-
----
-
-## 8. 获取音频文件
+## 7. 获取音频文件
 
 通过文件名获取系统临时目录中的音频文件。
 
@@ -434,7 +375,7 @@ GET /api/audio/{filename}
 
 ---
 
-## 9. 演示样例列表
+## 8. 演示样例列表
 
 获取所有预置的演示样例，每个样例包含预设文本和参考音频。
 
@@ -464,7 +405,7 @@ GET /api/demos
 
 ---
 
-## 10. 获取演示音频
+## 9. 获取演示音频
 
 获取指定演示样例的参考音频文件。
 
@@ -520,8 +461,7 @@ GET /api/demo-prompt-audio/{demo_id}
 
 ```
 1. GET  /api/status                       → 确认系统就绪
-2. POST /api/upload-prompt-audio          → 上传参考音频，获取临时路径
-3. POST /api/synthesize                   → 使用 uploaded_prompt_audio 参数提交合成请求
+2. POST /api/synthesize                   → 使用 prompt_audio_b64 参数直接传入 Base64 参考音频数据
 ```
 
 ### 使用演示样例

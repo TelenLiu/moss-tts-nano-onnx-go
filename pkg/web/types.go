@@ -29,7 +29,7 @@ type SynthesizeRequest struct {
 	DemoID                  string   `json:"demo_id"`
 	PreloadID               string   `json:"preload_id"`
 	PromptAudioPath         string   `json:"prompt_audio_path"`
-	UploadedPromptAudio     string   `json:"uploaded_prompt_audio"`
+	PromptAudioB64          string   `json:"prompt_audio_b64"`
 	SampleMode              string   `json:"sample_mode"`
 	MaxNewFrames            int      `json:"max_new_frames"`
 	VoiceCloneMaxTextTokens int      `json:"voice_clone_max_text_tokens"`
