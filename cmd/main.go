@@ -209,7 +209,7 @@ func runServe(args []string) {
 		displayHost = "0.0.0.0"
 	}
 	appRoot := fmt.Sprintf("http://%s:%d", displayHost, *port)
-	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, *executionMode, *host, *port, appRoot)
+	srv := web.NewServer(cfg, *cpuThreads, *maxNewFrames, *executionMode, *host, *port, appRoot, Version)
 
 	// 设置优雅退出：捕获中断信号并释放资源
 	go func() {

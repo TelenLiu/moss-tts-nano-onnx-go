@@ -37,11 +37,12 @@ GET /api/status
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | ready | bool | `true` 表示系统就绪，可接受合成请求；`false` 表示仍在初始化中 |
+| version | string | 引擎编译版本号（通过 `-ldflags` 注入，默认为 `"0"`） |
 
 ### 示例
 
 ```json
-{"ready": true}
+{"ready": true, "version": "0"}
 ```
 
 ---

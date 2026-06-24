@@ -31,6 +31,7 @@ type Server struct {
 	Host          string
 	Port          int
 	AppRoot       string
+	Version       string
 	OnnxConfig    *onnxconfig.Config
 
 	mu              sync.RWMutex
@@ -45,7 +46,7 @@ type Server struct {
 	AssetsDir       string
 }
 
-func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, host string, port int, appRoot string) *Server {
+func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, host string, port int, appRoot, version string) *Server {
 	cwd, _ := os.Getwd()
 	assetsDir := filepath.Join(cwd, "assets")
 	demoPath := filepath.Join(assetsDir, "demo.jsonl")
@@ -66,6 +67,7 @@ func NewServer(cfg *deps.Config, cpuThreads, maxNewFrames int, executionMode, ho
 		Host:            host,
 		Port:            port,
 		AppRoot:         appRoot,
+		Version:         version,
 		OnnxConfig:      onnxCfg,
 		subscribers:     make(map[chan ProgressEvent]struct{}),
 		DemoEntriesByID: make(map[string]*DemoEntry),
@@ -500,7 +502,7 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
 </style>
 </head>
 <body>
-<h1>MOSS-TTS-Nano ONNX Demo <span class="badge">Ready</span></h1>
+<h1>MOSS-TTS-Nano ONNX Demo <span class="badge">Ready</span> <span class="badge" id="version-badge" style="background:#e6f4ea;color:#0d652d;" hidden></span></h1>
 
 <div class="result" id="device-info-box" style="margin-bottom:20px;">
   <div style="font-weight:600;margin-bottom:8px;">设备信息</div>
@@ -635,6 +637,20 @@ async function loadDemos() {
     });
   } catch (e) {
     console.error('Failed to load demos:', e);
+  }
+}
+
+async function loadVersion() {
+  try {
+    const r = await fetch('/api/status');
+    const data = await r.json();
+    if (data.version) {
+      const badge = document.getElementById('version-badge');
+      badge.textContent = 'v' + data.version;
+      badge.hidden = false;
+    }
+  } catch (e) {
+    console.error('Failed to load version:', e);
   }
 }
 
@@ -1068,6 +1084,7 @@ async function doStreamSynthesize(body, result, btn, paramsInfo) {
 loadDemos();
 loadVoices();
 loadDeviceInfo();
+loadVersion();
 
 // 播放模式切换时，隐藏/显示输出格式
 document.getElementById('play-mode').addEventListener('change', function() {

@@ -72,9 +72,13 @@ func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	ready := s.Ready
+	version := s.Version
 	s.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{"ready": ready})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"ready":   ready,
+		"version": version,
+	})
 }
 
 func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
