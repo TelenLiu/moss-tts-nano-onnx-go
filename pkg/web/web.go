@@ -661,7 +661,14 @@ async function loadDeviceInfo() {
     const contentDiv = document.getElementById('device-info-content');
 
     // 构建设备信息显示
-    let html = '<div style="margin-bottom:6px;"><strong>CPU:</strong> ' + info.cpu.num_cores + ' 核心</div>';
+    let html = '<div style="margin-bottom:6px;"><strong>CPU:</strong> ' + info.cpu.num_cores + ' 核心';
+    if (info.cpu.core_freq_mhz && info.cpu.core_freq_mhz > 0) {
+      html += ' @ ' + (info.cpu.core_freq_mhz / 1000).toFixed(2) + ' GHz';
+    }
+    if (info.cpu.model_name) {
+      html += '<br><span style="font-size:12px;color:#888;">' + info.cpu.model_name + '</span>';
+    }
+    html += '</div>';
 
     if (info.has_gpu) {
       html += '<div style="margin-bottom:6px;"><strong>GPU:</strong> 可用';
@@ -674,6 +681,18 @@ async function loadDeviceInfo() {
     }
 
     html += '<div style="margin-bottom:6px;"><strong>当前推理模式:</strong> ' + info.execution_mode + '</div>';
+
+    if (info.onnx_pool) {
+      html += '<div style="margin-bottom:6px;"><strong>ONNX推理单元:</strong> ';
+      html += '常驻' + info.onnx_pool.work_cores + '个';
+      if (info.onnx_pool.reserve_cores !== undefined) {
+        html += '，预留' + info.onnx_pool.reserve_cores + '个';
+      }
+      if (info.onnx_pool.core_cpus && info.onnx_pool.core_cpus > 0) {
+        html += '，每单元' + info.onnx_pool.core_cpus + '核CPU';
+      }
+      html += '</div>';
+    }
 
     contentDiv.innerHTML = html;
 

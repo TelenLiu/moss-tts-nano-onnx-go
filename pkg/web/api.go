@@ -93,6 +93,8 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 			"num_cores":       deviceInfo.CPUInfo.NumCores,
 			"num_threads":     deviceInfo.CPUInfo.NumThreads,
 			"available_cores": deviceInfo.CPUInfo.AvailableCores,
+			"core_freq_mhz":   deviceInfo.CPUInfo.CoreFreqMHz,
+			"model_name":      deviceInfo.CPUInfo.ModelName,
 		},
 		"has_gpu":         deviceInfo.HasGPU,
 		"has_cuda":        deviceInfo.HasCUDA,
@@ -128,11 +130,17 @@ func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {
 	// 添加推理单元池信息
 	s.mu.RLock()
 	pool := s.Pool
+	onnxCfg := s.OnnxConfig
 	s.mu.RUnlock()
 	if pool != nil {
+		coreCPUs := 0
+		if onnxCfg != nil {
+			coreCPUs = onnxCfg.CoreCPUs
+		}
 		response["onnx_pool"] = map[string]interface{}{
 			"work_cores":       pool.WorkCoreCount(),
 			"reserve_cores":    pool.ReserveCoreCount(),
+			"core_cpus":        coreCPUs,
 			"pending_requests": pool.PendingCount(),
 			"cores":            pool.Status(),
 		}

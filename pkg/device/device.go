@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"runtime"
 
+	"github.com/TelenLiu/gopsutil/v4/cpu"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -32,9 +33,11 @@ type DeviceInfo struct {
 
 // CPUInfo CPU信息
 type CPUInfo struct {
-	NumCores       int `json:"num_cores"`
-	NumThreads     int `json:"num_threads"`
-	AvailableCores int `json:"available_cores"`
+	NumCores       int    `json:"num_cores"`
+	NumThreads     int    `json:"num_threads"`
+	AvailableCores int    `json:"available_cores"`
+	CoreFreqMHz    int    `json:"core_freq_mhz"` // 单核CPU频率（MHz），0表示无法获取
+	ModelName      string `json:"model_name"`    // CPU型号名称
 }
 
 // GPUInfo GPU信息
@@ -64,6 +67,20 @@ func GetDeviceInfo() *DeviceInfo {
 		HasGPU:    false,
 		HasCUDA:   false,
 		HasCoreML: false,
+	}
+
+	// 使用 gopsutil 获取 CPU 详细信息（频率、型号等）
+	if cpuInfos, err := cpu.Info(); err == nil && len(cpuInfos) > 0 {
+		ci := cpuInfos[0]
+		info.CPUInfo.CoreFreqMHz = int(ci.Mhz)
+		info.CPUInfo.ModelName = ci.ModelName
+		// gopsutil 的 Cores 字段表示每个物理 CPU 的核心数，用于更精确的物理核心数
+		if ci.Cores > 0 {
+			info.CPUInfo.NumCores = int(ci.Cores)
+		}
+		log.Debugf("[GetDeviceInfo] CPU: %s, 频率: %d MHz", ci.ModelName, int(ci.Mhz))
+	} else {
+		log.Debugf("[GetDeviceInfo] gopsutil cpu.Info 失败: %v", err)
 	}
 
 	// 尝试获取执行提供程序设备信息

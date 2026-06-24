@@ -105,6 +105,8 @@ GET /api/device-info
 | cpu.num_cores | int | CPU 物理核心数 |
 | cpu.num_threads | int | CPU 逻辑线程数 |
 | cpu.available_cores | int | 可用核心数 |
+| cpu.core_freq_mhz | int | 单核 CPU 频率（MHz），0 表示无法获取 |
+| cpu.model_name | string | CPU 型号名称 |
 | has_gpu | bool | 是否有 GPU 可用 |
 | has_cuda | bool | 是否支持 CUDA |
 | has_coreml | bool | 是否支持 CoreML（macOS） |
@@ -123,6 +125,7 @@ GET /api/device-info
 | onnx_pool | object | 推理单元池状态（系统就绪后存在） |
 | onnx_pool.work_cores | int | 常驻推理核心数 |
 | onnx_pool.reserve_cores | int | 预留推理核心数 |
+| onnx_pool.core_cpus | int | 每个推理单元使用的 CPU 核心数 |
 | onnx_pool.pending_requests | int | 等待中的请求数 |
 | onnx_pool.cores | object[] | 各核心状态详情 |
 
@@ -130,7 +133,7 @@ GET /api/device-info
 
 ```json
 {
-  "cpu": {"num_cores": 8, "num_threads": 8, "available_cores": 8},
+  "cpu": {"num_cores": 8, "num_threads": 8, "available_cores": 8, "core_freq_mhz": 3200, "model_name": "Apple M1"},
   "has_gpu": true,
   "has_cuda": false,
   "has_coreml": true,
@@ -143,6 +146,13 @@ GET /api/device-info
     "device_id": "0",
     "memory_mb": 8192,
     "compute_units": 8
+  },
+  "onnx_pool": {
+    "work_cores": 1,
+    "reserve_cores": 0,
+    "core_cpus": 4,
+    "pending_requests": 0,
+    "cores": [{"name": "workCore1", "type": "work", "active_reqs": 0}]
   }
 }
 ```
