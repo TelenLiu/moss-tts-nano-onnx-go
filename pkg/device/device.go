@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"runtime"
 
-	"github.com/TelenLiu/gopsutil/v4/cpu"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
+	"github.com/shirou/gopsutil/v4/cpu"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
