@@ -71,3 +71,12 @@ services:
         max-file: "7"  # 最多保存7个文件
 ```
 
+
+
+## Acknowledge
+
+1. Referred [MOSS-TTS-Nano](https://github.com/OpenMOSS/MOSS-TTS-Nano)
+2. ONNX Runtime binding: [onnxruntime_go](https://github.com/yalue/onnxruntime_go)
+3. Text processing: [WeTextProcessing-go](https://github.com/TelenLiu/WeTextProcessing-go)
+4. Audio resampling: [resample](https://github.com/gunter-q12/resample)
+5. Audio processing: [FFmpeg](https://ffmpeg.org/)
