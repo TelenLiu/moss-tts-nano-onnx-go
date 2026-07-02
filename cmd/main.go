@@ -44,6 +44,8 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "version", "-v", "--version":
+		return
 	case "infer":
 		runInfer(os.Args[2:])
 	case "serve":
