@@ -160,6 +160,14 @@ func findOrtLib(ortDir string) string {
 		ortDir,
 		filepath.Join(ortDir, "lib"),
 	}
+	// 优先查找有效的库文件（普通文件且大小 > 1MB），跳过符号链接和被转为文本文件的伪库
+	for _, dir := range searchPaths {
+		directPath := filepath.Join(dir, ortLibName())
+		if isValidLibFile(directPath) {
+			return directPath
+		}
+	}
+	// 回退：接受有效的符号链接（兼容旧安装）
 	for _, dir := range searchPaths {
 		directPath := filepath.Join(dir, ortLibName())
 		if fileExists(directPath) {
@@ -169,8 +177,15 @@ func findOrtLib(ortDir string) string {
 	for _, dir := range searchPaths {
 		matches, err := filepath.Glob(filepath.Join(dir, ortLibGlobPattern()))
 		if err == nil && len(matches) > 0 {
+			// 优先返回有效的库文件
 			for _, m := range matches {
-				if !strings.Contains(m, ".dSYM") && !strings.Contains(m, ".so.") {
+				if !strings.Contains(m, ".dSYM") && isValidLibFile(m) {
+					return m
+				}
+			}
+			// 回退：接受有效的符号链接
+			for _, m := range matches {
+				if !strings.Contains(m, ".dSYM") && fileExists(m) {
 					return m
 				}
 			}
@@ -219,13 +234,20 @@ func stripArchiveTopDir(name string) string {
 
 func isOrtNeededFile(name string) bool {
 	relativePath := stripArchiveTopDir(name)
-	switch {
-	case strings.HasPrefix(relativePath, "lib/") && isOrtLibFile(name):
-		return true
-	case strings.HasPrefix(relativePath, "include/"):
-		return true
+	if strings.Contains(relativePath, ".dSYM") {
+		return false
 	}
-	return false
+	return strings.HasPrefix(relativePath, "lib/") && isOrtLibFile(name)
+}
+
+// stripOrtLibPath 去除归档顶层目录和 lib/ 前缀，使库文件直接解压到 ortDir 下。
+// 例如: onnxruntime-osx-arm64-1.26.0/lib/libonnxruntime.1.26.0.dylib -> libonnxruntime.1.26.0.dylib
+func stripOrtLibPath(name string) string {
+	relativePath := stripArchiveTopDir(name)
+	if strings.HasPrefix(relativePath, "lib/") {
+		return relativePath[4:]
+	}
+	return relativePath
 }
 
 func EnsureNativeLibs(cfg *Config) error {
@@ -523,7 +545,7 @@ func extractOrtTgz(src, dest string) error {
 		if !isOrtNeededFile(hdr.Name) {
 			continue
 		}
-		target := filepath.Join(dest, stripArchiveTopDir(hdr.Name))
+		target := filepath.Join(dest, stripOrtLibPath(hdr.Name))
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			os.MkdirAll(target, 0755)
@@ -539,13 +561,8 @@ func extractOrtTgz(src, dest string) error {
 			}
 			out.Close()
 		case tar.TypeSymlink:
-			// 1.26.0+ 在 macOS 上额外增加了 libonnxruntime.1.dylib -> libonnxruntime.1.26.0.dylib
-			// 等符号链接，需要保留以便 dlopen 找到主库。
-			os.MkdirAll(filepath.Dir(target), 0755)
-			_ = os.Remove(target)
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
-				continue
-			}
+			// 跳过符号链接（如 libonnxruntime.dylib -> libonnxruntime.1.26.0.dylib）
+			// 直接使用原始版本文件，不创建符号链接也不复制副本
 		}
 	}
 	return nil
@@ -561,7 +578,7 @@ func extractOrtZip(src, dest string) error {
 		if !isOrtNeededFile(f.Name) {
 			continue
 		}
-		target := filepath.Join(dest, stripArchiveTopDir(f.Name))
+		target := filepath.Join(dest, stripOrtLibPath(f.Name))
 		if f.FileInfo().IsDir() {
 			os.MkdirAll(target, 0755)
 			continue
@@ -605,6 +622,40 @@ func downloadFile(url, dest string) error {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// isRegularFile 检查路径是否为普通文件（非符号链接）
+func isRegularFile(path string) bool {
+	fi, err := os.Lstat(path)
+	return err == nil && fi.Mode().IsRegular()
+}
+
+// isValidLibFile 检查路径是否为有效的动态库文件（普通文件且大小超过 1MB）。
+// 符号链接被复制工具转为文本文件后通常只有几十到几百字节，不是有效库文件。
+func isValidLibFile(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
+	}
+	return fi.Size() > 1024*1024
+}
+
+// copyFile 复制文件内容（不创建符号链接）
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	_, err = io.Copy(dstFile, srcFile)
+	return err
 }
 
 func SetDynlibPath(libDir string) {

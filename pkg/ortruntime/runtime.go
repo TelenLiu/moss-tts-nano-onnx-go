@@ -657,17 +657,124 @@ func hasExternalDataFiles(ttsDir string, ttsFiles map[string]interface{}, codecD
 
 func InitializeORT(libDir string) error {
 	ortDir := filepath.Join(libDir, "onnxruntime")
+	// 清理旧版本创建的符号链接和重复副本，只保留原始版本文件
+	cleanupOrtLibs(ortDir)
 	libPath := findOrtLibForInit(ortDir)
 	if libPath == "" {
 		return fmt.Errorf("未找到 ONNX Runtime 动态库 (搜索目录: %s)", ortDir)
 	}
-	ensureOrtSymlink(ortDir, libPath)
 	ort.SetSharedLibraryPath(libPath)
 	if err := ort.InitializeEnvironment(); err != nil {
 		return fmt.Errorf("初始化 ONNX Runtime 环境失败: %w", err)
 	}
 	log.Infof("ONNX Runtime 环境初始化成功 (lib=%s)", libPath)
 	return nil
+}
+
+// cleanupOrtLibs 清理 ortDir 目录，迁移旧结构的文件并移除冗余内容。
+// 新结构：库文件直接放在 ortDir 下（如 lib/onnxruntime/libonnxruntime.1.26.0.dylib），
+// 不再使用 lib/ 子目录和 include/ 目录。
+func cleanupOrtLibs(ortDir string) {
+	oldLibDir := filepath.Join(ortDir, "lib")
+
+	// 1. 迁移：将 ortDir/lib/ 下的库文件移动到 ortDir/
+	if entries, err := os.ReadDir(oldLibDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			if !strings.HasPrefix(name, "libonnxruntime") {
+				continue
+			}
+			if strings.Contains(name, ".dSYM") {
+				continue
+			}
+			oldPath := filepath.Join(oldLibDir, name)
+			newPath := filepath.Join(ortDir, name)
+			fi, err := os.Lstat(oldPath)
+			if err != nil {
+				continue
+			}
+			// 跳过符号链接（不移动也不保留）
+			if fi.Mode()&os.ModeSymlink != 0 {
+				os.Remove(oldPath)
+				continue
+			}
+			if !fi.Mode().IsRegular() {
+				continue
+			}
+			// 移动到 ortDir/（包括 providers_shared 等小文件）
+			os.Remove(newPath) // 移除可能已存在的伪库/符号链接
+			os.Rename(oldPath, newPath)
+		}
+	}
+
+	// 2. 移除旧的 include/、lib/ 目录和 dSYM 调试符号目录
+	os.RemoveAll(filepath.Join(ortDir, "include"))
+	os.RemoveAll(oldLibDir)
+	entries, err := os.ReadDir(ortDir)
+	if err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() && strings.Contains(entry.Name(), ".dSYM") {
+				os.RemoveAll(filepath.Join(ortDir, entry.Name()))
+			}
+		}
+	}
+
+	// 3. 清理 ortDir 中的符号链接、副本和伪库，只保留原始版本文件
+	entries, err = os.ReadDir(ortDir)
+	if err != nil {
+		return
+	}
+	type libEntry struct {
+		path string
+		name string
+	}
+	var libs []libEntry
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, "libonnxruntime") {
+			continue
+		}
+		if strings.Contains(name, ".dSYM") || strings.Contains(name, "providers_shared") {
+			continue
+		}
+		libs = append(libs, libEntry{path: filepath.Join(ortDir, name), name: name})
+	}
+	if len(libs) <= 1 {
+		// 只移除符号链接
+		for _, lb := range libs {
+			if fi, _ := os.Lstat(lb.path); fi != nil && fi.Mode()&os.ModeSymlink != 0 {
+				os.Remove(lb.path)
+			}
+		}
+		return
+	}
+	// 找到原始版本文件：名称最长（包含完整版本号）的有效库文件
+	var original *libEntry
+	for i := range libs {
+		fi, _ := os.Lstat(libs[i].path)
+		if fi == nil || fi.Mode()&os.ModeSymlink != 0 || !fi.Mode().IsRegular() {
+			continue
+		}
+		if fi.Size() < 1024*1024 {
+			continue
+		}
+		if original == nil || len(libs[i].name) > len(original.name) {
+			original = &libs[i]
+		}
+	}
+	// 移除所有非原始文件
+	for _, lb := range libs {
+		if original != nil && lb.path == original.path {
+			continue
+		}
+		os.Remove(lb.path)
+	}
 }
 
 func (rt *OrtCpuRuntime) ListBuiltinVoices() []map[string]interface{} {
@@ -2022,22 +2129,50 @@ func (rt *OrtCpuRuntime) ResolveManifestRelativePath(relativePath string) string
 func findOrtLibForInit(ortDir string) string {
 	libDir := filepath.Join(ortDir, "lib")
 	directNames := []string{"libonnxruntime.dylib", "libonnxruntime.so", "onnxruntime.dll"}
+
+	// 优先查找有效的库文件（普通文件且大小 > 1MB），跳过符号链接和被转为文本文件的伪库
 	for _, dir := range []string{ortDir, libDir} {
 		for _, name := range directNames {
-			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
-				return filepath.Join(dir, name)
+			path := filepath.Join(dir, name)
+			if isValidLibFile(path) {
+				return path
 			}
 		}
 	}
-	for _, pattern := range []string{
-		filepath.Join(libDir, "libonnxruntime*.dylib"),
-		filepath.Join(libDir, "libonnxruntime.so*"),
-	} {
-		matches, err := filepath.Glob(pattern)
-		if err == nil && len(matches) > 0 {
-			for _, m := range matches {
-				if !strings.Contains(m, ".dSYM") {
-					return m
+	// 回退：接受有效的符号链接（兼容旧安装）
+	for _, dir := range []string{ortDir, libDir} {
+		for _, name := range directNames {
+			path := filepath.Join(dir, name)
+			if _, err := os.Stat(path); err == nil {
+				return path
+			}
+		}
+	}
+	// Glob 回退：优先有效库文件，再接受有效符号链接
+	for _, dir := range []string{ortDir, libDir} {
+		for _, pattern := range []string{
+			filepath.Join(dir, "libonnxruntime*.dylib"),
+			filepath.Join(dir, "libonnxruntime.so*"),
+		} {
+			matches, err := filepath.Glob(pattern)
+			if err == nil && len(matches) > 0 {
+				// 优先返回有效的库文件
+				for _, m := range matches {
+					if strings.Contains(m, ".dSYM") {
+						continue
+					}
+					if isValidLibFile(m) {
+						return m
+					}
+				}
+				// 回退：接受有效的符号链接
+				for _, m := range matches {
+					if strings.Contains(m, ".dSYM") {
+						continue
+					}
+					if _, err := os.Stat(m); err == nil {
+						return m
+					}
 				}
 			}
 		}
@@ -2045,21 +2180,14 @@ func findOrtLibForInit(ortDir string) string {
 	return ""
 }
 
-func ensureOrtSymlink(ortDir, actualLibPath string) {
-	var symlinkName string
-	switch {
-	case strings.HasSuffix(actualLibPath, ".dylib"):
-		symlinkName = "libonnxruntime.dylib"
-	case strings.HasSuffix(actualLibPath, ".so") || strings.Contains(actualLibPath, ".so."):
-		symlinkName = "libonnxruntime.so"
-	default:
-		return
+// isValidLibFile 检查路径是否为有效的动态库文件（普通文件且大小超过 1MB）。
+// 符号链接被复制工具转为文本文件后通常只有几十到几百字节，不是有效库文件。
+func isValidLibFile(path string) bool {
+	fi, err := os.Lstat(path)
+	if err != nil || !fi.Mode().IsRegular() {
+		return false
 	}
-	symlinkPath := filepath.Join(ortDir, symlinkName)
-	if _, err := os.Stat(symlinkPath); err == nil {
-		return
-	}
-	os.Symlink(actualLibPath, symlinkPath)
+	return fi.Size() > 1024*1024
 }
 
 func getFloat32Data(v ort.Value) []float32 {
