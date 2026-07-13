@@ -73,12 +73,51 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	ready := s.Ready
 	version := s.Version
+	var lastEvt *ProgressEvent
+	if len(s.Progress) > 0 {
+		evt := s.Progress[len(s.Progress)-1]
+		lastEvt = &evt
+	}
 	s.mu.RUnlock()
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
+
+	resp := map[string]interface{}{
 		"ready":   ready,
 		"version": version,
-	})
+	}
+
+	// ready=false 时，补充初始化进度/错误信息，便于第三方判断如何处理
+	if !ready && lastEvt != nil {
+		resp["phase"] = lastEvt.Phase
+		resp["message"] = lastEvt.Message
+		resp["percent"] = lastEvt.Percent
+		if lastEvt.Error != "" {
+			resp["error"] = lastEvt.Error
+		}
+		if lastEvt.EstimatedRemainMs > 0 {
+			resp["estimated_remain_ms"] = lastEvt.EstimatedRemainMs
+		}
+		// 推荐操作：告诉第三方是等待、重试还是需要检查配置
+		switch lastEvt.Phase {
+		case "error":
+			resp["action"] = "retry"
+			resp["action_hint"] = "初始化失败，请检查错误信息后重试。可尝试：1) 确认网络可访问模型/依赖下载源（或使用 -mirror 参数切换国内镜像）；2) 确认磁盘空间充足；3) 确认模型文件完整后重启服务。"
+		case "ready":
+			// 极端情况：Ready 仍为 false 但已收到 ready 事件（竞态），告知稍候
+			resp["action"] = "wait"
+			resp["action_hint"] = "系统即将就绪，请稍候片刻后重试。"
+		default:
+			// check / download / load 阶段
+			resp["action"] = "wait"
+			resp["action_hint"] = fmt.Sprintf("系统正在初始化（%s，已完成 %.0f%%），请等待 ready=true 后再发起合成请求。可连接 /api/progress (SSE) 获取实时进度。", lastEvt.Phase, lastEvt.Percent)
+		}
+	} else if !ready && lastEvt == nil {
+		// 还没有任何进度事件
+		resp["action"] = "wait"
+		resp["action_hint"] = "系统正在启动初始化，请稍候片刻后重试。可连接 /api/progress (SSE) 获取实时进度。"
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleDeviceInfo(w http.ResponseWriter, r *http.Request) {

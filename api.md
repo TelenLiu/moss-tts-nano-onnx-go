@@ -34,15 +34,80 @@ GET /api/status
 
 ### 响应
 
+#### ready=true 时（系统就绪）
+
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| ready | bool | `true` 表示系统就绪，可接受合成请求；`false` 表示仍在初始化中 |
+| ready | bool | 固定为 `true`，表示系统就绪，可接受合成请求 |
 | version | string | 引擎编译版本号（通过 `-ldflags` 注入，默认为 `"0"`） |
+
+#### ready=false 时（初始化中或异常）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| ready | bool | 固定为 `false`，表示系统尚未就绪 |
+| version | string | 引擎编译版本号 |
+| phase | string | 当前初始化阶段：`check`（环境检测）、`download`（下载阶段）、`load`（加载阶段）、`ready`（即将就绪）、`error`（初始化失败） |
+| message | string | 当前状态描述信息 |
+| percent | float | 总体进度百分比（0-100） |
+| error | string | 错误详情，仅 `phase=error` 时存在 |
+| estimated_remain_ms | int64 | 预计剩余时间（毫秒），仅加载阶段且可估算时存在 |
+| action | string | 推荐操作：`wait`（等待，稍后轮询）、`retry`（需处理后重试） |
+| action_hint | string | 操作建议说明，帮助第三方判断如何处理当前状态 |
+
+### action 取值说明
+
+| 值 | 含义 | 第三方建议处理方式 |
+|------|------|------|
+| `wait` | 系统正在初始化中 | 间隔一段时间（建议 3-5 秒）后再次轮询 `/api/status`，或连接 `/api/progress` (SSE) 获取实时进度 |
+| `retry` | 初始化失败 | 根据 `error` 字段排查原因，解决问题后重启服务或重新请求 |
 
 ### 示例
 
+**系统就绪**：
 ```json
 {"ready": true, "version": "0"}
+```
+
+**初始化中（下载阶段）**：
+```json
+{
+  "ready": false,
+  "version": "0",
+  "phase": "download",
+  "message": "正在检查模型文件...",
+  "percent": 30,
+  "action": "wait",
+  "action_hint": "系统正在初始化（download，已完成 30%），请等待 ready=true 后再发起合成请求。可连接 /api/progress (SSE) 获取实时进度。"
+}
+```
+
+**初始化中（加载阶段，含预计剩余时间）**：
+```json
+{
+  "ready": false,
+  "version": "0",
+  "phase": "load",
+  "message": "正在构建文本归一化 FST 缓存...",
+  "percent": 96,
+  "estimated_remain_ms": 120000,
+  "action": "wait",
+  "action_hint": "系统正在初始化（load，已完成 96%），请等待 ready=true 后再发起合成请求。可连接 /api/progress (SSE) 获取实时进度。"
+}
+```
+
+**初始化失败**：
+```json
+{
+  "ready": false,
+  "version": "0",
+  "phase": "error",
+  "message": "ONNX Runtime 依赖准备失败: download timeout",
+  "percent": 25,
+  "error": "ONNX Runtime 依赖准备失败: download timeout",
+  "action": "retry",
+  "action_hint": "初始化失败，请检查错误信息后重试。可尝试：1) 确认网络可访问模型/依赖下载源（或使用 -mirror 参数切换国内镜像）；2) 确认磁盘空间充足；3) 确认模型文件完整后重启服务。"
+}
 ```
 
 ---
