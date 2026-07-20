@@ -212,6 +212,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/audio/", s.handleAudio)
 	mux.HandleFunc("/api/demos", s.handleDemos)
 	mux.HandleFunc("/api/demo-prompt-audio/", s.handleDemoPromptAudio)
+	mux.HandleFunc("/api/app-config", s.handleAppConfig)
 
 	go s.backgroundInit()
 
@@ -602,6 +603,17 @@ details{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px}
   <div class="meta">MP3: 44100Hz VBR-Q7，体积约为WAV的1/10；WAV: 原始无损格式</div>
 </div>
 
+<div class="field" id="volume-field" style="display:none">
+  <label for="mp3-volume">MP3 音量</label>
+  <div style="display:flex;align-items:center;gap:8px;">
+    <button id="mp3-volume-down" class="secondary" type="button" style="padding:4px 12px;font-size:16px;">－</button>
+    <input id="mp3-volume" type="number" step="0.1" min="0" max="4" value="1.0" style="width:80px;text-align:center;">
+    <button id="mp3-volume-up" class="secondary" type="button" style="padding:4px 12px;font-size:16px;">＋</button>
+    <span id="mp3-volume-label" style="font-size:13px;color:#666;">倍</span>
+  </div>
+  <div class="meta">仅 MP3 输出有效；1.0=原始音量，每次点击 ±0.1；默认值来自 conf/app.json</div>
+</div>
+
 <button id="btn" onclick="doSynthesize()">开始合成</button>
 <div id="params-info" class="params-info" style="display:none"></div>
 <div id="result" class="result" style="display:none"></div>
@@ -855,7 +867,8 @@ function clearPromptAudio() {
 function getConfig() {
   const seedVal = parseInt(document.getElementById('seed').value) || 0;
   const demoId = document.getElementById('demo').value;
-  return {
+  const outputFormat = document.getElementById('output-format').value;
+  const cfg = {
     text: document.getElementById('text').value,
     voice: document.getElementById('voice').value,
     demo_id: demoId,
@@ -865,8 +878,16 @@ function getConfig() {
     seed: seedVal === 0 ? Math.floor(Math.random() * 2147483647) + 1 : seedVal,
     enable_robust: document.getElementById('enable-robust').checked,
     enable_wetext: document.getElementById('enable-wetext').checked,
-    output_format: document.getElementById('output-format').value
+    output_format: outputFormat
   };
+  // 仅 MP3 格式时携带音量参数
+  if (outputFormat === 'mp3') {
+    const vol = parseFloat(document.getElementById('mp3-volume').value);
+    if (!isNaN(vol) && vol > 0) {
+      cfg.volume = vol;
+    }
+  }
+  return cfg;
 }
 
 async function doSynthesize() {
@@ -917,13 +938,18 @@ async function doSynthesize() {
       stream: playMode === 'stream',
       format: effectiveFormat
     };
+    // 仅 MP3 格式时携带音量参数
+    if (effectiveFormat === 'mp3' && cfg.volume !== undefined) {
+      body.volume = cfg.volume;
+    }
 
     // 显示请求参数
     const seedInputVal = parseInt(document.getElementById('seed').value) || 0;
     const seedDisplay = cfg.seed;
     const seedLabel = seedInputVal === 0 ? ' (自动随机)' : '';
     paramsInfo.style.display = 'block';
-    paramsInfo.innerHTML = '音色: <span>' + cfg.voice + '</span> 采样模式: <span>' + cfg.sample_mode + '</span> 种子: <span>' + seedDisplay + seedLabel + '</span> 最大帧数: <span>' + cfg.max_new_frames + '</span> 克隆最大文本Token: <span>' + cfg.voice_clone_max_text_tokens + '</span> 格式: <span>' + effectiveFormat + '</span> 播放模式: <span>' + playMode + '</span>';
+    const volDisplay = (effectiveFormat === 'mp3' && cfg.volume !== undefined) ? ' 音量: <span>' + cfg.volume.toFixed(1) + '</span>' : '';
+    paramsInfo.innerHTML = '音色: <span>' + cfg.voice + '</span> 采样模式: <span>' + cfg.sample_mode + '</span> 种子: <span>' + seedDisplay + seedLabel + '</span> 最大帧数: <span>' + cfg.max_new_frames + '</span> 克隆最大文本Token: <span>' + cfg.voice_clone_max_text_tokens + '</span> 格式: <span>' + effectiveFormat + '</span> 播放模式: <span>' + playMode + '</span>' + volDisplay;
 
     if (playMode === 'stream') {
       await doStreamSynthesize(body, result, btn, paramsInfo);
@@ -1104,16 +1130,57 @@ loadDemos();
 loadVoices();
 loadDeviceInfo();
 loadVersion();
+loadAppConfig();
 
-// 播放模式切换时，隐藏/显示输出格式
+// 加载 app.json 中的默认 MP3 音量
+async function loadAppConfig() {
+  try {
+    const r = await fetch('/api/app-config');
+    const data = await r.json();
+    if (data.mp3_volume && data.mp3_volume > 0) {
+      document.getElementById('mp3-volume').value = Number(data.mp3_volume).toFixed(1);
+    }
+  } catch (e) {
+    console.error('Failed to load app config:', e);
+  }
+}
+
+// MP3 音量 step 调节（每次点击 0.1）
+function adjustVolume(delta) {
+  const input = document.getElementById('mp3-volume');
+  let val = parseFloat(input.value);
+  if (isNaN(val)) val = 1.0;
+  val = Math.round((val + delta) * 10) / 10; // 保留一位小数，避免浮点误差
+  if (val < 0) val = 0;
+  if (val > 4) val = 4;
+  input.value = val.toFixed(1);
+}
+document.getElementById('mp3-volume-up').addEventListener('click', () => adjustVolume(0.1));
+document.getElementById('mp3-volume-down').addEventListener('click', () => adjustVolume(-0.1));
+
+// 根据播放模式和输出格式控制音量字段显示
+function updateVolumeFieldVisibility() {
+  const playMode = document.getElementById('play-mode').value;
+  const fmt = document.getElementById('output-format').value;
+  // 流式播放模式下默认强制 WAV（见 doSynthesize 中的 effectiveFormat 逻辑），此时隐藏音量
+  // 非流式播放模式下，仅 MP3 显示音量
+  const show = playMode !== 'stream' && fmt === 'mp3';
+  document.getElementById('volume-field').style.display = show ? '' : 'none';
+}
+
+// 播放模式切换时，隐藏/显示输出格式和音量
 document.getElementById('play-mode').addEventListener('change', function() {
   const formatField = document.getElementById('format-field');
   formatField.style.display = this.value === 'stream' ? 'none' : '';
+  updateVolumeFieldVisibility();
 });
-// 初始化：默认流式播放时隐藏格式选择
+// 输出格式切换时，控制音量字段显示
+document.getElementById('output-format').addEventListener('change', updateVolumeFieldVisibility);
+// 初始化：默认流式播放时隐藏格式选择和音量
 (function() {
   const playMode = document.getElementById('play-mode').value;
   document.getElementById('format-field').style.display = playMode === 'stream' ? 'none' : '';
+  updateVolumeFieldVisibility();
 })();
 </script>
 </body>

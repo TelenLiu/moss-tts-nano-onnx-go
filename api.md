@@ -20,6 +20,7 @@ MOSS-TTS-Nano ONNX 提供基于 HTTP 的 RESTful API 和 SSE（Server-Sent Event
 - [8. 获取音频文件](#8-获取音频文件)
 - [9. 演示样例列表](#9-演示样例列表)
 - [10. 获取演示音频](#10-获取演示音频)
+- [11. 应用配置](#11-应用配置)
 - [附录：错误码说明](#附录错误码说明)
 
 ---
@@ -253,6 +254,7 @@ Content-Type: application/json
 | format | string | 否 | `"mp3"` | 输出音频格式：`"mp3"` 或 `"wav"` |
 | mp3_sample_rate | int | 否 | 默认配置 | MP3 编码采样率（Hz），仅 `format=mp3` 时有效 |
 | mp3_vbr_quality | float | 否 | 默认配置 | MP3 VBR 质量参数，仅 `format=mp3` 时有效 |
+| volume | float | 否 | `app.json` 中 `mp3Volume`，未配置则 `1.0` | MP3 音量倍数，仅 `format=mp3` 时有效。`1.0`=原始音量，`>1` 放大，`<1` 减小。Web 界面以 0.1 步进调节 |
 | text_temperature | float | 否 | `null`（使用内置值） | 文本生成温度，覆盖 ONNX 模型内置常数。仅 `sample_mode=full` 时生效 |
 | text_top_k | int | 否 | `null`（使用内置值） | 文本生成 Top-K 采样参数。仅 `sample_mode=full` 时生效 |
 | text_top_p | float | 否 | `null`（使用内置值） | 文本生成 Top-P 采样参数。仅 `sample_mode=full` 时生效 |
@@ -507,6 +509,51 @@ GET /api/demo-prompt-audio/{demo_id}
 |-------------|------|
 | 400 | `demo_id` 为空 |
 | 404 | 指定的演示样例不存在 |
+
+---
+
+## 11. 应用配置
+
+获取前端需要的默认配置（如 MP3 默认音量）。这些默认值来自 `conf/app.json`。
+
+```
+GET /api/app-config
+```
+
+### 响应
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| mp3_volume | float | MP3 默认音量倍数。来自 `conf/app.json` 的 `mp3Volume` 字段，未配置时为 `1.0` |
+
+### 示例
+
+**请求**：
+```
+GET /api/app-config
+```
+
+**响应**：
+```json
+{"mp3_volume": 1.0}
+```
+
+### conf/app.json 配置说明
+
+`conf/app.json` 支持以下字段：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| logLevel | string | `"info"` | 日志级别：`debug`/`info`/`warn`/`error` |
+| mp3Volume | float | `1.0` | MP3 输出默认音量倍数。`1.0`=原始音量，`>1` 放大，`<1` 减小。仅 `format=mp3` 时生效 |
+
+**示例 `conf/app.json`**：
+```json
+{
+  "logLevel": "info",
+  "mp3Volume": 1.2
+}
+```
 
 ---
 

@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/appconfig"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/audio"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/device"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
@@ -379,6 +380,11 @@ func (s *Server) handleSynthesize(w http.ResponseWriter, r *http.Request) {
 		if req.MP3VBRQuality > 0 {
 			mp3Cfg.VBRQuality = req.MP3VBRQuality
 		}
+		// 音量倍数：请求未指定时使用 app.json 中的默认值
+		mp3Cfg.Volume = appconfig.MP3Volume()
+		if req.Volume != nil && *req.Volume > 0 {
+			mp3Cfg.Volume = *req.Volume
+		}
 		mp3Data, err := audio.EncodeMP3(result.Waveform, result.Channels, result.SampleRate, mp3Cfg)
 		if err != nil {
 			log.Warnf("[API synthesize] MP3 编码失败，回退 WAV: %v", err)
@@ -473,6 +479,11 @@ func (s *Server) handleStreamSynthesize(w http.ResponseWriter, ctx context.Conte
 		}
 		if req.MP3VBRQuality > 0 {
 			mp3Cfg.VBRQuality = req.MP3VBRQuality
+		}
+		// 音量倍数：请求未指定时使用 app.json 中的默认值
+		mp3Cfg.Volume = appconfig.MP3Volume()
+		if req.Volume != nil && *req.Volume > 0 {
+			mp3Cfg.Volume = *req.Volume
 		}
 		mp3Data, err := audio.EncodeMP3(waveform, channels, sampleRate, mp3Cfg)
 		if err != nil {
@@ -656,4 +667,14 @@ func (s *Server) handleDemoPromptAudio(w http.ResponseWriter, r *http.Request) {
 
 	http.ServeFile(w, r, demo.Path)
 	log.Debugf("[Demo] 提供演示音频: %s -> %s", demoID, demo.Path)
+}
+
+// handleAppConfig 返回前端需要的默认配置（如 MP3 默认音量）。
+func (s *Server) handleAppConfig(w http.ResponseWriter, r *http.Request) {
+	cfg := appconfig.LoadOnce()
+	resp := map[string]interface{}{
+		"mp3_volume": cfg.MP3Volume,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }

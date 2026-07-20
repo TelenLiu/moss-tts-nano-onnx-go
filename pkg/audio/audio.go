@@ -22,12 +22,14 @@ import (
 type MP3EncodeConfig struct {
 	SampleRate int     // 目标采样率，默认 44100
 	VBRQuality float64 // VBR 质量 (0-9, 0最高 9最低)，默认 7 (较低质量节省空间)
+	Volume     float64 // 音量倍数 (1.0=原始音量，>1放大，<1减小)，默认 1.0。<=0 或未设置时按 1.0 处理
 }
 
 // DefaultMP3EncodeConfig 默认 MP3 编码配置
 var DefaultMP3EncodeConfig = MP3EncodeConfig{
 	SampleRate: 44100,
 	VBRQuality: 7,
+	Volume:     1.0,
 }
 
 // mp3EncoderCache 缓存探测到的可用 MP3 编码器名称
@@ -119,12 +121,23 @@ func EncodeMP3(waveform []float32, channels, sampleRate int, cfg MP3EncodeConfig
 		"-ac", fmt.Sprintf("%d", channels),
 		"-ar", fmt.Sprintf("%d", sampleRate),
 		"-i", "pipe:0",
+	}
+	// 音量调节：仅当 Volume 有效且不等于 1.0 时添加 volume 滤镜
+	// ffmpeg volume 滤镜会做软限幅，不会硬削波爆音
+	vol := cfg.Volume
+	if vol <= 0 {
+		vol = 1.0
+	}
+	if vol != 1.0 {
+		args = append(args, "-af", fmt.Sprintf("volume=%.6g", vol))
+	}
+	args = append(args,
 		"-c:a", encoder,
 		"-ar", fmt.Sprintf("%d", cfg.SampleRate),
 		"-q:a", fmt.Sprintf("%.0f", cfg.VBRQuality),
 		"-f", "mp3",
 		"pipe:1",
-	}
+	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

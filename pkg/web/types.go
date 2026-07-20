@@ -40,6 +40,7 @@ type SynthesizeRequest struct {
 	Format                  string   `json:"format"`
 	MP3SampleRate           int      `json:"mp3_sample_rate"`
 	MP3VBRQuality           float64  `json:"mp3_vbr_quality"`
+	Volume                  *float64 `json:"volume"`
 	TextTemperature         *float64 `json:"text_temperature"`
 	TextTopK                *int     `json:"text_top_k"`
 	TextTopP                *float64 `json:"text_top_p"`
