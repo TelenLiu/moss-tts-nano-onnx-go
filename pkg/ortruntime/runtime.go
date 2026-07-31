@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -295,7 +294,7 @@ type OrtCpuRuntime struct {
 	CodecMetaPath      string
 	TTSMeta            map[string]interface{}
 	CodecMeta          map[string]interface{}
-	RNG                *rand.Rand
+	RNG                *sampler.PCG64 // 与 numpy.random.default_rng 兼容的 PCG64 随机数生成器
 	Onnx               *OnnxSessions
 	SessionIdleTimeout time.Duration // Session 空闲超时（默认 10 秒）
 	SessionMutex       sync.Mutex    // 保护 sessions 的并发访问
@@ -340,7 +339,7 @@ func NewOrtCpuRuntime(modelDir string, threadCount int, maxNewFrames *int, doSam
 		ModelDir:           modelDir,
 		ThreadCount:        max(1, threadCount),
 		ExecutionMode:      executionMode,
-		RNG:                rand.New(rand.NewSource(time.Now().UnixNano())),
+		RNG:                sampler.NewPCG64(time.Now().UnixNano()),
 		SessionIdleTimeout: 10 * time.Second, // 默认 10 秒超时
 	}
 	manifestPath, err := rt.resolveManifestPath(modelDir)
@@ -1437,12 +1436,13 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 	repMaskShape := []int64{1, int64(nvq), int64(audioCodebookSize)}
 	repMaskTensor, _ := ort.NewTensor(repMaskShape, repetitionMask)
 
-	assistantRU := []float32{clampRand(float32(rt.RNG.Float32()))}
+	// 与 Python 一致：使用 Float64() 然后转为 float32（numpy: float(rng.random()) -> np.float32）
+	assistantRU := []float32{clampRand(float32(rt.RNG.Float64()))}
 	assRUTensor, _ := ort.NewTensor([]int64{1}, assistantRU)
 
 	audioRU := make([]float32, nvq)
 	for i := range audioRU {
-		audioRU[i] = clampRand(float32(rt.RNG.Float32()))
+		audioRU[i] = clampRand(float32(rt.RNG.Float64()))
 	}
 	audioRUTensor, _ := ort.NewTensor([]int64{1, int64(nvq)}, audioRU)
 

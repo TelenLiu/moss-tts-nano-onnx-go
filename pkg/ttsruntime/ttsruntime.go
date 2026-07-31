@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +20,7 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/normalizer"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/ortruntime"
+	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/sampler"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/tokenizer"
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -627,7 +627,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		rngSeed = time.Now().UnixNano()
 		log.Infof("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
 	}
-	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+	t.OrtRuntime.RNG = sampler.NewPCG64(rngSeed)
 
 	// 构建采样参数覆盖
 	overrides := t.buildGenerationOverrides(sampleMode, doSample)
@@ -687,7 +687,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
 		// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
-		t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+		t.OrtRuntime.RNG = sampler.NewPCG64(rngSeed)
 
 		textTokenIDs := t.EncodeText(chunkText)
 		log.Debugf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
@@ -834,7 +834,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		rngSeed = time.Now().UnixNano()
 		log.Infof("[Synthesize] 使用随机种子(基于时间): %d", rngSeed)
 	}
-	t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+	t.OrtRuntime.RNG = sampler.NewPCG64(rngSeed)
 
 	// 构建采样参数覆盖
 	overrides := t.buildGenerationOverrides(sampleMode, doSample)
@@ -890,7 +890,7 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		logMemoryStats(fmt.Sprintf("chunk %d/%d 开始", chunkIndex+1, len(textChunks)))
 
 		// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
-		t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeed))
+		t.OrtRuntime.RNG = sampler.NewPCG64(rngSeed)
 
 		textTokenIDs := t.EncodeText(chunkText)
 		log.Debugf("[Synthesize]   文本编码完成: %d tokens", len(textTokenIDs))
@@ -1028,7 +1028,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 		}()
 
 		if seed != nil {
-			t.OrtRuntime.RNG = rand.New(rand.NewSource(int64(*seed)))
+			t.OrtRuntime.RNG = sampler.NewPCG64(int64(*seed))
 		}
 
 		// 记录实际使用的种子
@@ -1037,7 +1037,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 			rngSeedUsed = int64(*seed)
 		} else {
 			rngSeedUsed = time.Now().UnixNano()
-			t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeedUsed))
+			t.OrtRuntime.RNG = sampler.NewPCG64(rngSeedUsed)
 		}
 
 		// 构建采样参数覆盖
@@ -1087,7 +1087,7 @@ func (t *OnnxTtsRuntime) SynthesizeStreamEx(ctx context.Context, text string, vo
 			}
 
 			// 每个 chunk 重置 RNG 到相同种子，确保各 chunk 的随机值序列一致，减少音色差异
-			t.OrtRuntime.RNG = rand.New(rand.NewSource(rngSeedUsed))
+		t.OrtRuntime.RNG = sampler.NewPCG64(rngSeedUsed)
 
 			textTokenIDs := t.EncodeText(chunkText)
 

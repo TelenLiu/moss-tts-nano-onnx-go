@@ -2,7 +2,6 @@ package sampler
 
 import (
 	"math"
-	"math/rand"
 	"strings"
 )
 
@@ -94,7 +93,7 @@ type indexedVal struct {
 	val float64
 }
 
-func SampleFromScores(values []float32, doSample bool, temperature float64, topK int, topP float64, rng *rand.Rand) int {
+func SampleFromScores(values []float32, doSample bool, temperature float64, topK int, topP float64, rng *PCG64) int {
 	if !doSample {
 		return Argmax(values)
 	}
@@ -156,7 +155,7 @@ func SampleFromScores(values []float32, doSample bool, temperature float64, topK
 	return Argmax(values)
 }
 
-func SampleAssistantTextToken(textLogits []float32, assistantSlotTokenID, audioEndTokenID int, doSample bool, temperature float64, topK int, topP float64, rng *rand.Rand) int {
+func SampleAssistantTextToken(textLogits []float32, assistantSlotTokenID, audioEndTokenID int, doSample bool, temperature float64, topK int, topP float64, rng *PCG64) int {
 	candidateIDs := []int{assistantSlotTokenID, audioEndTokenID}
 	candidateScores := []float32{textLogits[assistantSlotTokenID], textLogits[audioEndTokenID]}
 	effectiveTopK := topK
@@ -167,7 +166,7 @@ func SampleAssistantTextToken(textLogits []float32, assistantSlotTokenID, audioE
 	return candidateIDs[sampledIndex]
 }
 
-func SampleAudioToken(audioLogits []float32, previousTokenIDs []int, previousTokenSet map[int]bool, doSample bool, temperature float64, topK int, topP float64, repetitionPenalty float32, rng *rand.Rand) int {
+func SampleAudioToken(audioLogits []float32, previousTokenIDs []int, previousTokenSet map[int]bool, doSample bool, temperature float64, topK int, topP float64, repetitionPenalty float32, rng *PCG64) int {
 	if !doSample {
 		return ArgmaxWithRepetitionPenalty(audioLogits, previousTokenSet, repetitionPenalty)
 	}

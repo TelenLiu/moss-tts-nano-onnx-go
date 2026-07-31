@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net"
 	"os"
 	"os/signal"
@@ -379,7 +378,6 @@ func workerFloat32sToBytes(data []float32) []byte {
 
 // 保留 unused import 引用
 var (
-	_ = rand.New
 	_ = runtime.GC
 	_ = debug.FreeOSMemory
 )
