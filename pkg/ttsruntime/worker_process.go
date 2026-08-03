@@ -49,11 +49,14 @@ const workerExeDir = ".workers"
 
 // createWorkerExe 为子进程创建一个带序号的可执行文件副本，
 // 使子进程在活动监视器/ps中显示独立的进程名（如 moss-tts-worker-1、moss-tts-worker-r1）。
-// 优先使用符号链接（symlink），不占用磁盘空间；失败时回退到文件复制。
+// 平台策略：
+//   - macOS: APFS 写时复制克隆（unix.Clonefile），独立 inode（进程名不会漂移）+ 零额外磁盘占用；
+//   - Linux: 硬链接（os.Link），共享 inode 零磁盘占用，Linux 的 ps 基于 argv[0] 不会出现名称漂移；
+//   - 两者失败时（非 APFS/跨文件系统）回退到文件复制。
+//
 // 文件存放在 .workers 子目录中，Close 时清理。
 func createWorkerExe(exePath, name string) string {
-	exeDir := filepath.Dir(exePath)
-	workersDir := filepath.Join(exeDir, workerExeDir)
+	workersDir := filepath.Join(filepath.Dir(exePath), workerExeDir)
 
 	// 确保 .workers 目录存在
 	if err := os.MkdirAll(workersDir, 0755); err != nil {
@@ -63,57 +66,46 @@ func createWorkerExe(exePath, name string) string {
 
 	target := filepath.Join(workersDir, "moss-tts-worker-"+name)
 
-	// 检查目标文件是否已存在
-	fi2, err2 := os.Lstat(target)
-	if err2 == nil {
-		// 目标已存在，检查是否是符号链接指向正确的源文件
-		if fi2.Mode()&os.ModeSymlink != 0 {
-			linkTarget, err := os.Readlink(target)
-			if err == nil && linkTarget == exePath {
-				log.Debugf("[WorkerProcess] 复用已有的 worker 符号链接: %s", target)
-				return target
-			}
-		} else if fi2.Mode().IsRegular() {
-			// 是普通文件（副本），检查是否与源文件相同
-			fi1, err1 := os.Stat(exePath)
-			if err1 == nil && !os.SameFile(fi1, fi2) && fi1.Size() == fi2.Size() {
-				log.Debugf("[WorkerProcess] 复用已有的 worker 副本: %s", target)
-				return target
-			}
-		}
-		// 文件存在但不匹配，删除重建
-		os.Remove(target)
-	}
-
-	// 优先尝试符号链接（不占用磁盘空间）
-	if err := os.Symlink(exePath, target); err == nil {
-		log.Printf("[WorkerProcess] 创建 worker 符号链接: %s -> %s", target, exePath)
+	// 平台专用方案（macOS clonefile / Linux 硬链接）
+	if tryLinkWorkerExe(exePath, target) {
 		return target
 	}
 
-	// 符号链接失败，回退到文件复制
+	// 回退：文件复制
+	if copyWorkerExe(exePath, target) {
+		return target
+	}
+
+	return exePath
+}
+
+// copyWorkerExe 将源可执行文件完整复制到 target（链接/克隆均不可用时的保底方案）
+func copyWorkerExe(exePath, target string) bool {
+	// 目标已存在则删除（可能是旧版本残留）
+	os.Remove(target)
+
 	src, err := os.Open(exePath)
 	if err != nil {
 		log.Printf("[WorkerProcess] 无法打开源文件创建worker副本: %v, 使用原始路径", err)
-		return exePath
+		return false
 	}
 	defer src.Close()
 
 	dst, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
 	if err != nil {
 		log.Printf("[WorkerProcess] 无法创建worker副本文件: %v, 使用原始路径", err)
-		return exePath
+		return false
 	}
 	defer dst.Close()
 
 	if _, err := io.Copy(dst, src); err != nil {
 		os.Remove(target)
 		log.Printf("[WorkerProcess] 复制worker可执行文件失败: %v, 使用原始路径", err)
-		return exePath
+		return false
 	}
 
 	log.Printf("[WorkerProcess] 创建 worker 副本: %s", target)
-	return target
+	return true
 }
 
 // NewWorkerProcess 启动一个子进程推理单元
