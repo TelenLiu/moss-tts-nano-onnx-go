@@ -24,6 +24,11 @@ var (
 
 	zhReady bool
 	enReady bool
+
+	// WeTextProcessing 的 pynini FST 内部存在非线程安全的 map 写入（FindRuneLabel），
+	// 并发调用 Normalize 会触发 "fatal error: concurrent map writes" 导致进程闪退。
+	// 使用互斥锁将归一化调用串行化。
+	normalizeMu sync.Mutex
 )
 
 var keepHyphenPlaceholder = "___KEEP_HYPHEN_BEFORE_ZH_WETEXT___"
@@ -343,7 +348,9 @@ func NormalizeTTSText(text string) string {
 		return text
 	}
 	zhOnce.Do(func() { initZh(nil) })
+	normalizeMu.Lock()
 	normalized := zhNormalizer.Normalize(text)
+	normalizeMu.Unlock()
 	normalized = strings.TrimSpace(normalized)
 	return normalized
 }
@@ -353,6 +360,7 @@ func NormalizeWithWeText(text string, language string) string {
 		return text
 	}
 	var result string
+	normalizeMu.Lock()
 	switch language {
 	case "en":
 		enOnce.Do(func() { initEn(nil) })
@@ -361,6 +369,7 @@ func NormalizeWithWeText(text string, language string) string {
 		zhOnce.Do(func() { initZh(nil) })
 		result = zhNormalizer.Normalize(text)
 	}
+	normalizeMu.Unlock()
 	return strings.TrimSpace(result)
 }
 
