@@ -216,43 +216,84 @@ func (p *Processor) Encode(text string) []int {
 		return nil
 	}
 	text = normalizeNFKC(text)
-	normalized := strings.ReplaceAll(text, " ", "\xe2\x96\x81")
+	// SentencePiece 在编码前会给文本前导添加一个空格，归一化后即元符号 ▁（U+2581），
+	// 因此非空文本的首个 token 通常是 ▁。这里补齐该前导符号，以与 Python sentencepiece
+	// 的 EncodeAsIds 行为对齐，避免 token 序列整体偏移。
+	normalized := "\xe2\x96\x81" + strings.ReplaceAll(text, " ", "\xe2\x96\x81")
 	runes := []rune(normalized)
-	var tokens []int
-	i := 0
-	for i < len(runes) {
-		bestLen := 0
-		bestID := -1
-		bestScore := float32(math.Inf(-1))
-		for end := i + 1; end <= len(runes) && end-i <= 64; end++ {
+	n := len(runes)
+
+	// SentencePiece unigram 模型使用 Viterbi 动态规划求整条路径分数和最大的切分，
+	// 而不是在每个位置贪心取单个 piece 的最高分。dp[i] 表示覆盖 runes[:i] 的最优路径。
+	negInf := float32(math.Inf(-1))
+	dp := make([]float32, n+1)
+	back := make([]int, n+1)
+	pieceID := make([]int, n+1)
+	for i := 1; i <= n; i++ {
+		dp[i] = negInf
+		back[i] = -1
+		pieceID[i] = -1
+	}
+	dp[0] = 0
+
+	for i := 0; i < n; i++ {
+		if dp[i] == negInf {
+			continue
+		}
+		matched := false
+		maxLen := i + 64
+		if maxLen > n {
+			maxLen = n
+		}
+		for end := i + 1; end <= maxLen; end++ {
 			candidate := string(runes[i:end])
 			if id, ok := p.PieceToID[candidate]; ok {
-				if p.Types[id] == PieceNormal || p.Types[id] == PieceUserDefined || p.Types[id] == PieceByte {
-					if p.Scores[id] > bestScore {
-						bestScore = p.Scores[id]
-						bestLen = end - i
-						bestID = id
+				t := p.Types[id]
+				if t == PieceNormal || t == PieceUserDefined || t == PieceByte {
+					score := dp[i] + p.Scores[id]
+					if score > dp[end] {
+						dp[end] = score
+						back[end] = i
+						pieceID[end] = id
 					}
+					matched = true
 				}
 			}
 		}
-		if bestID >= 0 && bestLen > 0 {
-			tokens = append(tokens, bestID)
-			i += bestLen
-		} else {
+		if !matched {
+			// 单字符回退：ASCII 字节用 <0xXX> piece，其余用 UNK。
 			ch := runes[i]
+			var id int
 			if ch < 0x100 {
 				hex := fmt.Sprintf("<0x%02X>", ch)
-				if id, ok := p.PieceToID[hex]; ok {
-					tokens = append(tokens, id)
+				if hid, ok := p.PieceToID[hex]; ok {
+					id = hid
 				} else {
-					tokens = append(tokens, p.UnkID)
+					id = p.UnkID
 				}
 			} else {
-				tokens = append(tokens, p.UnkID)
+				id = p.UnkID
 			}
-			i++
+			score := dp[i]
+			if score > dp[i+1] {
+				dp[i+1] = score
+				back[i+1] = i
+				pieceID[i+1] = id
+			}
 		}
+	}
+
+	// 回溯还原 token 顺序
+	var rev []int
+	for pos := n; pos > 0; pos = back[pos] {
+		if pieceID[pos] < 0 {
+			break
+		}
+		rev = append(rev, pieceID[pos])
+	}
+	tokens := make([]int, len(rev))
+	for i, id := range rev {
+		tokens[len(rev)-1-i] = id
 	}
 	return tokens
 }
