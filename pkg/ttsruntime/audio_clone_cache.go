@@ -14,7 +14,7 @@ import (
 
 // audioCloneEncodeVersion 编码版本号
 // 修改音频预处理/编码逻辑后递增此版本号，使旧缓存自动失效
-const audioCloneEncodeVersion = 2
+const audioCloneEncodeVersion = 8
 
 // AudioCloneCache 基于文件的音频克隆编码缓存
 // 使用音频数据的 SHA-256 hash + 编码版本号作为 key，gob 序列化存储到 cache/audio_clone_gob/ 目录

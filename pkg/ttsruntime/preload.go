@@ -11,8 +11,14 @@ import (
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
 )
 
+// preloadCacheVersion 预加载缓存版本号。
+// 修改参考音频预处理/编码逻辑（如采样精度、时长截断、编码帧数上限等）后递增此版本号，
+// 使旧的磁盘 gob 缓存自动失效，避免复用旧编码结果导致克隆异常。
+const preloadCacheVersion = 4
+
 // PreloadData 预加载的音频数据
 type PreloadData struct {
+	Version        int       // 缓存版本号，不匹配时视为失效
 	ID             string    // 预加载ID
 	AudioCodes     [][]int   // 音频编码数据
 	Text           string    // 示例文本
@@ -67,9 +73,13 @@ func (pc *PreloadCache) Get(id string) (*PreloadData, error) {
 	cacheFile := pc.getCacheFilePath(id)
 	if _, err := os.Stat(cacheFile); err == nil {
 		data, err := pc.loadFromDisk(id)
-		if err != nil {
-			log.Warnf("[PreloadCache] 从磁盘加载失败: %v", err)
-			return nil, err
+		if err != nil || data == nil || data.Version != preloadCacheVersion {
+			if err == nil && data != nil {
+				log.Infof("[PreloadCache] 磁盘缓存版本不匹配，忽略: %s (got=%d want=%d)", id, data.Version, preloadCacheVersion)
+			}
+			// 旧版本缓存不可用，删除并视为未命中
+			os.Remove(cacheFile)
+			return nil, fmt.Errorf("preload data version mismatch: %s", id)
 		}
 		// 加入内存缓存
 		pc.addToMemoryCache(id, data)
@@ -94,8 +104,13 @@ func (pc *PreloadCache) Preload(id string, audioPath string, text string) error 
 	// 检查磁盘缓存
 	cacheFile := pc.getCacheFilePath(id)
 	if _, err := os.Stat(cacheFile); err == nil {
-		log.Debugf("[PreloadCache] 磁盘缓存已存在: %s", id)
-		return nil
+		if existing, err := pc.loadFromDisk(id); err == nil && existing != nil && existing.Version == preloadCacheVersion {
+			log.Debugf("[PreloadCache] 磁盘缓存已存在: %s", id)
+			return nil
+		}
+		// 版本不匹配或加载失败：删除旧缓存，重新编码
+		log.Infof("[PreloadCache] 磁盘缓存版本不匹配，重新预加载: %s", id)
+		os.Remove(cacheFile)
 	}
 
 	// 编码音频
@@ -107,6 +122,7 @@ func (pc *PreloadCache) Preload(id string, audioPath string, text string) error 
 
 	// 创建预加载数据
 	data := &PreloadData{
+		Version:        preloadCacheVersion,
 		ID:             id,
 		AudioCodes:     audioCodes,
 		Text:           text,

@@ -15,7 +15,6 @@ import (
 
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/deps"
 	"github.com/TelenLiu/moss-tts-nano-onnx-go/pkg/log"
-	resample "github.com/gunter-q12/resample"
 )
 
 // MP3EncodeConfig MP3 编码配置
@@ -307,6 +306,7 @@ func readRIFFWAV(path string) ([]float32, int, int, error) {
 	}
 
 	var channels, sampleRate, dataSize int
+	var bitsPerSample, audioFormat uint16
 	for {
 		chunkHeader := make([]byte, 8)
 		_, err := f.Read(chunkHeader)
@@ -317,15 +317,27 @@ func readRIFFWAV(path string) ([]float32, int, int, error) {
 		chunkSize := int(binary.LittleEndian.Uint32(chunkHeader[4:8]))
 
 		if chunkID == "fmt " {
-			fmtData := make([]byte, 16)
+			fmtData := make([]byte, chunkSize)
 			if _, err := f.Read(fmtData); err != nil {
 				return nil, 0, 0, err
 			}
+			audioFormat = binary.LittleEndian.Uint16(fmtData[0:2])
 			channels = int(binary.LittleEndian.Uint16(fmtData[2:4]))
 			sampleRate = int(binary.LittleEndian.Uint32(fmtData[4:8]))
-			remaining := chunkSize - 16
-			if remaining > 0 {
-				f.Seek(int64(remaining), 1)
+			bitsPerSample = binary.LittleEndian.Uint16(fmtData[14:16])
+			// WAVE_FORMAT_EXTENSIBLE (0xFFFE): 真正的格式由末尾 16 字节 subformat GUID 决定。
+			// 若 GUID 为 IEEE float 则 audioFormat 设为 3。
+			if audioFormat == 0xFFFE && chunkSize >= 40 {
+				// GUID 位于 fmtData[24:40]，前 2 字节即 format code（little-endian）。
+				subFmt := binary.LittleEndian.Uint16(fmtData[24:26])
+				if subFmt == 3 {
+					audioFormat = 3
+				}
+			}
+			// fmtData 已读取整个 chunkSize 字节，无需再 seek。
+			// 若 chunkSize 为奇数，RIFF 规范要求 1 字节 padding，但 fmt chunk 通常为偶数。
+			if chunkSize%2 == 1 {
+				f.Seek(1, 1)
 			}
 		} else if chunkID == "data" {
 			dataSize = chunkSize
@@ -341,11 +353,23 @@ func readRIFFWAV(path string) ([]float32, int, int, error) {
 		return nil, 0, 0, err
 	}
 
-	numSamples := dataSize / 2
-	waveform := make([]float32, numSamples)
-	for i := 0; i < numSamples; i++ {
-		pcm16 := int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2]))
-		waveform[i] = float32(pcm16) / 32768.0
+	var waveform []float32
+	if audioFormat == 3 && bitsPerSample == 32 {
+		// 32-bit IEEE float (pcm_f32le)
+		numSamples := dataSize / 4
+		waveform = make([]float32, numSamples)
+		for i := 0; i < numSamples; i++ {
+			bits := binary.LittleEndian.Uint32(data[i*4 : i*4+4])
+			waveform[i] = math.Float32frombits(bits)
+		}
+	} else {
+		// 默认按 16-bit PCM 解析
+		numSamples := dataSize / 2
+		waveform = make([]float32, numSamples)
+		for i := 0; i < numSamples; i++ {
+			pcm16 := int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2]))
+			waveform[i] = float32(pcm16) / 32768.0
+		}
 	}
 
 	return waveform, channels, sampleRate, nil
@@ -553,8 +577,10 @@ func trimLeadingSilence(waveform []float32, channels int) []float32 {
 	return trimmed
 }
 
-// MaxReferenceAudioDurationSec 参考音频最大时长（秒），超过此时长将被截断以避免 OOM
-const MaxReferenceAudioDurationSec = 15
+// MaxReferenceAudioDurationSec 参考音频最大时长（秒），超过此时长将被截断以避免 OOM。
+// Python 端不截断参考音频，此处保留较大的安全上限（60 秒），确保内置 demo 参考音频
+// （部分约 28 秒）完整加载，避免因截断改变参考音频内容而导致模型 EOS 判定发散。
+const MaxReferenceAudioDurationSec = 60
 
 // loadWithHighQualityResample 使用 Go 内置高质量重采样加载参考音频
 // 基于 bandlimited interpolation（Kaiser 窗 sinc 插值），与 Python torchaudio.functional.resample 算法一致
@@ -573,14 +599,17 @@ func loadWithHighQualityResample(path string, targetSampleRate, targetChannels i
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// 用 ffmpeg 解码为 WAV（保持原始采样率，仅做格式转换和通道转换）
+	// 用 ffmpeg 解码为 WAV，保持原始采样率和声道数，仅做格式转换为 float32。
+	// 不使用 ffmpeg/swresample 做重采样或声道转换，因为其算法与 Python torchaudio 不同，
+	// 会导致参考音频波形偏离、codec 码不一致、EOS 判定发散。
+	// 使用 pcm_f32le 保留浮点精度，与 Python torchaudio 直接解码为 float32 的行为对齐，
+	// 避免 pcm_s16le 量化导致参考音频 codec 码偏离、进而影响克隆效果和 EOS 判定。
 	cmd := exec.CommandContext(ctx, ffmpegPath, "-y",
 		"-v", "fatal",
 		"-i", path,
 		"-t", fmt.Sprintf("%d", MaxReferenceAudioDurationSec),
-		"-ac", fmt.Sprintf("%d", targetChannels),
 		"-f", "wav",
-		"-acodec", "pcm_s16le",
+		"-acodec", "pcm_f32le",
 		tmpFile,
 	)
 	if err := cmd.Run(); err != nil {
@@ -598,67 +627,42 @@ func loadWithHighQualityResample(path string, targetSampleRate, targetChannels i
 		return waveform, channels, sampleRate, nil
 	}
 
-	// 4. 使用 bandlimited interpolation 进行高质量重采样
-	// gunter-q12/resample 库基于与 torchaudio 相同的 sinc 插值算法
-	// 使用 KaiserBest 滤波器获得最高质量
-	resampled, err := resampleWaveform(waveform, channels, sampleRate, targetSampleRate)
-	if err != nil {
-		return nil, 0, 0, fmt.Errorf("重采样失败: %w", err)
+	// 4. 使用与 torchaudio.functional.resample 完全一致的 sinc_interp_hann 重采样，
+	// 确保需要重采样的参考音频（16k/44.1k/24k 等）得到与 Python 端 bit-exact 的波形。
+	resampled := torchSincResample(waveform, channels, sampleRate, targetSampleRate)
+
+	// 5. 声道转换，对齐 Python _load_reference_audio 的逻辑：
+	//    通道数不足目标时 repeat（如单声道->双声道），过多时取平均（多声道->2声道）。
+	if channels != targetChannels {
+		if channels < targetChannels {
+			// repeat 单声道到多声道（与 torch repeat 行为一致）。
+			outFrames := len(resampled) / channels
+			expanded := make([]float32, outFrames*targetChannels)
+			for i := 0; i < outFrames; i++ {
+				for c := 0; c < targetChannels; c++ {
+					expanded[i*targetChannels+c] = resampled[i*channels]
+				}
+			}
+			resampled = expanded
+		} else {
+			// 多声道下混为 targetChannels（取平均）。
+			outFrames := len(resampled) / channels
+			downmixed := make([]float32, outFrames*targetChannels)
+			for i := 0; i < outFrames; i++ {
+				for c := 0; c < targetChannels; c++ {
+					var sum float32
+					for s := 0; s < channels; s++ {
+						sum += resampled[i*channels+s]
+					}
+					downmixed[i*targetChannels+c] = sum / float32(channels)
+				}
+			}
+			resampled = downmixed
+		}
+		channels = targetChannels
 	}
 
 	return resampled, channels, targetSampleRate, nil
-}
-
-// resampleWaveform 使用 bandlimited interpolation 重采样
-func resampleWaveform(waveform []float32, channels, inRate, outRate int) ([]float32, error) {
-	if inRate == outRate {
-		return waveform, nil
-	}
-
-	// 将交错格式的 float32 样本转换为 bytes
-	inputBytes := make([]byte, len(waveform)*4)
-	for i, v := range waveform {
-		bits := math.Float32bits(v)
-		binary.LittleEndian.PutUint32(inputBytes[i*4:], bits)
-	}
-
-	// 创建输出缓冲区
-	var outBuf bytes.Buffer
-
-	// 创建重采样器：输出写入 outBuf
-	r, err := resample.New(&outBuf, resample.FormatFloat32, inRate, outRate, channels, resample.WithKaiserBestFilter())
-	if err != nil {
-		return nil, fmt.Errorf("创建重采样器失败: %w", err)
-	}
-
-	// 执行重采样
-	n, err := r.Write(inputBytes)
-	if err != nil {
-		return nil, fmt.Errorf("重采样写入失败: %w", err)
-	}
-	if n != len(inputBytes) {
-		log.Warnf("[resampleWaveform] 警告: 写入 %d 字节，期望 %d 字节", n, len(inputBytes))
-	}
-
-	// 使用 ReadFrom 刷新重采样器内部缓冲区
-	// 传入空的 reader 以确保所有数据都被处理
-	if _, err := r.ReadFrom(bytes.NewReader([]byte{})); err != nil {
-		log.Warnf("[resampleWaveform] 刷新重采样器失败: %v", err)
-	}
-
-	// 从 outBuf 读取重采样后的 bytes 并转换为 float32
-	outputBytes := outBuf.Bytes()
-	if len(outputBytes)%4 != 0 {
-		return nil, fmt.Errorf("重采样输出字节数不是4的倍数: %d", len(outputBytes))
-	}
-
-	result := make([]float32, len(outputBytes)/4)
-	for i := range result {
-		bits := binary.LittleEndian.Uint32(outputBytes[i*4:])
-		result[i] = math.Float32frombits(bits)
-	}
-
-	return result, nil
 }
 
 func LoadReferenceAudio(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {

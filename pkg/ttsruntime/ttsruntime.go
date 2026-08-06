@@ -423,7 +423,8 @@ func (t *OnnxTtsRuntime) ResolvePromptAudioCodesWithPreload(voice string, prompt
 	}
 
 	// 统一截断保护：限制 audio codes 帧数，避免 prefill 输入序列过长导致 OOM
-	const maxPromptAudioFrames = 300
+	// 与 Python ONNX 路径对齐：不主动截断正常参考音频，仅设较大安全上限。
+	const maxPromptAudioFrames = 1024
 	if len(result) > maxPromptAudioFrames {
 		log.Warnf("[ResolvePromptAudioCodes] 音频编码帧数过多(%d帧)，截断至%d帧", len(result), maxPromptAudioFrames)
 		result = result[:maxPromptAudioFrames]
@@ -540,7 +541,8 @@ func (t *OnnxTtsRuntime) EncodeReferenceAudioWithOptions(audioPath string, skipA
 	}
 
 	// 截断过长的音频编码帧，避免 prefill 输入序列过长导致 OOM
-	maxPromptAudioFrames := 300 // 约 24 秒（帧率 12.5/秒）
+	// 与 Python ONNX 路径对齐：不主动截断正常参考音频，仅设较大安全上限。
+	maxPromptAudioFrames := 1024 // 约 80 秒（帧率 12.5/秒）
 	if codeLength > maxPromptAudioFrames {
 		log.Warnf("[EncodeReferenceAudio] 音频编码帧数过多(%d帧)，截断至%d帧", codeLength, maxPromptAudioFrames)
 		codeLength = maxPromptAudioFrames
@@ -1486,9 +1488,10 @@ func (t *OnnxTtsRuntime) resetSessionsIfOverMemory(streamingCodecSession *ortrun
 }
 
 // truncatePromptAudioCodes 截断过长的参考音频帧，只保留前 maxFrames 帧
-// 与 Python 端对齐：Python 不做主动截断，仅在 ResolvePromptAudioCodes 中有 300 帧 OOM 保护
-// 保留此函数作为安全上限，但默认值从 20 提高到 300（与 ResolvePromptAudioCodes 一致）
-const defaultMaxPromptAudioFrames = 300
+// 与 Python 端对齐：Python ONNX 路径不主动截断参考音频编码帧。
+// 这里保留一个较大的安全上限（1024 帧，约 80 秒 @12.5fps），仅用于防止异常超长输入导致 OOM，
+// 正常参考音频（通常 < 30 秒，约 375 帧）不会被截断，避免因截断改变模型 EOS 判定。
+const defaultMaxPromptAudioFrames = 1024
 
 func truncatePromptAudioCodes(codes [][]int, maxFrames int) [][]int {
 	if maxFrames <= 0 {

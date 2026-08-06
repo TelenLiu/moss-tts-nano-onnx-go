@@ -307,11 +307,11 @@ type OrtCpuRuntime struct {
 
 // cachedStepMetadata 缓存 local_cached_step 推理所需的元数据
 type cachedStepMetadata struct {
-	localHeads  int64
+	localHeads   int64
 	localHeadDim int64
-	inputNames  []string
-	outputNames []string
-	initialized bool
+	inputNames   []string
+	outputNames  []string
+	initialized  bool
 }
 
 // AcquireSession 标记有活跃请求正在使用 session，防止 session 被销毁。
@@ -878,14 +878,14 @@ type FrameCallback func(generatedFrames [][]int, stepIndex int, frame []int)
 
 // GenerationOverrides 运行时采样参数覆盖，优先级高于 manifest 中的 generation_defaults
 type GenerationOverrides struct {
-	DoSample              *bool
-	SampleMode            *string
-	TextTemperature       *float64
-	TextTopK              *int
-	TextTopP              *float64
-	AudioTemperature      *float64
-	AudioTopK             *int
-	AudioTopP             *float64
+	DoSample               *bool
+	SampleMode             *string
+	TextTemperature        *float64
+	TextTopK               *int
+	TextTopP               *float64
+	AudioTemperature       *float64
+	AudioTopK              *int
+	AudioTopP              *float64
 	AudioRepetitionPenalty *float64
 }
 
@@ -2063,7 +2063,7 @@ func (rt *OrtCpuRuntime) EnsureCodecEncodeSession() error {
 	}
 	defer sessionOptions.Destroy()
 
-	if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableExtended); err != nil {
+	if err := sessionOptions.SetGraphOptimizationLevel(ort.GraphOptimizationLevelEnableAll); err != nil {
 		log.Errorf("  警告: 设置图优化级别失败: %v", err)
 	}
 	if err := sessionOptions.AddSessionConfigEntry("session.enable_mem_pattern", "0"); err != nil {
