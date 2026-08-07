@@ -446,6 +446,57 @@ func MakeSilence(durationSamples, channels int) []float32 {
 	return make([]float32, durationSamples*channels)
 }
 
+// TrimTrailingSilence 裁剪波形末尾的静音/低能量拖尾。
+// 从后向前找到最后一个有声窗口，保留其后少量自然尾音。
+func TrimTrailingSilence(waveform []float32, channels, sampleRate int) []float32 {
+	if channels <= 0 || len(waveform) == 0 {
+		return waveform
+	}
+	numSamples := len(waveform) / channels
+	if numSamples < sampleRate/4 {
+		return waveform
+	}
+
+	windowSamples := int(float64(sampleRate) * 0.02)
+	if windowSamples < 1 {
+		windowSamples = 1
+	}
+	const rmsThreshold = 0.01
+
+	numWindows := numSamples / windowSamples
+	lastVoiced := -1
+	for w := numWindows - 1; w >= 0; w-- {
+		var sumSq float64
+		start := w * windowSamples
+		end := start + windowSamples
+		for i := start; i < end; i++ {
+			for ch := 0; ch < channels; ch++ {
+				v := float64(waveform[i*channels+ch])
+				sumSq += v * v
+			}
+		}
+		rms := math.Sqrt(sumSq / float64(windowSamples*channels))
+		if rms > rmsThreshold {
+			lastVoiced = w
+			break
+		}
+	}
+	if lastVoiced < 0 {
+		return waveform
+	}
+
+	paddingWindows := int(float64(sampleRate) * 0.15 / float64(windowSamples))
+	cutSample := (lastVoiced + 1 + paddingWindows) * windowSamples
+	if cutSample > numSamples {
+		cutSample = numSamples
+	}
+
+	if float64(numSamples-cutSample)/float64(numSamples) > 0.6 {
+		return waveform
+	}
+	return waveform[:cutSample*channels]
+}
+
 // loadWithFFmpegResampled 使用 ffmpeg 加载音频并完成重采样和通道转换
 // 优先使用 soxr 重采样器（质量接近 torchaudio），不可用时回退到 ffmpeg 默认 swr 重采样器
 func loadWithFFmpegResampled(path string, targetSampleRate, targetChannels int) ([]float32, int, int, error) {

@@ -1024,6 +1024,15 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 		doSample = toBool(ds)
 	}
 
+	// EOS 反弹检测：当 P(continue) 在生成早期（前 eosValleyWindow 步）曾明显下降
+	// （模型表示"说完了"），之后又大幅反弹回升，说明因随机数错过 EOS 后退入吸引子，
+	// 强制停止。早期窗口约束确保正常长文本在末尾自然收尾时不会被误判。
+	// 数据依据：正常长文本前 20 步 P(cont) 始终 ≥0.99；退化时前 20 步内出现 ≤0.5 的谷底。
+	const eosValleyThreshold = float32(0.8)
+	const eosReboundThreshold = float32(0.8)
+	const eosValleyWindow = 20
+	eosValleySeen := false
+
 	for stepIndex := 0; stepIndex < maxNewFrames; stepIndex++ {
 		select {
 		case <-ctx.Done():
@@ -1058,6 +1067,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 
 		var frame []int
 		shouldContinue := true
+		var pContinue float32
 
 		if rt.Onnx.Inference.LocalGreedyFrame != nil && !doSample {
 			if stepIndex == 0 {
@@ -1071,7 +1081,7 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 			}
 			// 仅在 sample_mode == "fixed" 时使用 local_fixed_sampled_frame
 			// 与 Python 端条件判断一致
-			shouldContinue, frame = rt.runLocalFixedSampledFrame(
+			shouldContinue, pContinue, frame = rt.runLocalFixedSampledFrame(
 				globalHidden, prevTokenSetsByChannel, nvq, audioCodebookSize)
 		} else if rt.Onnx.Inference.LocalCachedStep != nil {
 			if stepIndex == 0 {
@@ -1100,12 +1110,48 @@ func (rt *OrtCpuRuntime) GenerateAudioFramesWithCallbackAndOverrides(ctx context
 			break
 		}
 
+		// EOS 反弹检测（fixed 采样模式）：
+		// 仅在生成早期窗口内记录谷底；谷底之后 P(cont) 大幅反弹回升说明退化。
+		if pContinue > 0 && sampleMode == sampler.SampleModeFixed {
+			if stepIndex < eosValleyWindow && pContinue < eosValleyThreshold {
+				eosValleySeen = true
+			} else if eosValleySeen && pContinue > eosReboundThreshold && stepIndex > 0 {
+				log.Debugf("  step %d: EOS 反弹检测触发 (valley then pContinue=%.4f)，提前停止", stepIndex, pContinue)
+				break
+			}
+		}
+
 		// 添加帧到结果中
 		for ci, token := range frame {
 			prevTokensByChannel[ci] = append(prevTokensByChannel[ci], token)
 			prevTokenSetsByChannel[ci][token] = true
 		}
 		generatedFrames = append(generatedFrames, frame)
+
+		// 防自回归退化：检测固定点（连续多帧所有 VQ 码完全相同）。
+		// 真实语音（含口吃/长元音）每 12.5ms 帧的 16 个码不可能连续多帧 bit-exact 相同；
+		// 只有模型状态崩塌到吸引子时才会冻结，此时 EOS 几乎不可能再触发，必须强制停止。
+		const fixedPointRunThreshold = 8
+		if len(generatedFrames) >= fixedPointRunThreshold {
+			allSame := true
+			tail := generatedFrames[len(generatedFrames)-fixedPointRunThreshold:]
+			for k := 1; k < len(tail) && allSame; k++ {
+				if len(tail[k]) != len(tail[0]) {
+					allSame = false
+					break
+				}
+				for ci := range tail[0] {
+					if tail[k][ci] != tail[0][ci] {
+						allSame = false
+						break
+					}
+				}
+			}
+			if allSame {
+				log.Debugf("  step %d: 检测到固定点退化（连续 %d 帧完全相同），提前停止", stepIndex, fixedPointRunThreshold)
+				break
+			}
+		}
 
 		if onFrame != nil {
 			onFrame(generatedFrames, stepIndex, frame)
@@ -1421,7 +1467,7 @@ func (rt *OrtCpuRuntime) runLocalGreedyFrame(globalHidden []float32, prevTokenSe
 	return shouldContinue != 0, frame
 }
 
-func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevTokenSets []map[int]bool, nvq, audioCodebookSize int) (bool, []int) {
+func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevTokenSets []map[int]bool, nvq, audioCodebookSize int) (bool, float32, []int) {
 	ghShape := []int64{1, int64(len(globalHidden))}
 	ghTensor, _ := ort.NewTensor(ghShape, globalHidden)
 
@@ -1447,7 +1493,7 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 	audioRUTensor, _ := ort.NewTensor([]int64{1, int64(nvq)}, audioRU)
 
 	inputs := []ort.Value{ghTensor, repMaskTensor, assRUTensor, audioRUTensor}
-	outputs := make([]ort.Value, 2)
+	outputs := make([]ort.Value, 3)
 
 	err := rt.RunSession(rt.Onnx.Inference.LocalFixedSampledFrame.Session, inputs, outputs)
 	ghTensor.Destroy()
@@ -1457,7 +1503,7 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 
 	if err != nil {
 		log.Errorf("  local_fixed_sampled_frame 失败: %v", err)
-		return false, nil
+		return false, 0, nil
 	}
 	// 更新 Session 使用时间
 	rt.UpdateSessionTime(rt.Onnx.Inference.LocalFixedSampledFrame)
@@ -1474,9 +1520,21 @@ func (rt *OrtCpuRuntime) runLocalFixedSampledFrame(globalHidden []float32, prevT
 		frame[i] = int(frameData[i])
 	}
 
+	// P(continue) = softmax[0]，即模型判定继续生成 assistant 帧的概率
+	var pContinue float32
+	if len(outputs) >= 3 && outputs[2] != nil {
+		pContData := getFloat32Data(outputs[2])
+		if len(pContData) > 0 {
+			pContinue = pContData[0]
+		}
+	}
+
 	outputs[0].Destroy()
 	outputs[1].Destroy()
-	return shouldContinue != 0, frame
+	if len(outputs) >= 3 && outputs[2] != nil {
+		outputs[2].Destroy()
+	}
+	return shouldContinue != 0, pContinue, frame
 }
 
 func (rt *OrtCpuRuntime) runLocalCachedStepFull(globalHidden []float32, prevTokens [][]int, prevTokenSets []map[int]bool, nvq, audioCodebookSize int, gd map[string]interface{}, localPast map[string][]float32, localPVL int) (bool, []int, map[string][]float32, int) {

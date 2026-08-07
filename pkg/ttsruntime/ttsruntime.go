@@ -775,6 +775,12 @@ func (t *OnnxTtsRuntime) SynthesizeWithContextEx(ctx context.Context, text strin
 	}
 	waveform := audio.ConcatWaveforms(allWaveforms)
 
+	// 裁剪自回归退化产生的尾部静音/低能量拖尾（如模型错过 EOS 后生成的长尾噪声）。
+	// 仅裁剪最后一个 chunk 之后的尾部，chunk 之间的停顿由 estimateInterChunkPauseSeconds 控制，不受影响。
+	if len(waveform) > 0 {
+		waveform = audio.TrimTrailingSilence(waveform, channels, sampleRate)
+	}
+
 	// AudioData 延迟编码：子进程通过 attachment 传 Waveform bytes，AudioData 由调用方按需编码
 	var resolvedOutputPath string
 	if outputAudioPath != "" {
@@ -977,6 +983,11 @@ func (t *OnnxTtsRuntime) SynthesizeWithContext(ctx context.Context, text string,
 		streamingCodecSession.Reset()
 	}
 	waveform := audio.ConcatWaveforms(allWaveforms)
+
+	// 裁剪自回归退化产生的尾部静音/低能量拖尾
+	if len(waveform) > 0 {
+		waveform = audio.TrimTrailingSilence(waveform, channels, sampleRate)
+	}
 
 	// AudioData 延迟编码：子进程通过 attachment 传 Waveform bytes，AudioData 由调用方按需编码
 	var resolvedOutputPath string
